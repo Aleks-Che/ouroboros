@@ -99,6 +99,10 @@ MODEL_PRICING_STATIC = {
     "deepseek::deepseek-reasoner": (0.55, 0.27, 0.55, 2.19),
     "deepseek::deepseek-v4-flash": (0.15, 0.075, 0.15, 0.30),
     "deepseek::deepseek-v4-pro": (0.35, 0.175, 0.35, 1.40),
+    # MiniMax pricing (per 1M tokens, input/cached/output).
+    # https://platform.minimaxi.com/document/Price
+    "minimax/MiniMax-M3": (0.60, 0.12, 2.40),
+    "minimax::MiniMax-M3": (0.60, 0.12, 2.40),
 }
 
 _pricing_fetched = False

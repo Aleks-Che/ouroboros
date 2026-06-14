@@ -390,6 +390,8 @@ class LLMClient:
             return f"anthropic/{resolved_model}"
         if provider == "deepseek":
             return f"deepseek/{resolved_model}"
+        if provider == "minimax":
+            return f"minimax/{resolved_model}"
         if provider == "cloudru":
             return f"cloudru/{resolved_model}"
         if provider == "gigachat":
@@ -432,6 +434,18 @@ class LLMClient:
                 "usage_model": usage_model,
                 "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
                 "base_url": "https://api.deepseek.com/v1",
+                "default_headers": {},
+                "supports_openrouter_extensions": False,
+                "supports_generation_cost": False,
+            }
+
+        if provider == "minimax":
+            return {
+                "provider": provider,
+                "resolved_model": resolved_model,
+                "usage_model": usage_model,
+                "api_key": os.environ.get("MINIMAX_API_KEY", ""),
+                "base_url": "https://api.minimax.io/anthropic",
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
@@ -871,6 +885,19 @@ class LLMClient:
             raise ValueError("chat_async does not support tool calls")
         target = self._resolve_remote_target(model)
         if target.get("provider") == "anthropic":
+            return await asyncio.to_thread(
+                self._chat_anthropic,
+                target,
+                messages,
+                tools,
+                reasoning_effort,
+                max_tokens,
+                tool_choice,
+                temperature,
+                no_proxy,
+                timeout,
+            )
+        if target.get("provider") in ("minimax",):
             return await asyncio.to_thread(
                 self._chat_anthropic,
                 target,
@@ -2166,6 +2193,13 @@ class LLMClient:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
         if target.get("provider") == "anthropic":
+            return self._chat_anthropic(
+                target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
+                no_proxy=no_proxy,
+                timeout=timeout,
+            )
+
+        if target.get("provider") in ("minimax",):
             return self._chat_anthropic(
                 target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
                 no_proxy=no_proxy,

@@ -13,6 +13,7 @@ PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("openai::", "openai"),
     ("anthropic::", "anthropic"),
     ("deepseek::", "deepseek"),
+    ("minimax::", "minimax"),
     ("cloudru::", "cloudru"),
     ("gigachat::", "gigachat"),
     ("openai-compatible::", "openai-compatible"),
@@ -24,6 +25,7 @@ PROVIDER_ENV_KEYS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
     "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
@@ -110,9 +112,17 @@ ANTHROPIC_DIRECT_DEFAULTS = {
     "fallback": "anthropic::claude-sonnet-4-6",
 }
 
+MINIMAX_DIRECT_DEFAULTS = {
+    "main": "minimax::MiniMax-M3",
+    "code": "minimax::MiniMax-M3",
+    "light": "minimax::MiniMax-M3",
+    "fallback": "minimax::MiniMax-M3",
+}
+
 _DIRECT_PROVIDER_DEFAULTS = {
     "openai": OPENAI_DIRECT_DEFAULTS,
     "anthropic": ANTHROPIC_DIRECT_DEFAULTS,
+    "minimax": MINIMAX_DIRECT_DEFAULTS,
     "cloudru": CLOUDRU_DIRECT_DEFAULTS,
     "gigachat": GIGACHAT_DIRECT_DEFAULTS,
 }
@@ -147,6 +157,12 @@ def migrate_model_value(provider: str, value: str) -> str:
             return text
         if text.startswith("deepseek/"):
             return f"deepseek::{text[len('deepseek/'):]}"
+        return text
+    if provider == "minimax":
+        if text.startswith("minimax::"):
+            return text
+        if text.startswith("minimax/"):
+            return f"minimax::{text[len('minimax/'):]}"
         return text
     if provider == "cloudru":
         if text.startswith("cloudru::"):
@@ -239,6 +255,9 @@ _CONTEXT_WINDOW_PREFIXES: tuple[tuple[str, int], ...] = (
     # conservative family entry — both are far below the 1M scope floor and
     # early compaction is the safe direction for the bigger sibling.
     ("gigachat/", 131_072),
+    # MiniMax: M3 1M, other models 192K (verified 2026-06).
+    ("minimax/MiniMax-M3", 1_000_000),
+    ("minimax/", 1_000_000),
 )
 
 
@@ -269,6 +288,8 @@ def normalize_model_identity(model: str) -> str:
         return f"openai-compatible/{text[len('openai-compatible::'):]}"
     if text.startswith("deepseek::"):
         return f"deepseek/{text[len('deepseek::'):]}"
+    if text.startswith("minimax::"):
+        return f"minimax/{text[len('minimax::'):]}"
     if text.startswith("cloudru::"):
         return f"cloudru/{text[len('cloudru::'):]}"
     if text.startswith("gigachat::"):

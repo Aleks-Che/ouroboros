@@ -69,6 +69,7 @@ SETTINGS_DEFAULTS = {
     "GIGACHAT_VERIFY_SSL_CERTS": "true",
     "GIGACHAT_PROFANITY_CHECK": "",
     "DEEPSEEK_API_KEY": "",
+    "MINIMAX_API_KEY": "",
     "ANTHROPIC_API_KEY": "",
 
     "OUROBOROS_NETWORK_PASSWORD": "",
@@ -286,6 +287,7 @@ def _exclusive_direct_remote_provider_env() -> str:
     has_openai = bool(str(os.environ.get("OPENAI_API_KEY", "") or "").strip())
     has_anthropic = bool(str(os.environ.get("ANTHROPIC_API_KEY", "") or "").strip())
     has_deepseek = bool(str(os.environ.get("DEEPSEEK_API_KEY", "") or "").strip())
+    has_minimax = bool(str(os.environ.get("MINIMAX_API_KEY", "") or "").strip())
     has_legacy_base = bool(str(os.environ.get("OPENAI_BASE_URL", "") or "").strip())
     has_compatible = bool(str(os.environ.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip())
     has_cloudru = bool(str(os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip())
@@ -304,6 +306,7 @@ def _exclusive_direct_remote_provider_env() -> str:
             ("openai", has_openai),
             ("anthropic", has_anthropic),
             ("deepseek", has_deepseek),
+            ("minimax", has_minimax),
             ("cloudru", has_cloudru),
             ("gigachat", has_gigachat),
         ) if present
@@ -341,7 +344,7 @@ def resolve_effort(task_type: str) -> str:
 
 def direct_provider_review_models_fallback(provider: str) -> list[str]:
     """Return the exact review-models list a direct-provider fallback emits."""
-    if provider not in ("openai", "anthropic", "deepseek", "cloudru", "gigachat"):
+    if provider not in ("openai", "anthropic", "deepseek", "minimax", "cloudru", "gigachat"):
         return []
     main_model = str(
         os.environ.get("OUROBOROS_MODEL", SETTINGS_DEFAULTS["OUROBOROS_MODEL"]) or ""
@@ -1030,6 +1033,7 @@ def apply_settings_to_env(settings: dict) -> None:
         "GIGACHAT_SCOPE", "GIGACHAT_BASE_URL", "GIGACHAT_VERIFY_SSL_CERTS",
         "GIGACHAT_PROFANITY_CHECK",
         "DEEPSEEK_API_KEY",
+        "MINIMAX_API_KEY",
         "ANTHROPIC_API_KEY",
         "OUROBOROS_NETWORK_PASSWORD",
         "OUROBOROS_MODEL", "OUROBOROS_MODEL_CODE", "OUROBOROS_MODEL_LIGHT",

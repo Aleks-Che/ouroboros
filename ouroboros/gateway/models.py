@@ -250,6 +250,15 @@ def _provider_specs(
             ),
         ))
 
+    minimax_api_key = str(settings.get("MINIMAX_API_KEY", "") or "").strip()
+    if minimax_api_key:
+        specs.append((
+            "minimax",
+            lambda client: _fetch_openai_compatible_model_catalog(
+                client, "minimax", "MiniMax", minimax_api_key, "https://api.minimax.io/v1",
+            ),
+        ))
+
     cloudru_api_key = str(settings.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip()
     if cloudru_api_key:
         cloudru_base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or "").strip()

@@ -740,3 +740,31 @@ def test_build_anthropic_messages_rejects_tool_result_without_tool_call_id(monke
             {"role": "user", "content": "hi"},
             {"role": "tool", "content": "done"},
         ])
+
+
+def test_resolve_minimax_target(monkeypatch):
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-key")
+
+    target = LLMClient()._resolve_remote_target("minimax::MiniMax-M3")
+
+    assert target["provider"] == "minimax"
+    assert target["resolved_model"] == "MiniMax-M3"
+    assert target["usage_model"] == "minimax/MiniMax-M3"
+    assert target["base_url"] == "https://api.minimax.io/anthropic"
+    assert target["api_key"] == "minimax-key"
+    assert target["supports_openrouter_extensions"] is False
+
+
+def test_minimax_is_exclusive_direct_provider(monkeypatch):
+    monkeypatch.setenv("MINIMAX_API_KEY", "key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("CLOUDRU_FOUNDATION_MODELS_API_KEY", raising=False)
+    monkeypatch.delenv("GIGACHAT_CREDENTIALS", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_COMPATIBLE_BASE_URL", raising=False)
+
+    from ouroboros.config import _exclusive_direct_remote_provider_env
+    assert _exclusive_direct_remote_provider_env() == "minimax"
