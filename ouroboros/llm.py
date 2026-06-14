@@ -445,7 +445,7 @@ class LLMClient:
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
                 "api_key": os.environ.get("MINIMAX_API_KEY", ""),
-                "base_url": "https://api.minimax.io/anthropic",
+                "base_url": "https://api.minimax.io/v1",
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
@@ -2193,13 +2193,6 @@ class LLMClient:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
         if target.get("provider") == "anthropic":
-            return self._chat_anthropic(
-                target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
-                no_proxy=no_proxy,
-                timeout=timeout,
-            )
-
-        if target.get("provider") in ("minimax",):
             return self._chat_anthropic(
                 target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
                 no_proxy=no_proxy,
