@@ -101,6 +101,7 @@
                 ['CLOUDRU_FOUNDATION_MODELS_API_KEY', 'cloudru'],
                 ['ANTHROPIC_API_KEY', 'anthropic'],
                 ['DEEPSEEK_API_KEY', 'deepseek'],
+                ['MINIMAX_API_KEY', 'minimax'],
             ].filter(([settingKey]) => configured[settingKey]);
             if (hasOpenrouter) return 'openrouter';
             if (hasCompatible) return 'openai-compatible';

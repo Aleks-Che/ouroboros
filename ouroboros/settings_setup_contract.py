@@ -10,6 +10,7 @@ from ouroboros.provider_models import (
     ANTHROPIC_DIRECT_DEFAULTS,
     CLOUDRU_DIRECT_DEFAULTS,
     DEEPSEEK_DIRECT_DEFAULTS,
+    MINIMAX_DIRECT_DEFAULTS,
     OPENAI_DIRECT_DEFAULTS,
 )
 
@@ -35,6 +36,7 @@ _MODEL_DEFAULTS = {
     "cloudru": dict(CLOUDRU_DIRECT_DEFAULTS),
     "anthropic": dict(ANTHROPIC_DIRECT_DEFAULTS),
     "deepseek": dict(DEEPSEEK_DIRECT_DEFAULTS),
+    "minimax": dict(MINIMAX_DIRECT_DEFAULTS),
     # No defaults: model names are server-specific; user must fill all slots.
     "openai-compatible": {"main": "", "code": "", "light": "", "fallback": ""},
 }
@@ -57,6 +59,7 @@ _PROVIDER_FIELDS = _rows(("id", "stateKey", "settingKey", "settingsInputId", "la
     ("cloudru-key", "cloudruKey", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "s-cloudru-key", "Cloud.ru Foundation Models API Key", "Cloud.ru API key", "Optional. If this is the only remote key, the next step prefills direct cloudru::... models.", "password"),
     ("anthropic-key", "anthropicKey", "ANTHROPIC_API_KEY", "s-anthropic", "Anthropic API Key", "sk-ant-...", "Optional. Saved for direct anthropic::... models and Claude tooling.", "password"),
     ("deepseek-key", "deepseekKey", "DEEPSEEK_API_KEY", "s-deepseek", "DeepSeek API Key", "sk-...", "Optional. If this is the only remote key, the next step prefills direct deepseek::... models.", "password"),
+    ("minimax-key", "minimaxKey", "MINIMAX_API_KEY", "s-minimax", "MiniMax API Key", "MiniMax key", "Optional. If this is the only remote key, the next step prefills direct minimax::... models.", "password"),
     ("openai-compatible-url", "compatibleBaseUrl", "OPENAI_COMPATIBLE_BASE_URL", "s-compatible-url", "OpenAI-compatible Base URL", "http://localhost:11434/v1", "Base URL for your OpenAI-compatible endpoint (e.g. Ollama, LM Studio, vLLM). Required when using openai-compatible:: models.", "url"),
     ("openai-compatible-key", "compatibleApiKey", "OPENAI_COMPATIBLE_API_KEY", "s-compatible-key", "OpenAI-compatible API Key", "Leave empty for no auth", "API key for the endpoint. Leave empty if your server does not require authentication.", "password"),
 ))
@@ -67,6 +70,7 @@ _PROFILE_SPECS = {
     "cloudru": ("Cloud.ru Foundation Models", "Cloud.ru is present, so the next step prefills direct cloudru:: model values.", "Cloud.ru-only setup detected. These defaults use explicit cloudru:: model IDs."),
     "anthropic": ("Anthropic", "Anthropic is present, so the next step prefills direct anthropic:: model values.", "Anthropic-only setup detected. These defaults are explicit and official."),
     "deepseek": ("DeepSeek", "DeepSeek is present, so the next step prefills direct deepseek:: model values.", "DeepSeek-only setup detected. These defaults are explicit and official."),
+    "minimax": ("MiniMax", "MiniMax is present, so the next step prefills direct minimax:: model values.", "MiniMax-only setup detected. These defaults are explicit and official."),
     "openai-compatible": ("OpenAI-compatible endpoint", "An OpenAI-compatible base URL is configured. Enter the model names your server exposes in the next step.", "OpenAI-compatible endpoint detected. Use openai-compatible::your-model-name for every slot. The model list is whatever your server supports."),
     "direct-multi": ("Direct multi-provider", "Multiple direct providers are present, so the next step keeps your model values editable without forcing one provider family.", "Multiple direct providers are configured. Start here, then split model slots across them if you want."),
     "local": ("Local-first", "No remote key is present yet, so local-only setup remains available below.", "Local-only setup detected. Review the model values and local routing before launch."),
@@ -132,7 +136,7 @@ _LOCAL_PRESETS: Dict[str, Dict[str, Any]] = {
     "qwen3-32b": {"label": "Qwen3-32B Instruct Q4_K_M", "source": "Qwen/Qwen3-32B-GGUF", "filename": "Qwen3-32B-Q4_K_M.gguf", "contextLength": 32768, "chatFormat": ""},
 }
 
-_MODEL_SUGGESTIONS = list(dict.fromkeys(("google/gemini-3.5-flash", "anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.7", "anthropic/claude-opus-4.6", "anthropic::claude-opus-4-8", "anthropic::claude-opus-4-7", "anthropic::claude-opus-4-6", "anthropic::claude-sonnet-4-6", "openai/gpt-5.5", "openai::gpt-5.5", "openai::gpt-5.5-mini", "openai-compatible::meta-llama/compatible", "deepseek::deepseek-chat", "deepseek::deepseek-reasoner", "cloudru::zai-org/GLM-4.7")))
+_MODEL_SUGGESTIONS = list(dict.fromkeys(("google/gemini-3.5-flash", "anthropic/claude-sonnet-4.6", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.7", "anthropic/claude-opus-4.6", "anthropic::claude-opus-4-8", "anthropic::claude-opus-4-7", "anthropic::claude-opus-4-6", "anthropic::claude-sonnet-4-6", "openai/gpt-5.5", "openai::gpt-5.5", "openai::gpt-5.5-mini", "openai-compatible::meta-llama/compatible", "deepseek::deepseek-chat", "deepseek::deepseek-reasoner", "minimax::MiniMax-M3", "cloudru::zai-org/GLM-4.7")))
 
 
 def _string(value: Any) -> str:
@@ -183,6 +187,7 @@ def derive_provider_profile(settings: dict) -> str:
         ("CLOUDRU_FOUNDATION_MODELS_API_KEY", "cloudru"),
         ("ANTHROPIC_API_KEY", "anthropic"),
         ("DEEPSEEK_API_KEY", "deepseek"),
+        ("MINIMAX_API_KEY", "minimax"),
     ]
     configured = [name for key, name in direct if flags[key]]
     if len(configured) > 1:

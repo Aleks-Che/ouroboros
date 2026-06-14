@@ -105,6 +105,11 @@ const PROVIDER_CARDS = [
         note: 'Use model values like <code>deepseek::deepseek-v4-flash</code> in the Models tab to route models directly through DeepSeek. If this is the only remote key, Ouroboros auto-remaps to deepseek:: defaults.',
     },
     {
+        id: 'minimax', title: 'MiniMax', icon: '/static/providers/minimax.svg', hint: 'Direct MiniMax API',
+        fields: [{ id: 's-minimax', settingKey: 'MINIMAX_API_KEY', label: 'MiniMax API Key', placeholder: 'MiniMax key' }],
+        note: 'Use model values like <code>minimax::MiniMax-M3</code> in the Models tab to route models directly through MiniMax.',
+    },
+    {
         id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct runtime plus Claude tooling',
         fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
         note: 'Use model values like <code>anthropic::claude-sonnet-4-6</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
@@ -179,6 +184,7 @@ export const SECRET_KEYS = [
     ['GIGACHAT_PASSWORD', 'GigaChat Password (basic auth)', 'password'],
     ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
     ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
+    ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
