@@ -112,6 +112,13 @@ ANTHROPIC_DIRECT_DEFAULTS = {
     "fallback": "anthropic::claude-sonnet-4-6",
 }
 
+DEEPSEEK_DIRECT_DEFAULTS = {
+    "main": "deepseek::deepseek-v4-flash",
+    "code": "deepseek::deepseek-v4-flash",
+    "light": "deepseek::deepseek-v4-flash",
+    "fallback": "deepseek::deepseek-v4-flash",
+}
+
 MINIMAX_DIRECT_DEFAULTS = {
     "main": "minimax::MiniMax-M3",
     "code": "minimax::MiniMax-M3",
@@ -122,6 +129,7 @@ MINIMAX_DIRECT_DEFAULTS = {
 _DIRECT_PROVIDER_DEFAULTS = {
     "openai": OPENAI_DIRECT_DEFAULTS,
     "anthropic": ANTHROPIC_DIRECT_DEFAULTS,
+    "deepseek": DEEPSEEK_DIRECT_DEFAULTS,
     "minimax": MINIMAX_DIRECT_DEFAULTS,
     "cloudru": CLOUDRU_DIRECT_DEFAULTS,
     "gigachat": GIGACHAT_DIRECT_DEFAULTS,

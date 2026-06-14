@@ -8,7 +8,9 @@ from typing import Awaitable, Callable
 from ouroboros.provider_models import (
     ANTHROPIC_DIRECT_DEFAULTS,
     CLOUDRU_DIRECT_DEFAULTS,
+    DEEPSEEK_DIRECT_DEFAULTS,
     GIGACHAT_DIRECT_DEFAULTS,
+    MINIMAX_DIRECT_DEFAULTS,
     OPENAI_DIRECT_DEFAULTS,
     compute_direct_review_models_fallback,
     migrate_model_value,
@@ -41,6 +43,18 @@ _DIRECT_PROVIDER_AUTO_DEFAULTS = {
         "OUROBOROS_MODEL_CODE": GIGACHAT_DIRECT_DEFAULTS["code"],
         "OUROBOROS_MODEL_LIGHT": GIGACHAT_DIRECT_DEFAULTS["light"],
         "OUROBOROS_MODEL_FALLBACK": GIGACHAT_DIRECT_DEFAULTS["fallback"],
+    },
+    "deepseek": {
+        "OUROBOROS_MODEL": DEEPSEEK_DIRECT_DEFAULTS["main"],
+        "OUROBOROS_MODEL_CODE": DEEPSEEK_DIRECT_DEFAULTS["code"],
+        "OUROBOROS_MODEL_LIGHT": DEEPSEEK_DIRECT_DEFAULTS["light"],
+        "OUROBOROS_MODEL_FALLBACK": DEEPSEEK_DIRECT_DEFAULTS["fallback"],
+    },
+    "minimax": {
+        "OUROBOROS_MODEL": MINIMAX_DIRECT_DEFAULTS["main"],
+        "OUROBOROS_MODEL_CODE": MINIMAX_DIRECT_DEFAULTS["code"],
+        "OUROBOROS_MODEL_LIGHT": MINIMAX_DIRECT_DEFAULTS["light"],
+        "OUROBOROS_MODEL_FALLBACK": MINIMAX_DIRECT_DEFAULTS["fallback"],
     },
 }
 # Legacy values that should be auto-replaced with a provider's direct defaults.
@@ -180,12 +194,16 @@ def _exclusive_direct_remote_provider(settings: dict) -> str:
     # (OpenAI, Anthropic, Cloud.ru, GigaChat) return one only when exactly one is set.
     if has_openrouter or has_legacy_openai_base or has_compatible:
         return ""
+    has_deepseek = bool(_setting_text(settings, "DEEPSEEK_API_KEY"))
+    has_minimax = bool(_setting_text(settings, "MINIMAX_API_KEY"))
     direct = [
         name for name, present in (
             ("openai", has_official_openai),
             ("anthropic", has_anthropic),
             ("cloudru", has_cloudru),
             ("gigachat", has_gigachat),
+            ("deepseek", has_deepseek),
+            ("minimax", has_minimax),
         ) if present
     ]
     return direct[0] if len(direct) == 1 else ""
