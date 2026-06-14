@@ -1,31 +1,32 @@
-"""
-Supervisor — State management.
-
-Persistent state on Google Drive: load, save, atomic writes, file locks.
-"""
+"""Supervisor persistent state, atomic writes, locks, and budget accounting."""
 
 from __future__ import annotations
 
-import datetime
 import json
 import logging
 import os
 import pathlib
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+from ouroboros.utils import append_jsonl, iter_llm_usage_events, llm_usage_cost, utc_now_iso
 
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Module-level config (set via init())
-# ---------------------------------------------------------------------------
-DRIVE_ROOT: pathlib.Path = pathlib.Path("/content/drive/MyDrive/Ouroboros")
+DRIVE_ROOT: pathlib.Path = pathlib.Path.home() / "Ouroboros" / "data"
 STATE_PATH: pathlib.Path = DRIVE_ROOT / "state" / "state.json"
 STATE_LAST_GOOD_PATH: pathlib.Path = DRIVE_ROOT / "state" / "state.last_good.json"
 STATE_LOCK_PATH: pathlib.Path = DRIVE_ROOT / "locks" / "state.lock"
 QUEUE_SNAPSHOT_PATH: pathlib.Path = DRIVE_ROOT / "state" / "queue_snapshot.json"
+
+# Explicit marker a benchmark/evolution driver writes into its THROWAWAY data root. A live
+# data root (the default ~/Ouroboros/data OR a custom/Drive-backed OUROBOROS_DATA_DIR) never
+# has it, so reset_per_task_budget can refuse on it regardless of how the path resolves —
+# closing the budget-reset guard for custom-data-root installs (BIBLE P8).
+ISOLATED_BENCHMARK_SENTINEL = ".ouroboros_isolated_benchmark"
 
 
 def init(drive_root: pathlib.Path, total_budget_limit: float = 0.0) -> None:
@@ -37,10 +38,6 @@ def init(drive_root: pathlib.Path, total_budget_limit: float = 0.0) -> None:
     QUEUE_SNAPSHOT_PATH = drive_root / "state" / "queue_snapshot.json"
     set_budget_limit(total_budget_limit)
 
-
-# ---------------------------------------------------------------------------
-# Atomic file operations
-# ---------------------------------------------------------------------------
 
 def atomic_write_text(path: pathlib.Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,68 +63,32 @@ def json_load_file(path: pathlib.Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-# ---------------------------------------------------------------------------
-# File locks
-# ---------------------------------------------------------------------------
-
 def acquire_file_lock(lock_path: pathlib.Path, timeout_sec: float = 4.0,
                       stale_sec: float = 90.0) -> Optional[int]:
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    started = time.time()
-    while (time.time() - started) < timeout_sec:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            try:
-                os.write(fd, f"pid={os.getpid()} ts={datetime.datetime.now(datetime.timezone.utc).isoformat()}\n".encode("utf-8"))
-            except Exception:
-                log.debug(f"Failed to write lock metadata to {lock_path}", exc_info=True)
-                pass
-            return fd
-        except FileExistsError:
-            try:
-                age = time.time() - lock_path.stat().st_mtime
-                if age > stale_sec:
-                    lock_path.unlink()
-                    continue
-            except Exception:
-                log.debug(f"Failed to check/remove stale lock at {lock_path}", exc_info=True)
-                pass
-            time.sleep(0.05)
-        except Exception:
-            log.warning(f"Failed to acquire lock at {lock_path}", exc_info=True)
-            break
-    return None
+    return acquire_exclusive_file_lock(
+        lock_path,
+        timeout_sec=timeout_sec,
+        stale_sec=stale_sec,
+        metadata=f"pid={os.getpid()} ts={utc_now_iso()}\n",
+    )
 
 
-def release_file_lock(lock_path: pathlib.Path, lock_fd: Optional[int]) -> None:
-    if lock_fd is None:
-        return
-    try:
-        os.close(lock_fd)
-    except Exception:
-        log.debug(f"Failed to close lock fd {lock_fd} for {lock_path}", exc_info=True)
-        pass
-    try:
-        if lock_path.exists():
-            lock_path.unlink()
-    except Exception:
-        log.debug(f"Failed to unlink lock file {lock_path}", exc_info=True)
-        pass
+# Direct alias: the platform helper already has the exact signature.
+release_file_lock = release_exclusive_file_lock
 
-
-# Re-export append_jsonl from ouroboros.utils (single source of truth)
-from ouroboros.utils import append_jsonl  # noqa: F401
-
-
-# ---------------------------------------------------------------------------
-# State schema
-# ---------------------------------------------------------------------------
 
 def ensure_state_defaults(st: Dict[str, Any]) -> Dict[str, Any]:
-    st.setdefault("created_at", datetime.datetime.now(datetime.timezone.utc).isoformat())
+    st.setdefault("created_at", utc_now_iso())
     st.setdefault("owner_id", None)
     st.setdefault("owner_chat_id", None)
-    st.setdefault("tg_offset", 0)
+    # Separate slot authorizing owner slash commands from external transports
+    # (e.g. Telegram), so the local web owner never locks out a real chat owner.
+    st.setdefault("owner_external_id", None)
+    st.setdefault("owner_external_chat_id", None)
+    st.setdefault("owner_external_bound_at", None)
+    st.setdefault("message_offset", 0)
+    if "tg_offset" in st:
+        st.setdefault("message_offset", st.pop("tg_offset"))
     st.setdefault("spent_usd", 0.0)
     st.setdefault("spent_calls", 0)
     st.setdefault("spent_tokens_prompt", 0)
@@ -146,23 +107,15 @@ def ensure_state_defaults(st: Dict[str, Any]) -> Dict[str, Any]:
     st.setdefault("budget_drift_pct", None)
     st.setdefault("budget_drift_alert", False)
     st.setdefault("evolution_consecutive_failures", 0)
+    st.setdefault("bg_consciousness_enabled", False)
     for legacy_key in ("approvals", "idle_cursor", "idle_stats", "last_idle_task_at",
                         "last_auto_review_at", "last_review_task_id", "session_daily_snapshot"):
         st.pop(legacy_key, None)
     return st
 
 
-def default_state_dict() -> Dict[str, Any]:
-    """Create a fresh state dict. Single source of truth: ensure_state_defaults."""
-    return ensure_state_defaults({})
-
-
-# ---------------------------------------------------------------------------
-# Load / Save
-# ---------------------------------------------------------------------------
-
 def _load_state_unlocked() -> Dict[str, Any]:
-    """Load state without acquiring lock. Caller must hold STATE_LOCK."""
+    """Load state; caller must hold STATE_LOCK."""
     recovered = False
     st_obj = json_load_file(STATE_PATH)
     if st_obj is None:
@@ -170,7 +123,7 @@ def _load_state_unlocked() -> Dict[str, Any]:
         recovered = st_obj is not None
 
     if st_obj is None:
-        st = ensure_state_defaults(default_state_dict())
+        st = ensure_state_defaults({})
         _save_state_unlocked(st)
         return st
 
@@ -181,15 +134,27 @@ def _load_state_unlocked() -> Dict[str, Any]:
 
 
 def _save_state_unlocked(st: Dict[str, Any]) -> None:
-    """Save state without acquiring lock. Caller must hold STATE_LOCK."""
+    """Save state; caller must hold STATE_LOCK."""
     st = ensure_state_defaults(st)
     payload = json.dumps(st, ensure_ascii=False, indent=2)
     atomic_write_text(STATE_PATH, payload)
     atomic_write_text(STATE_LAST_GOOD_PATH, payload)
 
 
+def _warn_state_unlocked(op: str, lock_fd: Optional[int]) -> None:
+    """Loud trail when the state lock could not be acquired.
+
+    Proceeding unlocked is a deliberate availability tradeoff (a wedged lock
+    must not freeze the supervisor), but it must never be silent: an unlocked
+    write is exactly the lost-update class this lock exists to prevent.
+    """
+    if lock_fd is None:
+        log.error("state.json %s proceeding WITHOUT lock (timeout on %s)", op, STATE_LOCK_PATH)
+
+
 def load_state() -> Dict[str, Any]:
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
+    _warn_state_unlocked("load", lock_fd)
     try:
         return _load_state_unlocked()
     finally:
@@ -198,38 +163,58 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(st: Dict[str, Any]) -> None:
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
+    _warn_state_unlocked("save", lock_fd)
     try:
         _save_state_unlocked(st)
     finally:
         release_file_lock(STATE_LOCK_PATH, lock_fd)
 
 
-def init_state() -> Dict[str, Any]:
-    """
-    Initialize state at session start, capturing snapshots for budget drift detection.
+def update_state(mutator) -> Dict[str, Any]:
+    """Atomically read-modify-write state under a single held lock.
 
-    Fetches OpenRouter ground truth and stores session_daily_snapshot and
-    session_spent_snapshot for drift calculation.
+    Loads the current state, applies ``mutator(st)`` in place, and persists the
+    result while holding STATE_LOCK for the WHOLE operation, so concurrent
+    updates cannot lose each other (load and save are one critical section — the
+    racy ``st = load_state(); st[...] = ...; save_state(st)`` pattern drops the
+    other writer's change). Returns the saved state.
+
+    This is also the canonical home of ``update_state`` that
+    ``supervisor.events`` imports — it previously lived only in
+    ``ouroboros.review_state``, so ``from supervisor.state import update_state``
+    raised ImportError (e.g. toggling background consciousness via tool).
+
+    ``mutator`` must NOT call ``load_state``/``save_state``/``update_state`` itself:
+    STATE_LOCK is not re-entrant within a process, so re-entering would block.
     """
+    lock_fd = acquire_file_lock(STATE_LOCK_PATH)
+    _warn_state_unlocked("update", lock_fd)
+    try:
+        st = _load_state_unlocked()
+        mutator(st)
+        _save_state_unlocked(st)
+        return st
+    finally:
+        release_file_lock(STATE_LOCK_PATH, lock_fd)
+
+
+def init_state() -> Dict[str, Any]:
+    """Initialize session snapshots for budget drift detection."""
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
     try:
         st = _load_state_unlocked()
 
-        # Capture session snapshots for drift detection
         st["session_spent_snapshot"] = float(st.get("spent_usd") or 0.0)
 
-        # Fetch OpenRouter ground truth to capture total_usd baseline
         ground_truth = check_openrouter_ground_truth()
         if ground_truth is not None:
             st["session_total_snapshot"] = ground_truth["total_usd"]
             st["openrouter_total_usd"] = ground_truth["total_usd"]
             st["openrouter_daily_usd"] = ground_truth["daily_usd"]
-            st["openrouter_last_check_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            st["openrouter_last_check_at"] = utc_now_iso()
         else:
-            # If we can't fetch ground truth, use 0 as baseline
             st["session_total_snapshot"] = 0.0
 
-        # Reset drift tracking
         st["budget_drift_pct"] = None
         st["budget_drift_alert"] = False
 
@@ -239,34 +224,116 @@ def init_state() -> Dict[str, Any]:
         release_file_lock(STATE_LOCK_PATH, lock_fd)
 
 
-# ---------------------------------------------------------------------------
-# Budget tracking (moved from workers.py)
-# ---------------------------------------------------------------------------
 TOTAL_BUDGET_LIMIT: float = 0.0
-EVOLUTION_BUDGET_RESERVE: float = 50.0  # Stop evolution when remaining < this
+EVOLUTION_BUDGET_RESERVE: float = 2.0  # Stop evolution when remaining < this
 
 
 def set_budget_limit(limit: float) -> None:
-    """Set total budget limit for budget_pct calculation."""
+    """Set total budget limit for budget_pct."""
     global TOTAL_BUDGET_LIMIT
     TOTAL_BUDGET_LIMIT = limit
 
 
+def refresh_budget_from_settings(settings: Dict[str, Any]) -> None:
+    """Hot-reload TOTAL_BUDGET; bad/missing values mean no limit."""
+    try:
+        raw = settings.get("TOTAL_BUDGET")
+        value = float(raw) if raw is not None else 0.0
+        set_budget_limit(value)
+    except (TypeError, ValueError):
+        pass
+
+
 def budget_remaining(st: Dict[str, Any]) -> float:
-    """Calculate remaining budget in USD."""
+    """Return remaining budget in USD."""
     spent = float(st.get("spent_usd") or 0.0)
     total = float(TOTAL_BUDGET_LIMIT or 0.0)
     if total <= 0:
-        return float('inf')  # No limit set
+        return float('inf')
     return max(0.0, total - spent)
 
 
-def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
-    """
-    Call OpenRouter API to get ground truth usage.
+def reset_per_task_budget(data_root: Any, *, confirm_isolated: bool = False) -> bool:
+    """Zero the per-task budget ledger (spent_usd + call/token counters) in an
+    ISOLATED benchmark/evolution data root.
 
-    Returns dict with total_usd and daily_usd spent according to OpenRouter, or None on error.
+    CRITICAL safety guard (BIBLE P8): the live TOTAL_BUDGET / Emergency-Stop
+    contract must never be defeated by a reset. This refuses unless ALL hold:
+    the target is NOT the live ``~/Ouroboros/data`` dir, the caller passes
+    ``confirm_isolated=True`` (explicit bench intent), and ``OUROBOROS_DATA_DIR``
+    is set (a non-default, isolated data dir). Evolutionary drivers call this
+    between tasks so each instance starts with a fresh per-task allowance while
+    learned knowledge/identity/code carry forward. Returns True only when a reset
+    was actually written.
     """
+    try:
+        target = pathlib.Path(str(data_root)).resolve(strict=False)
+    except Exception:
+        return False
+    live = (pathlib.Path.home() / "Ouroboros" / "data").resolve(strict=False)
+    if target == live:
+        return False
+    if not confirm_isolated:
+        return False
+    env_dir = str(os.environ.get("OUROBOROS_DATA_DIR", "") or "").strip()
+    if not env_dir:
+        return False
+    try:
+        if pathlib.Path(env_dir).resolve(strict=False) != target:
+            return False
+    except Exception:
+        return False
+    # Final guard: the target MUST carry the isolated-benchmark sentinel. A live root (default
+    # or custom/Drive-backed) never has it, so this reset can never zero a live budget even if
+    # the home-path comparison above does not match a non-default live data root (BIBLE P8).
+    if not (target / ISOLATED_BENCHMARK_SENTINEL).exists():
+        return False
+    state_path = target / "state" / "state.json"
+    # Lock on the TARGET root's own state.lock (the isolated server holds the same
+    # path as its STATE_LOCK), so this between-instance reset and a concurrent server
+    # save_state cannot lost-update each other in the B-full server-driven model.
+    lock_path = target / "locks" / "state.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    lock_fd = acquire_file_lock(lock_path)
+    if lock_fd is None:
+        # Lock acquisition timed out (the isolated server is actively writing state):
+        # skip rather than run an UNLOCKED read-modify-write that would race save_state.
+        log.warning("reset_per_task_budget: could not acquire state lock for %s; skipping reset", state_path)
+        return False
+    budget_keys = ("spent_usd", "spent_calls", "spent_tokens_prompt",
+                   "spent_tokens_completion", "spent_tokens_cached")
+    try:
+        st = json_load_file(state_path) or {}
+        st["spent_usd"] = 0.0
+        st["spent_calls"] = 0
+        st["spent_tokens_prompt"] = 0
+        st["spent_tokens_completion"] = 0
+        st["spent_tokens_cached"] = 0
+        atomic_write_text(state_path, json.dumps(st, ensure_ascii=False, indent=2))
+        # Also zero the budget counters in the last-good snapshot. _load_state
+        # falls back to it when state.json is missing/corrupt; leaving stale
+        # spend there could re-inflate the per-task ledger after a mid-run
+        # crash+recovery, defeating the reset (the kit reset both files).
+        lg_path = target / "state" / "state.last_good.json"
+        lg = json_load_file(lg_path)
+        if isinstance(lg, dict):
+            for key in budget_keys:
+                if key in lg:
+                    lg[key] = 0 if key != "spent_usd" else 0.0
+            atomic_write_text(lg_path, json.dumps(lg, ensure_ascii=False, indent=2))
+    except Exception:
+        log.warning("reset_per_task_budget: failed to write %s", state_path, exc_info=True)
+        return False
+    finally:
+        release_file_lock(lock_path, lock_fd)
+    return True
+
+
+def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
+    """Return OpenRouter total/daily usage, or None on error."""
     try:
         import urllib.request
         api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
@@ -278,7 +345,7 @@ def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        # OpenRouter API returns usage already in dollars (not cents)
+        # OpenRouter usage is dollars, not cents.
         usage_total = data.get("data", {}).get("usage", 0)
         usage_daily = data.get("data", {}).get("usage_daily", 0)
         return {
@@ -291,7 +358,7 @@ def check_openrouter_ground_truth() -> Optional[Dict[str, float]]:
 
 
 def budget_pct(st: Dict[str, Any]) -> float:
-    """Calculate budget percentage used."""
+    """Return budget percent used."""
     spent = float(st.get("spent_usd") or 0.0)
     total = float(TOTAL_BUDGET_LIMIT or 0.0)
     if total <= 0:
@@ -300,13 +367,7 @@ def budget_pct(st: Dict[str, Any]) -> float:
 
 
 def update_budget_from_usage(usage: Dict[str, Any]) -> None:
-    """Update state with LLM usage costs and tokens.
-
-    Uses a single lock scope for the read-modify-write cycle to prevent
-    concurrent writes from losing budget updates.
-
-    Every 50 calls, fetches OpenRouter ground truth for comparison.
-    """
+    """Update LLM cost/token counters and periodically compare OpenRouter truth."""
     def _to_float(v: Any, default: float = 0.0) -> float:
         try:
             return float(v)
@@ -321,8 +382,9 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
             log.debug(f"Failed to convert value to int: {v!r}", exc_info=True)
             return default
 
-    # Step 1: Update budget counters under lock (fast, no I/O beyond Drive)
+    # Keep the lock around local counters only; network check runs outside it.
     lock_fd = acquire_file_lock(STATE_LOCK_PATH)
+    _warn_state_unlocked("budget-update", lock_fd)
     try:
         st = _load_state_unlocked()
         cost = usage.get("cost") if isinstance(usage, dict) else None
@@ -342,7 +404,6 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
     finally:
         release_file_lock(STATE_LOCK_PATH, lock_fd)
 
-    # Step 2: HTTP to OpenRouter OUTSIDE the lock (can take up to 10s)
     if should_check_ground_truth:
         ground_truth = check_openrouter_ground_truth()
         if ground_truth is not None:
@@ -351,7 +412,7 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                 st = _load_state_unlocked()
                 st["openrouter_total_usd"] = ground_truth["total_usd"]
                 st["openrouter_daily_usd"] = ground_truth["daily_usd"]
-                st["openrouter_last_check_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                st["openrouter_last_check_at"] = utc_now_iso()
 
                 session_total_snap = st.get("session_total_snapshot")
                 session_spent_snap = st.get("session_spent_snapshot")
@@ -371,7 +432,7 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                             append_jsonl(
                                 DRIVE_ROOT / "logs" / "events.jsonl",
                                 {
-                                    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                    "ts": utc_now_iso(),
                                     "event": "budget_drift_warning",
                                     "drift_pct": round(drift_pct, 2),
                                     "our_delta": round(our_delta, 4),
@@ -392,48 +453,16 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                 release_file_lock(STATE_LOCK_PATH, lock_fd)
 
 
-# ---------------------------------------------------------------------------
-# Budget breakdown by category
-# ---------------------------------------------------------------------------
-
 def budget_breakdown(st: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Calculate budget breakdown by category from events.jsonl.
-
-    Reads llm_usage events and aggregates cost_usd by category field.
-    Returns dict like {"task": 12.5, "evolution": 45.2, ...}
-    """
+    """Aggregate llm_usage cost by category from events.jsonl."""
     events_path = DRIVE_ROOT / "logs" / "events.jsonl"
-    if not events_path.exists():
-        return {}
-
     breakdown: Dict[str, float] = {}
     try:
-        with events_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    if event.get("type") != "llm_usage":
-                        continue
-
-                    # Get category (default to "other" if not present)
-                    category = event.get("category", "other")
-
-                    # Get cost from either top-level "cost" or nested "usage.cost"
-                    cost = 0.0
-                    if "cost" in event:
-                        cost = float(event.get("cost", 0))
-                    elif "usage" in event and isinstance(event["usage"], dict):
-                        cost = float(event["usage"].get("cost", 0))
-
-                    if cost > 0:
-                        breakdown[category] = breakdown.get(category, 0.0) + cost
-
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    continue
+        for event in iter_llm_usage_events(events_path):
+            category = event.get("category", "other")
+            cost = llm_usage_cost(event)
+            if cost > 0:
+                breakdown[category] = breakdown.get(category, 0.0) + cost
     except Exception:
         log.warning("Failed to calculate budget breakdown", exc_info=True)
 
@@ -441,58 +470,23 @@ def budget_breakdown(st: Dict[str, Any]) -> Dict[str, float]:
 
 
 def model_breakdown(st: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
-    """
-    Calculate budget breakdown by model from events.jsonl.
-
-    Returns dict like:
-    {
-        "anthropic/claude-sonnet-4.6": {"cost": 12.5, "calls": 120, "prompt_tokens": 50000, "completion_tokens": 3000},
-        "openai/gpt-4o": {"cost": 3.2, "calls": 15, ...},
-    }
-    """
+    """Aggregate llm_usage cost/calls/tokens by model."""
     events_path = DRIVE_ROOT / "logs" / "events.jsonl"
-    if not events_path.exists():
-        return {}
-
     breakdown: Dict[str, Dict[str, float]] = {}
     try:
-        with events_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
+        for event in iter_llm_usage_events(events_path):
+            model = event.get("model") or "unknown"
+            stats = breakdown.setdefault(model, {
+                "cost": 0.0, "calls": 0, "prompt_tokens": 0,
+                "completion_tokens": 0, "cached_tokens": 0,
+            })
+            stats["cost"] += llm_usage_cost(event)
+            stats["calls"] += 1
+            for key in ("prompt_tokens", "completion_tokens", "cached_tokens"):
                 try:
-                    event = json.loads(line)
-                    if event.get("type") != "llm_usage":
-                        continue
-
-                    model = event.get("model") or "unknown"
-                    if not model:
-                        model = "unknown"
-
-                    # Get cost
-                    cost = 0.0
-                    if "cost" in event:
-                        cost = float(event.get("cost", 0))
-                    elif "usage" in event and isinstance(event["usage"], dict):
-                        cost = float(event["usage"].get("cost", 0))
-
-                    # Get tokens
-                    prompt_tokens = int(event.get("prompt_tokens", 0) or 0)
-                    completion_tokens = int(event.get("completion_tokens", 0) or 0)
-                    cached_tokens = int(event.get("cached_tokens", 0) or 0)
-
-                    if model not in breakdown:
-                        breakdown[model] = {"cost": 0.0, "calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0}
-
-                    breakdown[model]["cost"] += cost
-                    breakdown[model]["calls"] += 1
-                    breakdown[model]["prompt_tokens"] += prompt_tokens
-                    breakdown[model]["completion_tokens"] += completion_tokens
-                    breakdown[model]["cached_tokens"] += cached_tokens
-
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    continue
+                    stats[key] += int(event.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    pass
     except Exception:
         log.warning("Failed to calculate model breakdown", exc_info=True)
 
@@ -500,41 +494,18 @@ def model_breakdown(st: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
 
 
 def per_task_cost_summary(max_tasks: int = 10, tail_bytes: int = 512_000) -> List[Dict[str, Any]]:
-    """Return cost summary for recent tasks from events.jsonl.
-
-    Only reads the last `tail_bytes` of the file to avoid scanning
-    megabytes of history on every LLM round.
-
-    Returns list of dicts: [{task_id, cost, rounds, model}, ...]
-    sorted by cost descending, limited to max_tasks.
-    """
+    """Return recent task cost summary from the tail of events.jsonl."""
     events_path = DRIVE_ROOT / "logs" / "events.jsonl"
-    if not events_path.exists():
-        return []
-
     tasks: Dict[str, Dict[str, Any]] = {}
     try:
-        file_size = events_path.stat().st_size
-        with events_path.open("r", encoding="utf-8") as f:
-            if file_size > tail_bytes:
-                f.seek(file_size - tail_bytes)
-                f.readline()  # skip partial first line
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                    if event.get("type") != "llm_usage":
-                        continue
-                    tid = event.get("task_id") or "unknown"
-                    cost = float(event.get("cost", 0) or 0)
-                    if tid not in tasks:
-                        tasks[tid] = {"task_id": tid, "cost": 0.0, "rounds": 0, "model": event.get("model", "")}
-                    tasks[tid]["cost"] += cost
-                    tasks[tid]["rounds"] += 1
-                except (json.JSONDecodeError, ValueError, TypeError):
-                    continue
+        for event in iter_llm_usage_events(events_path, tail_bytes=tail_bytes):
+            tid = event.get("task_id") or "unknown"
+            task = tasks.setdefault(
+                tid,
+                {"task_id": tid, "cost": 0.0, "rounds": 0, "model": event.get("model", "")},
+            )
+            task["cost"] += llm_usage_cost(event)
+            task["rounds"] += 1
     except Exception:
         log.warning("Failed to calculate per-task cost summary", exc_info=True)
 
@@ -542,9 +513,46 @@ def per_task_cost_summary(max_tasks: int = 10, tail_bytes: int = 512_000) -> Lis
     return sorted_tasks[:max_tasks]
 
 
-# ---------------------------------------------------------------------------
-# Status text (moved from workers.py)
-# ---------------------------------------------------------------------------
+def reconstruct_task_cost(task_id: str) -> Tuple[float, int, int, int]:
+    """Reconstruct ``(cost_usd, rounds, prompt_tokens, completion_tokens)`` for a
+    task from its durable ``llm_usage`` events.
+
+    On abnormal termination (hard-timeout kill, cancel, worker loss) the worker is
+    SIGKILLed before normal finalization aggregates cost, so the terminal event
+    carries zeros — which silently understates per-task rollups, the evolution
+    campaign tally, and the failure heuristic. The per-round ``llm_usage`` rows in
+    ``events.jsonl`` are the budget SSOT (global ``spent_usd`` is summed from them)
+    and are already durable before any kill, so we re-derive the per-task totals
+    from them here. Full-scan (not tail): a long task's early rounds can sit far
+    behind the file tail.
+    """
+    want = str(task_id or "")
+    cost = 0.0
+    rounds = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    if not want:
+        return (0.0, 0, 0, 0)
+    events_path = DRIVE_ROOT / "logs" / "events.jsonl"
+    try:
+        for event in iter_llm_usage_events(events_path):
+            if str(event.get("task_id") or "") != want:
+                continue
+            usage = event.get("usage") if isinstance(event.get("usage"), dict) else {}
+            rounds += 1
+            cost += llm_usage_cost(event)
+            try:
+                prompt_tokens += int(event.get("prompt_tokens") or usage.get("prompt_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                completion_tokens += int(event.get("completion_tokens") or usage.get("completion_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        log.warning("Failed to reconstruct task cost for %s", task_id, exc_info=True)
+    return (round(cost, 6), rounds, prompt_tokens, completion_tokens)
+
 
 def status_text(workers_dict: Dict[int, Any], pending_list: list, running_dict: Dict[str, Dict[str, Any]],
                 soft_timeout_sec: int, hard_timeout_sec: int) -> str:
@@ -599,16 +607,13 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list, running_dict: 
     lines.append(f"spent_calls: {st.get('spent_calls')}")
     lines.append(f"prompt_tokens: {st.get('spent_tokens_prompt')}, completion_tokens: {st.get('spent_tokens_completion')}, cached_tokens: {st.get('spent_tokens_cached')}")
 
-    # Add budget breakdown by category
     breakdown = budget_breakdown(st)
     if breakdown:
-        # Sort by cost descending
         sorted_categories = sorted(breakdown.items(), key=lambda x: x[1], reverse=True)
         breakdown_parts = [f"{cat}=${cost:.2f}" for cat, cost in sorted_categories if cost > 0]
         if breakdown_parts:
             lines.append(f"budget_breakdown: {', '.join(breakdown_parts)}")
 
-    # Display budget drift if available
     drift_pct = st.get("budget_drift_pct")
     if drift_pct is not None:
         session_total_snap = st.get("session_total_snapshot")
@@ -625,7 +630,6 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list, running_dict: 
                 f"(tracked: ${our_delta:.2f} vs OpenRouter: ${or_delta:.2f})"
             )
 
-    # Model breakdown
     models = model_breakdown(st)
     if models:
         sorted_models = sorted(models.items(), key=lambda x: x[1]["cost"], reverse=True)
@@ -648,14 +652,32 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list, running_dict: 
 
 
 def rotate_chat_log_if_needed(drive_root: pathlib.Path, max_bytes: int = 800_000) -> None:
-    """Rotate chat log if it exceeds max_bytes."""
+    """Rotate chat log if it exceeds max_bytes.
+
+    Rotation is an atomic ``os.replace`` rename performed under the SAME
+    sidecar lock that ``append_jsonl`` writers take — the old copy+truncate
+    destroyed any line appended between the read and the truncate.
+    """
     chat = drive_root / "logs" / "chat.jsonl"
     if not chat.exists():
         return
     if chat.stat().st_size < max_bytes:
         return
-    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+    ts = utc_now_iso().replace("-", "").replace(":", "").split(".")[0]
     archive_path = drive_root / "archive" / f"chat_{ts}.jsonl"
     archive_path.parent.mkdir(parents=True, exist_ok=True)
-    archive_path.write_bytes(chat.read_bytes())
-    chat.write_text("", encoding="utf-8")
+
+    from ouroboros.utils import jsonl_append_lock_path
+
+    lock_path = jsonl_append_lock_path(chat)
+    lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=2.0, stale_sec=10.0)
+    if lock_fd is None:
+        log.warning("chat.jsonl rotation skipped: append lock busy")
+        return
+    try:
+        if not chat.exists() or chat.stat().st_size < max_bytes:
+            return
+        os.replace(chat, archive_path)
+        chat.touch()
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)

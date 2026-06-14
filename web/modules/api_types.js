@@ -1,0 +1,329 @@
+/** Dependency-free JSDoc mirror of `ouroboros.gateway.contracts`. */
+
+/**
+ * @typedef {Object} StateResponse
+ * @property {number} uptime
+ * @property {number} workers_alive
+ * @property {number} workers_total
+ * @property {number} pending_count
+ * @property {number} running_count
+ * @property {number} spent_usd
+ * @property {number} budget_limit
+ * @property {number} budget_pct
+ * @property {string} branch
+ * @property {string} sha
+ * @property {boolean} evolution_enabled
+ * @property {boolean} bg_consciousness_enabled
+ * @property {number} evolution_cycle
+ * @property {Object} evolution_state
+ * @property {Object} bg_consciousness_state
+ * @property {number} spent_calls
+ * @property {boolean} supervisor_ready
+ * @property {?string} supervisor_error
+ * @property {string} runtime_mode
+ * @property {string} context_mode
+ * @property {boolean} skills_repo_configured
+ * @property {boolean} github_token_configured
+ * @property {Array<Object>} projects  // [{id, name, status, chat_id, working_dir, last_active_at}] (v6.32.0)
+ * @property {Array<number>} project_chat_ids  // complete (uncapped, all-status) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
+ */
+
+/**
+ * @typedef {Object} EvolutionDataResponse
+ * @property {Object[]} points
+ * @property {Object[]=} checkpoints
+ * @property {string} generated_at
+ * @property {boolean} cached
+ */
+
+/**
+ * @typedef {Object} HealthResponse
+ * @property {"ok"} status
+ * @property {string} version
+ * @property {string} runtime_version
+ * @property {string} app_version
+ */
+
+/**
+ * @typedef {Object} OpenAICompatibleModelsResponse
+ * @property {string[]} models
+ * @property {string=} error
+ */
+
+/**
+ * @typedef {Object} SettingsMeta
+ * @property {string[]=} custom_secret_keys
+ * @property {Object=} setup_contract
+ */
+
+/**
+ * @typedef {Object} ChatInbound
+ * @property {"chat"} type
+ * @property {string} content
+ * @property {string=} sender_session_id
+ * @property {string=} client_message_id
+ * @property {boolean=} force_plan
+ * @property {Array<Object>=} attachments  // [{filename, display_name, mime}] — image uploads become native blocks (v6.26.0)
+ * @property {number=} chat_id     // multi-project thread routing (v6.32.0); main chat = 1
+ * @property {string=} project_id  // per-project memory scope (v6.32.0)
+ */
+
+/**
+ * @typedef {Object} CommandInbound
+ * @property {"command"} type
+ * @property {string} cmd
+ */
+
+/**
+ * @typedef {Object} ChatOutbound
+ * @property {"chat"} type
+ * @property {"user"|"assistant"|"system"} role
+ * @property {string} content
+ * @property {string} ts
+ * @property {boolean=} markdown
+ * @property {boolean=} is_progress
+ * @property {string=} task_id
+ * @property {Object=} lifecycle
+ * @property {string=} subagent_event
+ * @property {string=} subagent_task_id
+ * @property {string=} root_task_id
+ * @property {string=} parent_task_id
+ * @property {string=} delegation_role
+ * @property {string=} subagent_role
+ * @property {boolean=} accepted
+ * @property {number=} active_subagent_count
+ * @property {number=} max_active_subagents
+ * @property {string=} write_surface
+ * @property {string=} model_lane
+ * @property {string=} requested_model_lane
+ * @property {string=} effective_model_lane
+ * @property {string=} model
+ * @property {string=} task_group_id
+ * @property {string=} task_event
+ * @property {string=} status
+ * @property {number=} cost_usd
+ * @property {string=} result
+ * @property {string=} trace_summary
+ * @property {string=} error
+ * @property {string=} artifact_status
+ * @property {Object=} artifact_bundle
+ * @property {Object=} outcome_axes
+ * @property {Object=} task_contract
+ * @property {string=} reason_code
+ * @property {Object=} review_status
+ * @property {boolean=} worker_saturation_warning
+ * @property {string=} source
+ * @property {string=} sender_label
+ * @property {string=} sender_session_id
+ * @property {string=} client_message_id
+ * @property {Object=} transport
+ * @property {number=} telegram_chat_id
+ * @property {string=} system_type
+ * @property {number=} chat_id
+ */
+
+/**
+ * @typedef {Object} PhotoOutbound
+ * @property {"photo"} type
+ * @property {"user"|"assistant"} role
+ * @property {string} image_base64
+ * @property {string} mime
+ * @property {string} ts
+ * @property {string=} caption
+ * @property {string=} content
+ * @property {string=} source
+ * @property {string=} sender_label
+ * @property {string=} sender_session_id
+ * @property {string=} client_message_id
+ * @property {Object=} transport
+ * @property {number=} chat_id
+ * @property {number=} telegram_chat_id
+ */
+
+/**
+ * @typedef {Object} VideoOutbound
+ * @property {"video"} type
+ * @property {"user"|"assistant"} role
+ * @property {string} video_base64
+ * @property {string} mime
+ * @property {string} ts
+ * @property {string=} caption
+ * @property {string=} content
+ * @property {string=} source
+ * @property {string=} sender_label
+ * @property {string=} sender_session_id
+ * @property {string=} client_message_id
+ * @property {Object=} transport
+ * @property {number=} chat_id
+ * @property {number=} telegram_chat_id
+ */
+
+/**
+ * @typedef {Object} LogOutbound
+ * @property {"log"} type
+ * @property {Object} data
+ * @property {number=} chat_id  // multi-project thread routing (v6.32.0); main chat = 1
+ */
+
+/**
+ * @typedef {Object} ProjectsChangedOutbound
+ * @property {"projects_changed"} type
+ * @property {string=} project_id
+ * @property {number=} chat_id  // new project thread; client learns it before /api/state (v6.32.0)
+ */
+
+/**
+ * @typedef {Object} UploadResponse
+ * @property {boolean} ok
+ * @property {string} filename
+ * @property {string} display_name
+ * @property {string} path
+ * @property {number} size
+ * @property {string} mime
+ */
+
+/**
+ * @typedef {Object} OwnerRuntimeModeResponse
+ * @property {boolean} ok
+ * @property {string} runtime_mode
+ * @property {boolean} restart_required
+ */
+
+/**
+ * @typedef {Object} OwnerAutoGrantResponse
+ * @property {boolean} ok
+ * @property {boolean} enabled
+ */
+
+/**
+ * @typedef {Object} OwnerContextModeResponse
+ * @property {boolean} ok
+ * @property {string} context_mode
+ */
+
+/**
+ * @typedef {Object} SkillGrantResponse
+ * @property {boolean} ok
+ * @property {string} skill
+ * @property {string[]=} granted_keys
+ * @property {string[]=} granted_permissions
+ * @property {string=} extension_action
+ * @property {string=} extension_reason
+ * @property {string=} load_error
+ * @property {Object=} grants
+ */
+
+/**
+ * @typedef {Object} ExecutorRef
+ * @property {"local"|"docker_exec"} type
+ * @property {string=} id
+ * @property {"host"|"none"=} network
+ * @property {string=} workspace_host_path
+ * @property {string=} workspace_backend_path
+ * @property {string=} container_name Required when type is "docker_exec".
+ * @property {Object[]=} path_mappings
+ */
+
+/**
+ * @typedef {Object} TaskCreateRequest
+ * @property {string} description
+ * @property {string=} task_id
+ * @property {string=} type
+ * @property {number=} chat_id
+ * @property {number=} depth
+ * @property {string=} session_id
+ * @property {string=} workspace_root
+ * @property {"external"=} workspace_mode
+ * @property {"forked"|"empty"|"shared"=} memory_mode
+ * @property {string=} project_id Per-project facts scope id (else derived from the workspace path).
+ * @property {Object[]=} attachments
+ * @property {Object=} allowed_resources
+ * @property {Object=} resource_policy
+ * @property {ExecutorRef=} executor_ref
+ * @property {"stop"|"keep"=} service_teardown Task service finalization policy; `keep` is for external verifiers/owners that need live services after task completion. POSIX-only: on Windows a cancel/hard-timeout tree-kills all task processes, so `keep` is not preserved there.
+ * @property {string=} deadline_at
+ * @property {number=} timeout_sec
+ * @property {number=} timeout
+ * @property {string=} context
+ * @property {string=} expected_output
+ * @property {string=} constraints
+ * @property {boolean=} context_requires_self_body_docs
+ * @property {string=} actor_id Top-level task actor/provenance id; metadata.actor_id is reserved.
+ * @property {string=} source Top-level task source/provenance label.
+ * @property {Object=} metadata Arbitrary task metadata; executor_ref/workspace_executor keys are reserved.
+ */
+
+/**
+ * @typedef {Object} TaskCreateResponse
+ * @property {boolean} ok
+ * @property {string} task_id
+ * @property {string} status
+ */
+
+/**
+ * @typedef {Object} TaskEvent
+ * @property {number} seq
+ * @property {string=} source
+ * @property {number=} line
+ * @property {string} type
+ * @property {string} task_id
+ * @property {string=} ts
+ * @property {string=} root
+ * @property {Object=} data
+ */
+
+/**
+ * @typedef {Object} TaskListResponse
+ * @property {Object[]} tasks
+ * @property {Object=} queue
+ */
+
+/**
+ * @typedef {Object} ScheduledTasksResponse
+ * @property {number} schema_version
+ * @property {Object[]} tasks
+ */
+
+/**
+ * @typedef {Object} ScheduleUpsertResponse
+ * @property {boolean} ok
+ * @property {Object} schedule
+ */
+
+/**
+ * @typedef {Object} ScheduleDeleteResponse
+ * @property {boolean} ok
+ */
+
+/**
+ * @typedef {Object} TaskCancelResponse
+ * @property {boolean} ok
+ * @property {string} task_id
+ */
+
+/**
+ * @typedef {Object} LogTailResponse
+ * @property {string} name
+ * @property {Object[]} entries
+ */
+
+/**
+ * @typedef {Object} SkillDeleteResponse
+ * @property {boolean} ok
+ * @property {string} skill
+ * @property {string} source
+ * @property {string} deleted_payload_root
+ * @property {boolean} deleted_state
+ * @property {string} extension_action
+ * @property {string} extension_reason
+ * @property {string=} error
+ */
+
+/**
+ * @typedef {Object} UiPreferencesResponse
+ * @property {string[]} widget_order
+ * @property {boolean} nested_subagents_expanded
+ * @property {boolean=} ok
+ */
+
+export const GATEWAY_CONTRACT_VERSION = '6.32.0';
