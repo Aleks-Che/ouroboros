@@ -1,15 +1,4 @@
-"""Evolution Stats — generates evolution.json from git history and pushes to docs/.
-
-Collects metrics per sampled commit:
-  - ts: ISO timestamp
-  - hash: short commit hash
-  - msg: commit message
-  - version: semver extracted from message (e.g. "v5.2.1")
-  - py_lines: total lines across all .py files
-  - bible_bytes: size of BIBLE.md in bytes
-  - system_bytes: size of prompts/SYSTEM.md in bytes (proxy for self-concept)
-  - module_count: number of .py files
-"""
+"""Generate evolution.json metrics from sampled git history."""
 
 from __future__ import annotations
 
@@ -25,175 +14,9 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 _VERSION_RE = re.compile(r"v(\d+\.\d+\.\d+)")
-_REPO_DIR = Path(os.environ.get("OUROBOROS_REPO_DIR", "/content/ouroboros_repo"))
+_REPO_DIR = Path(os.environ.get("OUROBOROS_REPO_DIR", str(Path.home() / "Ouroboros" / "repo")))
 
-# How many data-points to generate (sampled across full history)
 MAX_POINTS = 100
-
-# ── Evolution tab HTML (injected into app.html) ────────────────────────────────
-_EVOLUTION_NAV = '<div class="nav-item" data-tab="evolution"><span class="icon">📈</span> Evolution</div>'
-
-_EVOLUTION_TAB = """    <div class="tab-content" id="tab-evolution">
-      <h2 style="color:var(--accent);margin-bottom:16px">📈 Evolution Time-Lapse</h2>
-      <p style="color:var(--muted);margin-bottom:20px;font-size:13px">
-        Growth across three axes — Technical (code lines), Philosophical (BIBLE.md), Self-Concept (System Prompt) — since birth on Feb 16, 2026.
-      </p>
-      <div id="evo-loading" style="text-align:center;padding:40px;color:var(--muted)">Loading evolution data…</div>
-      <canvas id="evoChart" style="display:none;width:100%;max-height:450px"></canvas>
-      <div id="evo-stats" style="margin-top:20px;display:none;grid-template-columns:repeat(3,1fr);gap:12px"></div>
-      <div style="margin-top:16px;text-align:right">
-        <button onclick="loadEvolution()" style="background:var(--card);border:1px solid var(--accent);color:var(--accent);padding:6px 16px;border-radius:6px;cursor:pointer;font-size:13px">↻ Refresh</button>
-      </div>
-    </div>
-"""
-
-_EVOLUTION_JS = r"""<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<script>
-// ── Evolution Time-Lapse ─────────────────────────────────────────────────────
-let _evoChart = null;
-
-function _fmtDate(ts) {
-  const d = new Date(ts);
-  return d.toLocaleDateString('en-US', {month: 'short', day: 'numeric'});
-}
-
-async function loadEvolution() {
-  const loading = document.getElementById('evo-loading');
-  const canvas  = document.getElementById('evoChart');
-  const stats   = document.getElementById('evo-stats');
-  if (!loading) return;
-  loading.textContent = 'Loading evolution data…';
-  loading.style.display = 'block';
-  canvas.style.display  = 'none';
-  if (stats) stats.style.display = 'none';
-
-  try {
-    const url = `evolution.json?t=${Date.now()}`;
-    const r = await fetch(url);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const data = await r.json();
-    if (!data.points || !data.points.length) throw new Error('No data points');
-
-    const pts     = data.points;
-    const labels  = pts.map(p => _fmtDate(p.ts));
-    const pyLines = pts.map(p => p.py_lines);
-    const bible   = pts.map(p => +(p.bible_bytes / 1024).toFixed(2));
-    const system  = pts.map(p => +(p.system_bytes / 1024).toFixed(2));
-
-    loading.style.display = 'none';
-    canvas.style.display  = 'block';
-
-    if (_evoChart) { _evoChart.destroy(); _evoChart = null; }
-
-    const isDark    = document.documentElement.getAttribute('data-theme') !== 'light';
-    const gridColor = isDark ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.07)';
-    const textColor = isDark ? '#9ca3af' : '#6b7280';
-
-    _evoChart = new Chart(canvas.getContext('2d'), {
-      type: 'line',
-      data: {
-        labels,
-        datasets: [
-          {
-            label: 'Code (lines)',
-            data: pyLines,
-            borderColor: '#00d1ff',
-            backgroundColor: 'rgba(0,209,255,0.08)',
-            tension: 0.35, fill: true,
-            yAxisID: 'yCode',
-            pointRadius: 2, borderWidth: 2,
-          },
-          {
-            label: 'Bible (KB)',
-            data: bible,
-            borderColor: '#a78bfa',
-            backgroundColor: 'rgba(167,139,250,0.08)',
-            tension: 0.35, fill: false,
-            yAxisID: 'yDoc',
-            pointRadius: 2, borderWidth: 2,
-          },
-          {
-            label: 'System Prompt (KB)',
-            data: system,
-            borderColor: '#34d399',
-            backgroundColor: 'rgba(52,211,153,0.08)',
-            tension: 0.35, fill: false,
-            yAxisID: 'yDoc',
-            pointRadius: 2, borderWidth: 2,
-          },
-        ],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: { mode: 'index', intersect: false },
-        plugins: {
-          legend: { labels: { color: textColor, font: { size: 12 } } },
-          tooltip: {
-            callbacks: {
-              title(items) {
-                const p = pts[items[0].dataIndex];
-                const v = p.version ? ` [v${p.version}]` : '';
-                return `${_fmtDate(p.ts)}${v} — ${p.msg.slice(0, 55)}`;
-              },
-            },
-          },
-        },
-        scales: {
-          x: {
-            ticks: { color: textColor, maxTicksLimit: 12, maxRotation: 30 },
-            grid: { color: gridColor },
-          },
-          yCode: {
-            type: 'linear', position: 'left',
-            ticks: { color: '#00d1ff' },
-            grid: { color: gridColor },
-            title: { display: true, text: 'Lines of Code', color: '#00d1ff', font: {size: 11} },
-          },
-          yDoc: {
-            type: 'linear', position: 'right',
-            ticks: { color: '#a78bfa' },
-            grid: { drawOnChartArea: false },
-            title: { display: true, text: 'KB', color: '#a78bfa', font: {size: 11} },
-          },
-        },
-      },
-    });
-
-    // Stats cards
-    if (stats) {
-      const first = pts[0], last = pts[pts.length - 1];
-      const mult  = last.py_lines / Math.max(first.py_lines, 1);
-      stats.style.display = 'grid';
-      stats.innerHTML = [
-        ['📏', 'Code Growth',     `${first.py_lines.toLocaleString()} → ${last.py_lines.toLocaleString()} lines`, `×${mult.toFixed(1)} in ${pts.length} snapshots`],
-        ['📖', 'Bible Growth',    `${(first.bible_bytes/1024).toFixed(1)} → ${(last.bible_bytes/1024).toFixed(1)} KB`,    `+${((last.bible_bytes-first.bible_bytes)/1024).toFixed(1)} KB philosophy`],
-        ['🧠', 'Self Growth',     `${(first.system_bytes/1024).toFixed(1)} → ${(last.system_bytes/1024).toFixed(1)} KB`,  `Generated ${data.generated_at ? new Date(data.generated_at).toLocaleDateString() : ''}`],
-      ].map(([icon, title, val, sub]) => `
-        <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;text-align:center">
-          <div style="font-size:22px;margin-bottom:4px">${icon}</div>
-          <div style="font-size:11px;color:var(--muted);margin-bottom:4px">${title}</div>
-          <div style="font-weight:600;color:var(--text);font-size:13px">${val}</div>
-          <div style="font-size:11px;color:var(--accent);margin-top:2px">${sub}</div>
-        </div>`).join('');
-    }
-  } catch(e) {
-    if (loading) { loading.style.display = 'block'; loading.textContent = `⚠ ${e.message}`; }
-    console.error('Evolution load error:', e);
-  }
-}
-
-// Auto-load when tab opened
-document.addEventListener('DOMContentLoaded', () => {
-  document.querySelectorAll('.nav-item').forEach(item => {
-    item.addEventListener('click', () => {
-      if (item.dataset.tab === 'evolution') setTimeout(loadEvolution, 50);
-    });
-  });
-});
-</script>
-"""
-
 
 def _git(args: list[str], timeout: int = 15) -> str:
     """Run git command in repo dir, return stdout or empty string on error."""
@@ -304,49 +127,25 @@ def _collect_data() -> list[dict[str, Any]]:
     return points
 
 
-def _patch_app_html(webapp_dir: Path) -> str:
-    """Inject Evolution tab into app.html if not already present."""
-    app_path = webapp_dir / "app.html"
-    if not app_path.exists():
-        return "app.html not found"
-
-    html = app_path.read_text(encoding="utf-8")
-
-    if 'data-tab="evolution"' in html:
-        return "already patched"
-
-    # 1. Insert nav item before settings nav item
-    settings_nav = '<div class="nav-item" data-tab="settings">'
-    if settings_nav not in html:
-        return f"nav anchor not found"
-    html = html.replace(settings_nav, _EVOLUTION_NAV + "\n      " + settings_nav)
-
-    # 2. Insert tab content before settings tab content
-    settings_tab_marker = '<div class="tab-content" id="tab-settings">'
-    if settings_tab_marker not in html:
-        return "settings tab not found"
-    html = html.replace(settings_tab_marker, _EVOLUTION_TAB + "    " + settings_tab_marker)
-
-    # 3. Add Chart.js + evolution JS before </body>
-    if "chart.js" not in html.lower():
-        html = html.replace("</body>", _EVOLUTION_JS + "\n</body>")
-
-    app_path.write_text(html, encoding="utf-8")
-    return "patched"
-
-
 def _push_to_github(data: dict[str, Any]) -> str:
     """Push evolution.json to the repo's docs/ folder via GitHub API."""
     import base64
     import requests
 
+    from ouroboros.utils import in_worker_process
+
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not token:
         return "error: GITHUB_TOKEN not found"
 
-    user = os.environ.get("GITHUB_USER", "")
-    repo = os.environ.get("GITHUB_REPO", "")
-    repo_slug = f"{user}/{repo}"
+    repo_setting = os.environ.get("GITHUB_REPO", "").strip()
+    if "/" in repo_setting:
+        repo_slug = repo_setting
+    else:
+        user = os.environ.get("GITHUB_USER", "").strip()
+        repo_slug = f"{user}/{repo_setting}" if user and repo_setting else ""
+    if not repo_slug:
+        return "error: GITHUB_REPO not configured (expected owner/repo)"
     file_path = "docs/evolution.json"
     branch = os.environ.get("GITHUB_BRANCH", "ouroboros")
 
@@ -356,23 +155,26 @@ def _push_to_github(data: dict[str, Any]) -> str:
         "Accept": "application/vnd.github.v3+json",
     }
 
-    sha = None
-    r = requests.get(url, headers=headers, timeout=15)
-    if r.status_code == 200:
-        sha = r.json().get("sha")
+    with requests.Session() as session:
+        if in_worker_process():
+            session.trust_env = False  # fork-safe: skip system proxy lookup
+        sha = None
+        r = session.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
 
-    content_str = json.dumps(data, ensure_ascii=False, indent=2)
-    content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+        content_str = json.dumps(data, ensure_ascii=False, indent=2)
+        content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
 
-    payload = {
-        "message": f"evolution: {len(data.get('points', []))} data points",
-        "content": content_b64,
-        "branch": branch,
-    }
-    if sha:
-        payload["sha"] = sha
+        payload = {
+            "message": f"evolution: {len(data.get('points', []))} data points",
+            "content": content_b64,
+            "branch": branch,
+        }
+        if sha:
+            payload["sha"] = sha
 
-    put_r = requests.put(url, headers=headers, json=payload, timeout=15)
+        put_r = session.put(url, headers=headers, json=payload, timeout=15)
     if put_r.status_code in [200, 201]:
         return f"pushed {len(data.get('points', []))} points to {file_path}"
     return f"error: {put_r.status_code} — {put_r.text[:200]}"

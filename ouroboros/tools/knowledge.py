@@ -1,44 +1,50 @@
-"""Knowledge base tools: persistent structured memory on Google Drive.
+"""Persistent topic-based knowledge files with an auto-maintained index."""
 
-Provides read/write/list operations for topic-based knowledge files
-stored in memory/knowledge/ on Drive. Auto-maintains an index file.
-"""
-
+import json
+import hashlib
 import logging
 import re
 from pathlib import Path
 from typing import List
 
 from ouroboros.tools.registry import ToolEntry, ToolContext
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
 KNOWLEDGE_DIR = "memory/knowledge"
-INDEX_FILE = "_index.md"
+INDEX_FILE = "index-full.md"
 
-# --- Sanitization ---
+
+def _knowledge_dir(ctx: ToolContext) -> Path:
+    """Resolve the knowledge base dir: a per-project store under the CANONICAL data
+    dir when the task is project-scoped (Phase 3b), else the canonical
+    ``memory/knowledge`` under the task's drive. Project facts thus persist across
+    forked/empty child drives and stay isolated from the global memory tree."""
+    pid = str(getattr(ctx, "project_id", "") or "").strip()
+    if pid:
+        from ouroboros.project_facts import project_knowledge_dir
+
+        return project_knowledge_dir(pid)
+    return ctx.drive_path(KNOWLEDGE_DIR)
 
 _VALID_TOPIC = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,98}[a-zA-Z0-9]$|^[a-zA-Z0-9]$')
-_RESERVED = frozenset({"_index", "con", "prn", "aux", "nul"})
+_RESERVED = frozenset({"_index", "index-full", "con", "prn", "aux", "nul"})
 
 
 def _sanitize_topic(topic: str) -> str:
-    """Validate and sanitize topic name. Raises ValueError on bad input."""
+    """Validate a topic name and raise ValueError on bad input."""
     if not topic or not isinstance(topic, str):
         raise ValueError("Topic must be a non-empty string")
 
-    # Strip whitespace
     topic = topic.strip()
 
-    # Reject path separators and traversal
     if '/' in topic or '\\' in topic or '..' in topic:
         raise ValueError(f"Invalid characters in topic: {topic}")
 
-    # Check against pattern
     if not _VALID_TOPIC.match(topic):
         raise ValueError(f"Invalid topic name: {topic}. Use alphanumeric, underscore, hyphen, dot.")
 
-    # Reject reserved names
     if topic.lower() in _RESERVED:
         raise ValueError(f"Reserved topic name: {topic}")
 
@@ -46,20 +52,14 @@ def _sanitize_topic(topic: str) -> str:
 
 
 def _safe_path(ctx: ToolContext, topic: str) -> tuple[Path, str]:
-    """Build and verify path is within knowledge directory.
-
-    Returns:
-        tuple[Path, str]: (path, sanitized_topic)
-    """
+    """Build a knowledge path and verify containment."""
     sanitized_topic = _sanitize_topic(topic)
-    kdir = ctx.drive_path(KNOWLEDGE_DIR)
+    kdir = _knowledge_dir(ctx)
     path = kdir / f"{sanitized_topic}.md"
 
-    # Resolve and verify containment
     resolved = path.resolve()
     kdir_resolved = kdir.resolve()
 
-    # Use relative_to for robust path containment check
     try:
         resolved.relative_to(kdir_resolved)
     except ValueError:
@@ -68,26 +68,19 @@ def _safe_path(ctx: ToolContext, topic: str) -> tuple[Path, str]:
     return path, sanitized_topic
 
 
-# --- Helpers ---
-
 def _ensure_dir(ctx: ToolContext):
-    """Create knowledge directory if it doesn't exist."""
-    ctx.drive_path(KNOWLEDGE_DIR).mkdir(parents=True, exist_ok=True)
+    """Create the knowledge directory."""
+    _knowledge_dir(ctx).mkdir(parents=True, exist_ok=True)
 
 
 def _extract_summary(text: str, max_chars: int = 150) -> str:
-    """Extract a richer summary from knowledge file content.
-
-    Skips heading lines (starting with #) and collects up to 3 meaningful
-    content sentences/lines, joined with ' | ', capped at max_chars.
-    """
+    """Extract up to three non-heading snippets for the index."""
     lines = text.strip().split("\n")
     snippets = []
     for line in lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        # Strip markdown list/bold markers for a cleaner snippet
         clean = stripped.lstrip("-*").strip().lstrip("#").strip()
         if clean:
             snippets.append(clean)
@@ -101,8 +94,8 @@ def _extract_summary(text: str, max_chars: int = 150) -> str:
 
 
 def _rebuild_index(ctx: ToolContext):
-    """Rebuild the knowledge index from all .md files (full scan)."""
-    kdir = ctx.drive_path(KNOWLEDGE_DIR)
+    """Rebuild the knowledge index from all topic files."""
+    kdir = _knowledge_dir(ctx)
     if not kdir.exists():
         return
 
@@ -110,14 +103,11 @@ def _rebuild_index(ctx: ToolContext):
     for f in sorted(kdir.glob("*.md")):
         if f.name == INDEX_FILE:
             continue
-        # Sanitize topic from filename to protect against hand-crafted filenames
         try:
             topic = _sanitize_topic(f.stem)
         except ValueError:
-            # Skip files with invalid names
             continue
 
-        # Read first 3 non-heading lines as summary
         try:
             text = f.read_text(encoding="utf-8").strip()
             summary = _extract_summary(text)
@@ -136,20 +126,18 @@ def _rebuild_index(ctx: ToolContext):
 
 
 def _update_index_entry(ctx: ToolContext, topic: str):
-    """Incrementally update the index for a single topic."""
-    kdir = ctx.drive_path(KNOWLEDGE_DIR)
+    """Update the index entry for one topic."""
+    kdir = _knowledge_dir(ctx)
     index_path = kdir / INDEX_FILE
     topic_path = kdir / f"{topic}.md"
 
     _ensure_dir(ctx)
 
-    # Read existing index or create header
     if index_path.exists():
         index_content = index_path.read_text(encoding="utf-8")
     else:
         index_content = "# Knowledge Base Index\n\n"
 
-    # Split into lines, preserving header
     lines = index_content.split("\n")
     header_end = 0
     for i, line in enumerate(lines):
@@ -162,11 +150,9 @@ def _update_index_entry(ctx: ToolContext, topic: str):
     header = "\n".join(lines[:header_end])
     entries = [line for line in lines[header_end:] if line.strip() and line.strip() != "(empty)"]
 
-    # Remove old entry for this topic (if exists)
     pattern = f"- **{topic}**:"
     entries = [e for e in entries if not e.strip().startswith(pattern)]
 
-    # Add new entry if topic file exists
     if topic_path.exists():
         try:
             text = topic_path.read_text(encoding="utf-8").strip()
@@ -176,26 +162,21 @@ def _update_index_entry(ctx: ToolContext, topic: str):
             log.debug(f"Failed to read knowledge file for index update: {topic}", exc_info=True)
             new_entry = f"- **{topic}**: (unreadable)"
 
-        # Insert in sorted position
         entries.append(new_entry)
         entries.sort(key=lambda e: e.lower())
 
-    # Rebuild index content
     if entries:
         new_index = header.rstrip("\n") + "\n\n" + "\n".join(entries) + "\n"
     else:
         new_index = header.rstrip("\n") + "\n\n(empty)\n"
 
-    # Atomic write: temp file + replace (works on Windows even if target exists)
     temp_path = index_path.with_suffix(".tmp")
     temp_path.write_text(new_index, encoding="utf-8")
     temp_path.replace(index_path)
 
 
-# --- Tool handlers ---
-
 def _knowledge_read(ctx: ToolContext, topic: str) -> str:
-    """Read a knowledge file by topic name."""
+    """Read a knowledge topic."""
     try:
         path, sanitized_topic = _safe_path(ctx, topic)
     except ValueError as e:
@@ -207,28 +188,46 @@ def _knowledge_read(ctx: ToolContext, topic: str) -> str:
 
 
 def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "overwrite") -> str:
-    """Write or append to a knowledge file."""
+    """Write or append a knowledge topic."""
     try:
         path, sanitized_topic = _safe_path(ctx, topic)
     except ValueError as e:
         return f"⚠️ Invalid topic: {e}"
 
-    # Validate mode explicitly
     if mode not in ("overwrite", "append"):
         return f"⚠️ Invalid mode '{mode}'. Use 'overwrite' or 'append'."
 
     _ensure_dir(ctx)
+    old_content = path.read_text(encoding="utf-8") if path.exists() else ""
 
-    if mode == "append":
-        # Check if we need a leading newline by reading last byte first
+    if sanitized_topic == "improvement-backlog":
+        # The backlog is concurrently rewritten by its locked helpers (groomer,
+        # post-task promotion close). A generic unlocked write can interleave
+        # with a groom and lose items — take the SAME file lock for the write.
+        from ouroboros.improvement_backlog import _locked_text_file
+
+        # "a+" for both modes: "r+" raises FileNotFoundError on the very first
+        # overwrite of a fresh drive (the topic file is created on first write).
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _locked_text_file(path, mode="a+") as fh:
+            if mode == "append":
+                fh.seek(0)
+                tail = fh.read()
+                if tail and not tail.endswith("\n"):
+                    fh.write("\n")
+                fh.write(content)
+            else:
+                fh.seek(0)
+                fh.truncate(0)
+                fh.write(content)
+    elif mode == "append":
         needs_newline = False
         if path.exists() and path.stat().st_size > 0:
             with open(path, "rb") as rf:
-                rf.seek(-1, 2)  # Seek to last byte
+                rf.seek(-1, 2)
                 if rf.read(1) != b"\n":
                     needs_newline = True
 
-        # Now open for append and write
         with open(path, "a", encoding="utf-8") as f:
             if needs_newline:
                 f.write("\n")
@@ -237,18 +236,54 @@ def _knowledge_write(ctx: ToolContext, topic: str, content: str, mode: str = "ov
         path.write_text(content, encoding="utf-8")
 
     _update_index_entry(ctx, sanitized_topic)
+
+    try:
+        history_path = _knowledge_dir(ctx).parent / "knowledge_history.jsonl"
+        with open(history_path, "a", encoding="utf-8") as hf:
+            hf.write(json.dumps({
+                "ts": utc_now_iso(),
+                "task_id": str(getattr(ctx, "task_id", "") or ""),
+                "topic": sanitized_topic,
+                "mode": mode,
+                "old_sha256": hashlib.sha256(old_content.encode("utf-8")).hexdigest() if old_content else "",
+                "new_sha256": hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() if path.exists() else "",
+                "old_content": old_content,
+                "new_content": path.read_text(encoding="utf-8") if path.exists() else "",
+            }, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    try:
+        journal_path = _knowledge_dir(ctx).parent / "knowledge_journal.jsonl"
+        total_kb = 0
+        knowledge_dir = _knowledge_dir(ctx)
+        if knowledge_dir.exists():
+            for f in knowledge_dir.iterdir():
+                if f.is_file() and f.suffix == ".md":
+                    total_kb += f.stat().st_size / 1024
+        entry = {
+            "ts": utc_now_iso(),
+            "topic": sanitized_topic,
+            "mode": mode,
+            "file_kb": path.stat().st_size / 1024,
+            "total_knowledge_kb": round(total_kb, 2),
+        }
+        with open(journal_path, "a", encoding="utf-8") as jf:
+            jf.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
     return f"✅ Knowledge '{sanitized_topic}' saved ({mode})."
 
 
 def _knowledge_list(ctx: ToolContext) -> str:
-    """List all knowledge topics with summaries."""
-    kdir = ctx.drive_path(KNOWLEDGE_DIR)
+    """List knowledge topics with summaries."""
+    kdir = _knowledge_dir(ctx)
     index_path = kdir / INDEX_FILE
 
     if index_path.exists():
         return index_path.read_text(encoding="utf-8")
 
-    # No index yet — build it
     if kdir.exists():
         _rebuild_index(ctx)
         if index_path.exists():
@@ -257,19 +292,17 @@ def _knowledge_list(ctx: ToolContext) -> str:
     return "Knowledge base is empty. Use knowledge_write to add topics."
 
 
-# --- Tool registration ---
-
 def get_tools() -> List[ToolEntry]:
     return [
         ToolEntry("knowledge_read", {
             "name": "knowledge_read",
-            "description": "Read a topic from the persistent knowledge base on Drive.",
+            "description": "Read a topic from the persistent knowledge base on Drive. On a project-scoped task, reads from that project's per-project facts store (isolated from global knowledge).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
-                        "description": "Topic name (alphanumeric, hyphens, underscores). E.g. 'browser-automation', 'joi_gotchas'"
+                        "description": "Topic name (alphanumeric, hyphens, underscores). E.g. 'browser-automation', 'git-recipes'"
                     }
                 },
                 "required": ["topic"]
@@ -277,7 +310,7 @@ def get_tools() -> List[ToolEntry]:
         }, _knowledge_read),
         ToolEntry("knowledge_write", {
             "name": "knowledge_write",
-            "description": "Write or append to a knowledge topic. Use for recipes, gotchas, patterns learned from experience.",
+            "description": "Write or append to a knowledge topic. Use for recipes, gotchas, patterns learned from experience. On a project-scoped task, reads/writes are automatically scoped to that project's per-project facts store (isolated from global knowledge).",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -300,7 +333,7 @@ def get_tools() -> List[ToolEntry]:
         }, _knowledge_write),
         ToolEntry("knowledge_list", {
             "name": "knowledge_list",
-            "description": "List all topics in the knowledge base with summaries.",
+            "description": "List all topics in the knowledge base with summaries. On a project-scoped task, lists only the current project's facts store.",
             "parameters": {
                 "type": "object",
                 "properties": {},

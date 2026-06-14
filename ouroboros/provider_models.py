@@ -1,0 +1,280 @@
+"""Provider-specific model ID helpers, direct-provider defaults, and the
+provider registry (SSOT for prefix→provider→credentials knowledge that was
+previously duplicated across llm.py, pricing.py, agent_task_pipeline.py and
+deep_self_review.py)."""
+
+from __future__ import annotations
+
+import os
+
+# Direct-provider prefix → canonical provider name. Un-prefixed models route
+# through OpenRouter. Order matters only for readability; prefixes are disjoint.
+PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("openai::", "openai"),
+    ("anthropic::", "anthropic"),
+    ("deepseek::", "deepseek"),
+    ("cloudru::", "cloudru"),
+    ("gigachat::", "gigachat"),
+    ("openai-compatible::", "openai-compatible"),
+    ("openrouter::", "openrouter"),
+)
+
+# Primary credential env var per provider (single-key providers).
+PROVIDER_ENV_KEYS: dict[str, str] = {
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+    "openrouter": "OPENROUTER_API_KEY",
+}
+
+
+def provider_for_model(model: str) -> str:
+    """Return the execution provider for a model id (``local`` for local lanes)."""
+    name = str(model or "").strip()
+    if name.endswith(" (local)"):
+        return "local"
+    for prefix, provider in PROVIDER_PREFIXES:
+        if name.startswith(prefix):
+            return provider
+    return "openrouter"
+
+
+def provider_has_credentials(provider: str) -> bool:
+    """Return True when the environment carries usable credentials for a provider."""
+    if provider == "local":
+        return True
+    if provider == "openai-compatible":
+        compat = str(os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
+        legacy_key = str(os.environ.get("OPENAI_API_KEY", "") or "").strip()
+        legacy_base = str(os.environ.get("OPENAI_BASE_URL", "") or "").strip()
+        return bool(compat or (legacy_key and legacy_base))
+    if provider == "gigachat":
+        creds = str(os.environ.get("GIGACHAT_CREDENTIALS", "") or "").strip()
+        user = str(os.environ.get("GIGACHAT_USER", "") or "").strip()
+        password = str(os.environ.get("GIGACHAT_PASSWORD", "") or "").strip()
+        return bool(creds or (user and password))
+    env_key = PROVIDER_ENV_KEYS.get(provider, "OPENROUTER_API_KEY")
+    return bool(str(os.environ.get(env_key, "") or "").strip())
+
+
+def model_has_credentials(model: str) -> bool:
+    """Return True when the model's provider has usable credentials configured."""
+    return provider_has_credentials(provider_for_model(model))
+
+
+def resolve_credentialed_model(default_model: str) -> str:
+    """Return ``default_model`` if its provider is credentialed, else the first
+    configured model slot whose provider has credentials (light → fallback →
+    main → code). Falls back to ``default_model`` when nothing is credentialed
+    so callers surface the original provider error rather than a silent swap."""
+    if model_has_credentials(default_model):
+        return default_model
+    for env_name in (
+        "OUROBOROS_MODEL_LIGHT",
+        "OUROBOROS_MODEL_FALLBACK",
+        "OUROBOROS_MODEL",
+        "OUROBOROS_MODEL_CODE",
+    ):
+        candidate = str(os.environ.get(env_name, "") or "").strip()
+        if candidate and model_has_credentials(candidate):
+            return candidate
+    return default_model
+
+
+OPENAI_DIRECT_DEFAULTS = {
+    "main": "openai::gpt-5.5",
+    "code": "openai::gpt-5.5",
+    "light": "openai::gpt-5.5-mini",
+    "fallback": "openai::gpt-5.5-mini",
+}
+
+CLOUDRU_DIRECT_DEFAULTS = {
+    "main": "cloudru::zai-org/GLM-4.7",
+    "code": "cloudru::zai-org/GLM-4.7",
+    "light": "cloudru::zai-org/GLM-4.7",
+    "fallback": "cloudru::zai-org/GLM-4.7",
+}
+
+GIGACHAT_DIRECT_DEFAULTS = {
+    "main": "gigachat::GigaChat-3-Ultra",
+    "code": "gigachat::GigaChat-3-Ultra",
+    "light": "gigachat::GigaChat-3-Ultra",
+    "fallback": "gigachat::GigaChat-3-Ultra",
+}
+
+ANTHROPIC_DIRECT_DEFAULTS = {
+    "main": "anthropic::claude-opus-4-8",
+    "code": "anthropic::claude-opus-4-8",
+    "light": "anthropic::claude-sonnet-4-6",
+    "fallback": "anthropic::claude-sonnet-4-6",
+}
+
+_DIRECT_PROVIDER_DEFAULTS = {
+    "openai": OPENAI_DIRECT_DEFAULTS,
+    "anthropic": ANTHROPIC_DIRECT_DEFAULTS,
+    "cloudru": CLOUDRU_DIRECT_DEFAULTS,
+    "gigachat": GIGACHAT_DIRECT_DEFAULTS,
+}
+
+_ANTHROPIC_MODEL_ALIASES = {
+    "claude-opus-4.6": "claude-opus-4-6",
+    "claude-opus-4.7": "claude-opus-4-7",
+    "claude-opus-4.8": "claude-opus-4-8",
+    "claude-sonnet-4.6": "claude-sonnet-4-6",
+}
+
+
+def normalize_anthropic_model_id(model_id: str) -> str:
+    text = str(model_id or "").strip()
+    return _ANTHROPIC_MODEL_ALIASES.get(text, text)
+
+
+def migrate_model_value(provider: str, value: str) -> str:
+    text = str(value or "").strip()
+    if provider == "openai":
+        if text.startswith("openai/"):
+            return f"openai::{text[len('openai/'):]}"
+        return text
+    if provider == "anthropic":
+        if text.startswith("anthropic::"):
+            return f"anthropic::{normalize_anthropic_model_id(text[len('anthropic::'):])}"
+        if text.startswith("anthropic/"):
+            return f"anthropic::{normalize_anthropic_model_id(text[len('anthropic/'):])}"
+        return text
+    if provider == "deepseek":
+        if text.startswith("deepseek::"):
+            return text
+        if text.startswith("deepseek/"):
+            return f"deepseek::{text[len('deepseek/'):]}"
+        return text
+    if provider == "cloudru":
+        if text.startswith("cloudru::"):
+            return text
+        if text.startswith("cloudru/"):
+            return f"cloudru::{text[len('cloudru/'):]}"
+        return text
+    return text
+
+
+def compute_direct_review_models_fallback(
+    provider: str,
+    main_model: str,
+    light_model: str = "",
+    *,
+    review_runs: int = 3,
+) -> list[str]:
+    """Return direct-provider review fallback preserving commit-triad shape.
+
+    The quorum-safe shape is ``[main, light, light]`` when main/light are
+    distinct provider-prefixed lanes; otherwise it degrades to ``[main] * N``.
+    """
+    if provider not in _DIRECT_PROVIDER_DEFAULTS:
+        return []
+    provider_prefix = f"{provider}::"
+    main = migrate_model_value(provider, main_model)
+    if not main.startswith(provider_prefix):
+        return []
+    light = migrate_model_value(provider, light_model) if light_model else ""
+    default_light = migrate_model_value(provider, _DIRECT_PROVIDER_DEFAULTS[provider].get("light", ""))
+    light_slot = light if light.startswith(provider_prefix) else default_light
+    if light_slot and light_slot != main:
+        return [main, light_slot, light_slot]
+    return [main] * int(review_runs or 3)
+
+
+# Conservative static vision map by normalized id/prefix. The OpenRouter
+# /models overlay (llm.py) refines this at runtime; static knowledge only
+# covers families whose vision support is long-established.
+_VISION_MODEL_PREFIXES: tuple[str, ...] = (
+    "openai/gpt-5", "openai/gpt-4o", "openai/gpt-4.1", "openai/o3", "openai/o4",
+    "google/gemini-", "anthropic/claude-",
+    "x-ai/grok-4", "x-ai/grok-3",
+    "qwen/qwen-vl", "qwen/qwen2.5-vl", "qwen/qwen3-vl",
+    "mistralai/pixtral", "meta-llama/llama-4", "meta-llama/llama-3.2-90b-vision",
+    "openai/gpt-5.5",
+)
+
+# Runtime overlay: model_id → bool, fed from OpenRouter /models
+# architecture.input_modalities by llm.py (same lifecycle as its
+# supported-parameters cache).
+_VISION_OVERLAY: dict = {}
+
+
+def update_vision_overlay(model_id: str, supports: bool) -> None:
+    normalized = normalize_model_identity(model_id)
+    if normalized:
+        _VISION_OVERLAY[normalized] = bool(supports)
+
+
+def supports_vision(model_id: str) -> bool:
+    """True when the model accepts native image input blocks."""
+    # Local lanes have no vision regardless of family name; check the RAW id —
+    # normalize_model_identity strips the " (local)" suffix.
+    if str(model_id or "").strip().endswith(" (local)"):
+        return False
+    normalized = normalize_model_identity(model_id)
+    if not normalized:
+        return False
+    if normalized in _VISION_OVERLAY:
+        return _VISION_OVERLAY[normalized]
+    return normalized.startswith(_VISION_MODEL_PREFIXES)
+
+
+# Conservative static context-window knowledge (tokens) by normalized id/prefix.
+# Deliberately tight: only families with long-established public windows that
+# this deployment actually routes to. Unknown models return 0 and callers keep
+# their profile defaults — a wrong window here either wastes compaction (too
+# small) or overflows the provider (too large), so guessing is worse than 0.
+# First matching prefix wins (most specific first): a dated fable variant like
+# "anthropic/claude-fable-5-20260601" must hit the 1M family entry, not the
+# generic 200K anthropic bucket.
+_CONTEXT_WINDOW_PREFIXES: tuple[tuple[str, int], ...] = (
+    ("anthropic/claude-fable-5", 1_000_000),
+    ("anthropic/claude-", 200_000),
+    ("openai/gpt-5.5", 1_000_000),
+    ("google/gemini-3.", 1_000_000),
+    ("google/gemini-2.5", 1_000_000),
+    # GigaChat-3 family: Ultra 131K (verified 2026-06), Lightning 256K. One
+    # conservative family entry — both are far below the 1M scope floor and
+    # early compaction is the safe direction for the bigger sibling.
+    ("gigachat/", 131_072),
+)
+
+
+def context_window_tokens(model_id: str) -> int:
+    """Best-known context window (tokens) for a remote model id; 0 = unknown.
+
+    Local lanes are intentionally not covered: their window comes live from
+    ``LocalModelManager.get_context_length()`` and they already run the low
+    context profile.
+    """
+    raw = str(model_id or "").strip()
+    if not raw or raw.endswith(" (local)"):
+        return 0
+    normalized = normalize_model_identity(raw)
+    for prefix, window in _CONTEXT_WINDOW_PREFIXES:
+        if normalized.startswith(prefix):
+            return window
+    return 0
+
+
+def normalize_model_identity(model: str) -> str:
+    text = str(model or "").strip()
+    if text.endswith(" (local)"):
+        text = text[:-8]
+    if text.startswith("openai::"):
+        return f"openai/{text[len('openai::'):]}"
+    if text.startswith("openai-compatible::"):
+        return f"openai-compatible/{text[len('openai-compatible::'):]}"
+    if text.startswith("deepseek::"):
+        return f"deepseek/{text[len('deepseek::'):]}"
+    if text.startswith("cloudru::"):
+        return f"cloudru/{text[len('cloudru::'):]}"
+    if text.startswith("gigachat::"):
+        return f"gigachat/{text[len('gigachat::'):]}"
+    if text.startswith("anthropic::"):
+        return f"anthropic/{normalize_anthropic_model_id(text[len('anthropic::'):])}"
+    if text.startswith("anthropic/"):
+        return f"anthropic/{normalize_anthropic_model_id(text[len('anthropic/'):])}"
+    return text

@@ -1,21 +1,19 @@
-"""
-Browser automation tools via Playwright (sync API).
-
-Provides browse_page (open URL, get content/screenshot)
-and browser_action (click, fill, evaluate JS on current page).
-
-Browser state lives in ToolContext (per-task lifecycle),
-not module-level globals — safe across threads.
-"""
+"""Playwright browser tools with per-ToolContext lifecycle/thread affinity."""
 
 from __future__ import annotations
 
 import base64
+import ipaddress
 import logging
+import os
+import pathlib
+import re
+import socket
 import subprocess
 import sys
 import threading
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
 
 try:
     from playwright_stealth import Stealth
@@ -24,177 +22,680 @@ except ImportError:
     _HAS_STEALTH = False
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.server_auth import is_loopback_host
+from ouroboros.config import AGENT_SERVER_PORT
 
 log = logging.getLogger(__name__)
 
 _playwright_ready = False
-# Module-level Playwright instance to avoid greenlet threading issues
-# Persists across ToolContext recreations but can be reset on error
-_pw_instance = None
-_pw_thread_id = None  # Track which thread owns the Playwright instance
+_playwright_ready_engines: set[tuple[str, str]] = set()
+_playwright_browsers_path_managed = False
+_MISSING_EXECUTABLE_RE = re.compile(r"Executable doesn't exist at ([^\n]+)")
+_NONSTANDARD_NUMERIC_IPV4_RE = re.compile(r"^(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+)){0,3}$", re.I)
+_SUPPORTED_BROWSER_ENGINES = frozenset({"chromium", "webkit"})
 
 
-def _ensure_playwright_installed():
-    """Install Playwright and Chromium if not already available."""
-    global _playwright_ready
-    if _playwright_ready:
+def _normalize_browser_engine(engine: str = "") -> str:
+    value = str(engine or "chromium").strip().lower()
+    if value not in _SUPPORTED_BROWSER_ENGINES:
+        raise ValueError("browser engine must be 'chromium' or 'webkit'")
+    return value
+
+
+# Subagent browse restrictions (no loopback/private/non-HTTP) apply to ALL
+# delegated subagents — read-only, acting, and fail-closed missing-constraint.
+# Same fail-closed predicate as secret/control READ denials (SSOT in tools.core).
+from ouroboros.tools.core import is_restricted_subagent_profile as _readonly_subagent
+
+
+def _is_subagent_blocked_browser_url(url: str, ctx: Any = None) -> bool:
+    parsed = urlparse(str(url or ""))
+    scheme = parsed.scheme
+    if scheme == "file":
+        # Readonly/acting subagents may open their OWN built files for visual
+        # checks, scoped to the task's explicit workspace root only — never the
+        # data root, so secrets like data/settings.json stay unreachable.
+        return not _file_url_under_workspace(parsed, ctx)
+    if scheme not in {"http", "https"}:
+        return True
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    if not host:
+        return True
+    if is_loopback_host(host) or host == "localhost":
+        # Local app verification is allowed EXCEPT the Ouroboros control-plane
+        # ports: loopback API is unauthenticated (server_auth bypasses auth for
+        # loopback), so a subagent must never reach it.
+        return _is_blocked_loopback_port(parsed)
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        if _NONSTANDARD_NUMERIC_IPV4_RE.match(host):
+            return True
+        return _hostname_resolves_to_blocked_ip(host)
+    if ip.is_loopback:
+        return _is_blocked_loopback_port(parsed)
+    return _is_blocked_subagent_ip(ip)
+
+
+def _control_plane_loopback_ports() -> set[int]:
+    """Ouroboros loopback control-plane ports a subagent must never reach: the three live
+    defaults agent-API (8765), local-model (8765+1=8766) and host-service (8765+2=8767);
+    the configured LOCAL_MODEL_PORT; the ACTUAL bound server port (find_free_port may fall
+    back, recorded in state/server_port); and any isolated-run server's EXPLICIT
+    OUROBOROS_SERVER_PORT / OUROBOROS_HOST_SERVICE_PORT. The +1/+2 above are the fixed
+    default ports, NOT adjacency guesses — configured/bound ports are blocked EXACTLY (the
+    isolated server sets both env ports independently, so no neighbor needs guessing)."""
+    ports = {AGENT_SERVER_PORT, AGENT_SERVER_PORT + 1, AGENT_SERVER_PORT + 2}
+    for env in ("OUROBOROS_SERVER_PORT", "OUROBOROS_HOST_SERVICE_PORT", "LOCAL_MODEL_PORT"):
+        value = os.environ.get(env, "").strip()
+        if value.isdigit():
+            ports.add(int(value))
+    # The server may bind a fallback port (find_free_port) recorded only in state.
+    try:
+        from ouroboros.config import DATA_DIR
+
+        port_text = (DATA_DIR / "state" / "server_port").read_text(encoding="utf-8").strip()
+        if port_text.isdigit():
+            ports.add(int(port_text))
+    except (OSError, ValueError):
+        pass
+    return ports
+
+
+def _is_blocked_loopback_port(parsed: Any) -> bool:
+    try:
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return True
+    return int(port) in _control_plane_loopback_ports()
+
+
+def _file_url_under_workspace(parsed: Any, ctx: Any) -> bool:
+    """True only when a file:// path resolves under the task's EXPLICIT workspace
+    root, so a subagent can view its own built app but not the data root/secrets."""
+    if ctx is None:
+        return False
+    ws = str(getattr(ctx, "workspace_root", "") or "").strip()
+    if not ws:
+        return False
+    try:
+        from urllib.request import url2pathname
+
+        path = pathlib.Path(url2pathname(parsed.path)).resolve(strict=False)
+        base = pathlib.Path(ws).resolve(strict=False)
+        path.relative_to(base)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _is_blocked_subagent_ip(ip: ipaddress._BaseAddress) -> bool:
+    return bool(
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_unspecified
+        or ip.is_reserved
+    )
+
+
+# AWS IMDSv6 endpoint; the IPv4 metadata services all live in 169.254.0.0/16
+# (link-local), which ``is_link_local`` covers including decimal/hex URL
+# spellings once ipaddress normalizes the resolved address.
+_METADATA_IPV6_ADDRESSES = frozenset({ipaddress.ip_address("fd00:ec2::254")})
+
+
+def _is_metadata_ip(ip: ipaddress._BaseAddress) -> bool:
+    # Unwrap IPv4-mapped IPv6 (http://[::ffff:169.254.169.254]/) so the
+    # link-local check sees the real IPv4 — mirrors mcp_client's guard.
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return bool(ip.is_link_local) or ip in _METADATA_IPV6_ADDRESSES
+
+
+def _is_metadata_blocked_browser_url(url: str) -> bool:
+    """Main-agent guard: True only for link-local/cloud-metadata destinations."""
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    if not host:
+        return False
+    try:
+        return _is_metadata_ip(ipaddress.ip_address(host))
+    except ValueError:
+        pass
+    if _NONSTANDARD_NUMERIC_IPV4_RE.match(host):
+        # Decimal/hex IPv4 spellings (e.g. http://2852039166/) bypass naive
+        # string checks; resolve via inet_aton normalization below.
+        try:
+            packed = socket.inet_aton(host)
+            return _is_metadata_ip(ipaddress.ip_address(socket.inet_ntoa(packed)))
+        except OSError:
+            return True
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False  # unresolvable hosts fail naturally at fetch time
+    for info in infos:
+        try:
+            if _is_metadata_ip(ipaddress.ip_address(str(info[4][0]))):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _hostname_resolves_to_blocked_ip(host: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return True
+    if not infos:
+        return True
+    for info in infos:
+        try:
+            sockaddr = info[4]
+            ip = ipaddress.ip_address(str(sockaddr[0]))
+        except Exception:
+            return True
+        if _is_blocked_subagent_ip(ip):
+            return True
+    return False
+
+
+def _has_platform_browser(local_browsers_dir: pathlib.Path, engine: str = "chromium") -> bool:
+    """Return True when a platform-matching bundled browser executable exists."""
+    engine = _normalize_browser_engine(engine)
+    if not local_browsers_dir.is_dir():
+        return False
+    if engine == "webkit":
+        for webkit_dir in local_browsers_dir.iterdir():
+            if not webkit_dir.name.startswith("webkit-"):
+                continue
+            for executable_name in (
+                "pw_run.sh",
+                "MiniBrowser",
+                "MiniBrowser.exe",
+                "Playwright.exe",
+                "WebKitWebProcess",
+                "WebKitWebProcess.exe",
+            ):
+                if any(candidate.is_file() for candidate in webkit_dir.rglob(executable_name)):
+                    return True
+        return False
+    plat = sys.platform
+    if plat == "darwin":
+        candidates = ["chrome-mac", "chrome-headless-shell-mac"]
+    elif plat.startswith("win"):
+        candidates = ["chrome-win", "chrome-headless-shell-win"]
+    else:
+        candidates = ["chrome-linux", "chrome-headless-shell-linux"]
+    for chromium_dir in local_browsers_dir.iterdir():
+        if not (
+            chromium_dir.name.startswith("chromium-")
+            or chromium_dir.name.startswith("chromium_headless_shell-")
+        ):
+            continue
+        for sub in chromium_dir.iterdir():
+            if not any(sub.name.startswith(c) for c in candidates):
+                continue
+            # Avoid treating partial downloads as usable browser bundles.
+            if (
+                (plat == "darwin" and (
+                    (sub / "Chromium.app" / "Contents" / "MacOS" / "Chromium").exists()
+                    or (sub / "chrome-headless-shell").exists()
+                ))
+                or (plat.startswith("win") and (
+                    (sub / "chrome.exe").exists()
+                    or (sub / "chrome-headless-shell.exe").exists()
+                ))
+                or (not plat.startswith(("darwin", "win")) and (
+                    (sub / "chrome").exists()
+                    or (sub / "chrome-headless-shell").exists()
+                ))
+            ):
+                return True
+    return False
+
+
+def _has_platform_chromium(local_browsers_dir: pathlib.Path) -> bool:
+    return _has_platform_browser(local_browsers_dir, "chromium")
+
+
+def _has_platform_webkit(local_browsers_dir: pathlib.Path) -> bool:
+    return _has_platform_browser(local_browsers_dir, "webkit")
+
+
+def _set_playwright_browsers_path_if_bundled() -> None:
+    """Use bundled Playwright browsers in packaged builds; respect explicit env override."""
+    global _playwright_browsers_path_managed, _playwright_ready
+    if "PLAYWRIGHT_BROWSERS_PATH" in os.environ:
         return
+    try:
+        import playwright as _pw_pkg
+        pkg_root = pathlib.Path(_pw_pkg.__file__).parent
+        local_browsers = pkg_root / "driver" / "package" / ".local-browsers"
+        bundled = [
+            engine for engine in sorted(_SUPPORTED_BROWSER_ENGINES)
+            if _has_platform_browser(local_browsers, engine)
+        ]
+        if bundled:
+            if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") != "0":
+                _playwright_ready_engines.clear()
+                _playwright_ready = False
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+            _playwright_browsers_path_managed = True
+            log.debug("Bundled Playwright browsers detected (%s) — set PLAYWRIGHT_BROWSERS_PATH=0", ", ".join(bundled))
+    except Exception:
+        pass  # non-fatal; fall through to standard cache lookup
+
+
+_set_playwright_browsers_path_if_bundled()
+
+
+def _ensure_playwright_installed(*, engine: str = "chromium", allow_install: bool = True):
+    """Install Playwright and the requested browser engine if not already available."""
+    global _playwright_browsers_path_managed, _playwright_ready
+    engine = _normalize_browser_engine(engine)
 
     try:
         import playwright  # noqa: F401
     except ImportError:
+        if not allow_install:
+            raise RuntimeError("Browser tools are unavailable in local_readonly_subagent mode because Playwright is not already installed.")
+        if getattr(sys, 'frozen', False):
+            raise RuntimeError(
+                "Browser tools require Playwright, which is not bundled. "
+                f"Install manually: pip3 install playwright && python3 -m playwright install {engine}"
+            )
         log.info("Playwright not found, installing...")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright"])
+
+    current_browser_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not (current_browser_path and current_browser_path != "0" and not _playwright_browsers_path_managed):
+        try:
+            import playwright as _pw_pkg
+            local_browsers = pathlib.Path(_pw_pkg.__file__).parent / "driver" / "package" / ".local-browsers"
+        except Exception:
+            local_browsers = None
+        if local_browsers is not None and _has_platform_browser(local_browsers, engine):
+            if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") != "0":
+                _playwright_ready_engines.clear()
+                _playwright_ready = False
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+            _playwright_browsers_path_managed = True
+        elif current_browser_path == "0" or _playwright_browsers_path_managed:
+            data_dir = pathlib.Path(
+                os.environ.get("OUROBOROS_DATA_DIR") or pathlib.Path.home() / "Ouroboros" / "data"
+            )
+            target = data_dir / "playwright-browsers"
+            if target.exists() and _has_platform_browser(target, engine):
+                target_str = str(target)
+                if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") != target_str:
+                    _playwright_ready_engines.clear()
+                    _playwright_ready = False
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = target_str
+                _playwright_browsers_path_managed = True
+            if allow_install:
+                target.mkdir(parents=True, exist_ok=True)
+                target_str = str(target)
+                if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") != target_str:
+                    _playwright_ready_engines.clear()
+                    _playwright_ready = False
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = target_str
+                _playwright_browsers_path_managed = True
+                log.warning("Bundled %s is unavailable; using Playwright browser cache %s", engine, target)
+
+    key = (engine, str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or ""))
+    if _playwright_ready and key in _playwright_ready_engines:
+        return
 
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as pw:
-            pw.chromium.executable_path
-        log.info("Playwright chromium binary found")
+            executable_path = pathlib.Path(str(getattr(pw, engine).executable_path))
+        if os.environ.get("PLAYWRIGHT_BROWSERS_PATH") == "0":
+            try:
+                import playwright as _pw_pkg
+                local_browsers = pathlib.Path(_pw_pkg.__file__).parent / "driver" / "package" / ".local-browsers"
+            except Exception:
+                local_browsers = None
+            if local_browsers is None or not _has_platform_browser(local_browsers, engine):
+                raise RuntimeError(f"bundled Playwright {engine} is missing")
+        elif not executable_path.exists():
+            raise RuntimeError(f"Playwright {engine} binary not found at {executable_path}")
+        log.info("Playwright %s binary found", engine)
     except Exception:
-        log.info("Installing Playwright chromium binary...")
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-        subprocess.check_call([sys.executable, "-m", "playwright", "install-deps", "chromium"])
+        if not allow_install:
+            raise RuntimeError(
+                f"Browser tools are unavailable in local_readonly_subagent mode because {engine} is not already installed."
+            )
+        if not getattr(sys, "frozen", False):
+            install_python = sys.executable
+        else:
+            install_python = ""
+            try:
+                from ouroboros.platform_layer import embedded_python_candidates
+                bases: list[pathlib.Path] = []
+                frozen_base = getattr(sys, "_MEIPASS", None)
+                if frozen_base:
+                    bases.append(pathlib.Path(frozen_base))
+                exe_parent = pathlib.Path(sys.executable).resolve().parent
+                bases.extend([exe_parent, exe_parent.parent])
+                for base in bases:
+                    for candidate in embedded_python_candidates(base):
+                        if candidate.exists():
+                            install_python = str(candidate)
+                            break
+                    if install_python:
+                        break
+            except Exception:
+                install_python = ""
+            if not install_python:
+                raise RuntimeError(
+                    "Playwright browser install requires the embedded python-standalone interpreter, "
+                    "but it was not found in this packaged app."
+                )
+        log.info("Installing Playwright %s dependencies and binary...", engine)
+        try:
+            subprocess.check_call([install_python, "-m", "playwright", "install-deps", engine])
+        except Exception as exc:
+            log.warning("Playwright system dependency repair failed; continuing with browser download: %s", exc)
+        subprocess.check_call([install_python, "-m", "playwright", "install", engine])
 
+    _playwright_ready_engines.add((engine, str(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or "")))
     _playwright_ready = True
 
 
-def _reset_playwright_greenlet():
-    """
-    Fully reset Playwright's greenlet state by purging all related modules.
-    This is necessary because sync_playwright() uses greenlets internally,
-    and once a greenlet dies, it cannot be reused across "threads".
-    """
-    global _pw_instance, _pw_thread_id
+def _maybe_alias_playwright_binary(exc: Exception) -> bool:
+    """Bridge x64->arm64 browser cache lookups on Apple Silicon when possible."""
+    match = _MISSING_EXECUTABLE_RE.search(str(exc))
+    if not match:
+        return False
 
-    log.info("Resetting Playwright greenlet state...")
+    missing_path = pathlib.Path(match.group(1).strip())
+    missing_dir = missing_path.parent
+    if "-mac-x64" not in str(missing_dir):
+        return False
 
-    # Kill any lingering chromium processes
+    alternate_dir = pathlib.Path(str(missing_dir).replace("-mac-x64", "-mac-arm64"))
+    alternate_binary = alternate_dir / missing_path.name
+    if not alternate_binary.exists():
+        return False
+
     try:
-        subprocess.run(["pkill", "-9", "-f", "chromium"], capture_output=True, timeout=5)
-    except Exception:
-        log.debug("Failed to kill chromium processes during reset", exc_info=True)
-        pass
-
-    # Purge all playwright modules from sys.modules to reset greenlet state
-    mods_to_remove = [k for k in sys.modules.keys() if k.startswith('playwright')]
-    for k in mods_to_remove:
-        del sys.modules[k]
-
-    # Also purge greenlet-related modules to ensure clean state
-    mods_to_remove = [k for k in sys.modules.keys() if 'greenlet' in k.lower()]
-    for k in mods_to_remove:
-        try:
-            del sys.modules[k]
-        except Exception:
-            log.debug(f"Failed to delete greenlet module {k} during reset", exc_info=True)
-            pass
-
-    # Reset module-level instance and thread ID
-    _pw_instance = None
-    _pw_thread_id = None
-    log.info("Playwright greenlet state reset complete")
+        if missing_dir.exists():
+            return missing_path.exists()
+        missing_dir.symlink_to(alternate_dir, target_is_directory=True)
+        log.info("Aliased Playwright browser cache %s -> %s", missing_dir, alternate_dir)
+        return True
+    except OSError:
+        log.debug("Failed to alias Playwright browser cache", exc_info=True)
+        return False
 
 
-def _ensure_browser(ctx: ToolContext):
-    """Create or reuse browser for this task. Browser state lives in ctx,
-    but Playwright instance is module-level to avoid greenlet issues."""
-    global _pw_instance, _pw_thread_id
-
-    # Check if we've switched threads - if so, reset everything
-    current_thread_id = threading.get_ident()
-    if _pw_instance is not None and _pw_thread_id != current_thread_id:
-        log.info(f"Thread switch detected (old={_pw_thread_id}, new={current_thread_id}). Resetting Playwright...")
-        _reset_playwright_greenlet()
-
-    if ctx.browser_state.browser is not None:
-        try:
-            if ctx.browser_state.browser.is_connected():
-                return ctx.browser_state.page
-        except Exception:
-            log.debug("Browser connection check failed in _ensure_browser", exc_info=True)
-            pass
-        # Browser died — clean up and recreate
-        cleanup_browser(ctx)
-
-    _ensure_playwright_installed()
-
-    # Use module-level Playwright instance to avoid greenlet threading issues
-    if _pw_instance is None:
-        from playwright.sync_api import sync_playwright
-
-        try:
-            _pw_instance = sync_playwright().start()
-            _pw_thread_id = current_thread_id  # Record which thread owns this instance
-            log.info(f"Created Playwright instance in thread {_pw_thread_id}")
-        except RuntimeError as e:
-            if "cannot switch" in str(e) or "different thread" in str(e):
-                # Greenlet is dead, do a full reset
-                _reset_playwright_greenlet()
-                # Now import fresh and try again
-                from playwright.sync_api import sync_playwright
-                _pw_instance = sync_playwright().start()
-                _pw_thread_id = current_thread_id
-                log.info(f"Recreated Playwright instance in thread {_pw_thread_id} after error")
-            else:
-                raise
-
-    # Store reference in ctx for cleanup
-    ctx.browser_state.pw_instance = _pw_instance
-
-    ctx.browser_state.browser = _pw_instance.chromium.launch(
-        headless=True,
-        args=[
+def _launch_browser_with_fallback(pw_instance: Any, *, engine: str = "chromium", allow_cache_write: bool = True) -> Any:
+    engine = _normalize_browser_engine(engine)
+    launch_kwargs = {
+        "headless": True,
+    }
+    if engine == "chromium":
+        launch_kwargs["args"] = [
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
             "--disable-features=site-per-process",
             "--window-size=1920,1080",
-        ],
-    )
-    ctx.browser_state.page = ctx.browser_state.browser.new_page(
-        viewport={"width": 1920, "height": 1080},
-        user_agent=(
+        ]
+    browser_type = getattr(pw_instance, engine)
+    try:
+        return browser_type.launch(**launch_kwargs)
+    except Exception as exc:
+        if engine == "chromium" and allow_cache_write and _maybe_alias_playwright_binary(exc):
+            return browser_type.launch(**launch_kwargs)
+        raise
+
+
+def _device_context_options(pw_instance: Any, device: str = "") -> Tuple[Dict[str, Any], str]:
+    device_name = str(device or "").strip()
+    if not device_name:
+        return {}, ""
+    devices = getattr(pw_instance, "devices", {}) or {}
+    resolved = device_name
+    if resolved not in devices:
+        matches = [name for name in devices if str(name).lower() == device_name.lower()]
+        if matches:
+            resolved = matches[0]
+        else:
+            samples = ", ".join(list(devices)[:6])
+            raise ValueError(f"Unknown Playwright device descriptor {device_name!r}. Examples: {samples}")
+    return dict(devices[resolved]), resolved
+
+
+def _default_context_options(engine: str) -> Dict[str, Any]:
+    options: Dict[str, Any] = {"viewport": {"width": 1920, "height": 1080}}
+    if engine == "chromium":
+        options["user_agent"] = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-    )
+        )
+    return options
+
+
+def _ensure_browser(ctx: ToolContext, *, engine: str = "chromium", device: str = ""):
+    """Create or reuse this context's browser; no module-level Playwright state."""
+    engine = _normalize_browser_engine(engine)
+    requested_device = str(device or "").strip()
+    bs = ctx.browser_state
+    current_thread_id = threading.get_ident()
+    stored_thread_id = getattr(bs, "_thread_id", None)
+    stored_engine = getattr(bs, "_browser_engine", "")
+    stored_device = getattr(bs, "_browser_device", "")
+
+    if stored_thread_id is not None and stored_thread_id != current_thread_id:
+        log.info("Thread switch detected (old=%s, new=%s). Tearing down browser for this context.",
+                 stored_thread_id, current_thread_id)
+        cleanup_browser(ctx)
+    elif bs.browser is not None and (
+        stored_engine != engine
+        or stored_device.lower() != requested_device.lower()
+    ):
+        log.info("Browser engine/device changed (%s/%s -> %s/%s); recreating context.",
+                 stored_engine or "chromium", stored_device, engine, requested_device)
+        cleanup_browser(ctx)
+
+    if bs.browser is not None:
+        try:
+            if bs.browser.is_connected():
+                return bs.page
+        except Exception:
+            log.debug("Browser connection check failed", exc_info=True)
+        cleanup_browser(ctx)
+
+    readonly_subagent = _readonly_subagent(ctx)
+    _ensure_playwright_installed(engine=engine, allow_install=not readonly_subagent)
+
+    if bs.pw_instance is None:
+        from playwright.sync_api import sync_playwright
+        bs.pw_instance = sync_playwright().start()
+        setattr(bs, "_thread_id", current_thread_id)
+        log.info("Created Playwright instance in thread %s", current_thread_id)
+
+    bs.browser = _launch_browser_with_fallback(bs.pw_instance, engine=engine, allow_cache_write=not readonly_subagent)
+    device_options, resolved_device = _device_context_options(bs.pw_instance, requested_device)
+    context_options = device_options or _default_context_options(engine)
+    bs_context = bs.browser.new_context(**context_options)
+    setattr(bs, "_browser_context", bs_context)
+    setattr(bs, "_browser_engine", engine)
+    setattr(bs, "_browser_device", resolved_device or requested_device)
+    bs.page = bs_context.new_page()
 
     if _HAS_STEALTH:
         stealth = Stealth()
-        stealth.apply_stealth_sync(ctx.browser_state.page)
+        stealth.apply_stealth_sync(bs.page)
 
-    ctx.browser_state.page.set_default_timeout(30000)
-    return ctx.browser_state.page
+    bs.page.set_default_timeout(30000)
+    # Browser tools are agent-controlled. They may inspect the UI, but must not
+    # use clicks/fetches to change the owner-controlled context horizon.
+    bs_context.route("**/api/owner/context-mode", _block_context_mode_owner_post)
+    # Owner-only self-modification toggles ride /api/settings; block the browser
+    # click+Save path (POST /api/settings) for them, not just evaluate-JS. Applies to
+    # every browser session (root + subagents).
+    bs_context.route("**/api/settings", _block_owner_settings_post)
+    if readonly_subagent:
+        bs_context.route(
+            "**/*",
+            lambda route: route.abort()
+            if _is_subagent_blocked_browser_url(route.request.url, ctx)
+            else route.continue_(),
+        )
+    else:
+        # Main-agent SSRF guard (conservative): block ONLY link-local /
+        # cloud-metadata endpoints (169.254.0.0/16 incl. decimal/hex spellings,
+        # fd00:ec2::254). Private/LAN stays reachable — owners legitimately
+        # browse their own LAN services. Route interception re-validates every
+        # hop, so redirects cannot smuggle a metadata fetch.
+        bs_context.route(
+            "**/*",
+            lambda route: route.abort()
+            if _is_metadata_blocked_browser_url(route.request.url)
+            else route.continue_(),
+        )
+    return bs.page
 
 
 def cleanup_browser(ctx: ToolContext) -> None:
-    """Close browser and playwright. Called by agent.py in finally block.
-
-    Note: We DON'T stop the module-level _pw_instance here to allow reuse
-    across tasks. Only close the browser and page for this context.
-    """
-    global _pw_instance
-
+    """Close page/browser and stop the Playwright instance."""
+    bs = ctx.browser_state
     try:
-        if ctx.browser_state.page is not None:
-            ctx.browser_state.page.close()
+        if bs.page is not None:
+            bs.page.close()
     except Exception:
         log.debug("Failed to close browser page during cleanup", exc_info=True)
-        pass
     try:
-        if ctx.browser_state.browser is not None:
-            ctx.browser_state.browser.close()
-    except Exception as e:
-        # If browser cleanup fails with thread error, reset everything
-        if "cannot switch" in str(e) or "different thread" in str(e):
-            log.warning("Browser cleanup hit thread error, resetting Playwright...")
-            _reset_playwright_greenlet()
+        browser_context = getattr(bs, "_browser_context", None)
+        if browser_context is not None:
+            browser_context.close()
+    except Exception:
+        log.debug("Failed to close browser context during cleanup", exc_info=True)
+    try:
+        if bs.browser is not None:
+            bs.browser.close()
+    except Exception:
+        log.debug("Failed to close browser during cleanup", exc_info=True)
+    try:
+        if bs.pw_instance is not None:
+            bs.pw_instance.stop()
+    except Exception:
+        log.debug("Failed to stop Playwright instance during cleanup", exc_info=True)
+    bs.page = None
+    bs.browser = None
+    bs.pw_instance = None
+    setattr(bs, "_thread_id", None)
+    setattr(bs, "_browser_context", None)
+    setattr(bs, "_browser_engine", "")
+    setattr(bs, "_browser_device", "")
 
-    # Clear ctx references but keep module-level _pw_instance alive for reuse
-    ctx.browser_state.page = None
-    ctx.browser_state.browser = None
-    ctx.browser_state.pw_instance = None
+
+def _is_infrastructure_error(obj: Any) -> bool:
+    """Detect context-state or legacy string-based browser infrastructure failures."""
+    if hasattr(obj, "browser_state"):
+        bs = obj.browser_state
+        if bs.browser is None or bs.pw_instance is None:
+            return True
+        try:
+            if not bs.browser.is_connected():
+                return True
+        except Exception:
+            return True
+        if bs.page is not None:
+            try:
+                if bs.page.is_closed():
+                    return True
+            except Exception:
+                return True
+        return False
+
+    msg = str(obj).lower()
+    return any(token in msg for token in (
+        "green thread",
+        "different thread",
+        "browser has been closed",
+        "page has been closed",
+        "connection closed",
+    ))
+
+
+def _blocks_context_mode_self_lowering_js(value: str) -> bool:
+    low = str(value or "").lower()
+    return "low" in low and (
+        "/api/owner/context-mode" in low
+        or ("ouroboros_context_mode" in low and ("settings.json" in low or "save_settings" in low))
+    )
+
+
+def _blocks_mutative_toggle_js(value: str) -> bool:
+    """Block browser JS that tries to enable the owner-only mutative-subagents toggle."""
+    low = str(value or "").lower()
+    return "ouroboros_allow_mutative_subagents" in low and (
+        "settings.json" in low or "save_settings" in low or "/api/settings" in low
+    )
+
+
+def _blocks_post_task_evolution_js(value: str) -> bool:
+    """Block browser JS that tries to set an owner-only self-evolution control (the
+    post-task evolution toggle or the persistent evolution-objective steer)."""
+    low = str(value or "").lower()
+    return (
+        "ouroboros_post_task_evolution" in low
+        or "ouroboros_evolution_persistent_objective" in low
+    ) and (
+        "settings.json" in low or "save_settings" in low or "/api/settings" in low
+    )
+
+
+def _is_context_mode_owner_post(request: Any) -> bool:
+    try:
+        parsed = urlparse(str(request.url or ""))
+        method = str(request.method or "").upper()
+    except Exception:
+        return False
+    return method == "POST" and parsed.path.rstrip("/") == "/api/owner/context-mode"
+
+
+def _block_context_mode_owner_post(route: Any) -> None:
+    if _is_context_mode_owner_post(route.request):
+        route.abort()
+        return
+    route.continue_()
+
+
+def _is_owner_settings_self_elevation_post(request: Any) -> bool:
+    """A browser POST /api/settings carrying an owner-only self-modification toggle —
+    the click+Save bypass of the evaluate-only JS guards."""
+    try:
+        if str(request.method or "").upper() != "POST":
+            return False
+        parsed = urlparse(str(request.url or ""))
+        if parsed.path.rstrip("/") != "/api/settings":
+            return False
+        body = str(request.post_data or "").lower()
+    except Exception:
+        return False
+    return (
+        "ouroboros_post_task_evolution" in body
+        or "ouroboros_allow_mutative_subagents" in body
+        or "ouroboros_evolution_persistent_objective" in body
+    )
+
+
+def _block_owner_settings_post(route: Any) -> None:
+    if _is_owner_settings_self_elevation_post(route.request):
+        route.abort()
+        return
+    route.continue_()
 
 
 _MARKDOWN_JS = """() => {
@@ -222,15 +723,65 @@ _MARKDOWN_JS = """() => {
 }"""
 
 
+def _inject_native_screenshot(ctx: ToolContext, b64: str) -> str:
+    """Hand a fresh screenshot to a vision-capable active model natively.
+
+    The screenshot is saved to ``data/uploads/screenshots/<ts>.png`` (the
+    re-view path used by eviction placeholders) and injected as a user-role
+    image block via the existing multipart-preserving merge. The TOOL result
+    stays a plain string — the tool-message contract is unchanged. Non-vision
+    models keep the analyze_screenshot/vlm_query flow.
+    """
+    try:
+        from ouroboros.provider_models import supports_vision
+
+        active_model = str(os.environ.get("OUROBOROS_MODEL", "") or "")
+        if not supports_vision(active_model):
+            return ""
+        messages = getattr(ctx, "messages", None)
+        if not isinstance(messages, list):
+            return ""
+        from ouroboros.utils import utc_now_iso
+
+        ts = utc_now_iso().replace(":", "").replace("-", "")[:15]
+        shot_dir = pathlib.Path(ctx.drive_root) / "uploads" / "screenshots"
+        shot_dir.mkdir(parents=True, exist_ok=True)
+        shot_path = shot_dir / f"{ts}.png"
+        shot_path.write_bytes(base64.b64decode(b64))
+        caption = f"[browser screenshot {ts}]"
+        from ouroboros.loop import _append_or_merge_user_content
+
+        _append_or_merge_user_content(messages, [
+            {"type": "text", "text": caption},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                "_caption": caption,
+                "_source_path": str(shot_path),
+            },
+        ])
+        return "The screenshot is attached to your context natively (vision model). "
+    except Exception:
+        log.debug("native screenshot injection failed", exc_info=True)
+        return ""
+
+
 def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
     """Extract page content in the requested format."""
     if output == "screenshot":
         data = page.screenshot(type="png", full_page=False)
         b64 = base64.b64encode(data).decode()
         ctx.browser_state.last_screenshot_b64 = b64
+        if _readonly_subagent(ctx):
+            return (
+                f"Screenshot captured ({len(b64)} bytes base64). "
+                "Use analyze_screenshot to inspect it."
+            )
+        native_note = _inject_native_screenshot(ctx, b64)
         return (
             f"Screenshot captured ({len(b64)} bytes base64). "
-            f"Call send_photo(image_base64='__last_screenshot__') to deliver it to the owner."
+            + (native_note or "Use analyze_screenshot to inspect it. ")
+            + "Call send_photo(image_base64='__last_screenshot__') to deliver it to the user."
         )
     elif output == "html":
         html = page.content()
@@ -244,62 +795,131 @@ def _extract_page_output(page: Any, output: str, ctx: ToolContext) -> str:
 
 
 def _browse_page(ctx: ToolContext, url: str, output: str = "text",
-                 wait_for: str = "", timeout: int = 30000) -> str:
+                 wait_for: str = "", timeout: int = 30000,
+                 viewport: str = "", engine: str = "chromium", device: str = "") -> str:
+    readonly_subagent = _readonly_subagent(ctx)
+    if readonly_subagent and _is_subagent_blocked_browser_url(str(url or ""), ctx):
+        return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents may browse external HTTP(S), localhost (non-Ouroboros ports), and file:// under their workspace — not the Ouroboros API ports, private/link-local IPs, or other schemes."
     try:
-        page = _ensure_browser(ctx)
+        page = _ensure_browser(ctx, engine=engine, device=device)
+        if viewport:
+            _apply_viewport(page, viewport)
         page.goto(url, timeout=timeout, wait_until="domcontentloaded")
         if wait_for:
             page.wait_for_selector(wait_for, timeout=timeout)
+        if readonly_subagent and _is_subagent_blocked_browser_url(str(getattr(page, "url", "") or ""), ctx):
+            return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents may browse external HTTP(S), localhost (non-Ouroboros ports), and file:// under their workspace — not the Ouroboros API ports, private/link-local IPs, or other schemes."
         return _extract_page_output(page, output, ctx)
     except Exception as e:
-        if "cannot switch" in str(e) or "different thread" in str(e) or "greenlet" in str(e).lower():
-            log.warning(f"Browser thread error detected: {e}. Resetting Playwright and retrying...")
+        if _is_infrastructure_error(ctx):
+            log.warning("Browser infrastructure error: %s. Cleaning up and retrying...", e)
             cleanup_browser(ctx)
-            _reset_playwright_greenlet()
-            page = _ensure_browser(ctx)
+            page = _ensure_browser(ctx, engine=engine, device=device)
+            if viewport:
+                _apply_viewport(page, viewport)
             page.goto(url, timeout=timeout, wait_until="domcontentloaded")
             if wait_for:
                 page.wait_for_selector(wait_for, timeout=timeout)
+            if readonly_subagent and _is_subagent_blocked_browser_url(str(getattr(page, "url", "") or ""), ctx):
+                return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents may browse external HTTP(S), localhost (non-Ouroboros ports), and file:// under their workspace — not the Ouroboros API ports, private/link-local IPs, or other schemes."
             return _extract_page_output(page, output, ctx)
         raise
 
 
-def _browser_action(ctx: ToolContext, action: str, selector: str = "",
-                    value: str = "", timeout: int = 5000) -> str:
-    def _do_action():
-        page = _ensure_browser(ctx)
+def _apply_viewport(page: Any, viewport: str) -> None:
+    """Parse a 'WxH' string and resize the browser viewport."""
+    try:
+        parts = viewport.lower().split("x")
+        w, h = int(parts[0]), int(parts[1])
+        page.set_viewport_size({"width": max(320, w), "height": max(480, h)})
+    except (ValueError, IndexError):
+        log.warning("Invalid viewport '%s', expected WxH (e.g. '375x812')", viewport)
 
-        if action == "click":
+
+def _browser_action(ctx: ToolContext, action: str, selector: str = "",
+                    value: str = "", timeout: int = 5000,
+                    engine: str = "", device: str = "") -> str:
+    normalized_action = str(action or "").strip().lower()
+    readonly_subagent = _readonly_subagent(ctx)
+    if readonly_subagent and normalized_action == "evaluate":
+        return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents cannot run arbitrary browser JavaScript."
+
+    def _do_action():
+        page = _ensure_browser(
+            ctx,
+            engine=engine or getattr(ctx.browser_state, "_browser_engine", "chromium") or "chromium",
+            device=device or getattr(ctx.browser_state, "_browser_device", "") or "",
+        )
+        if readonly_subagent and _is_subagent_blocked_browser_url(str(getattr(page, "url", "") or ""), ctx):
+            return "⚠️ BROWSER_LOCAL_READONLY_BLOCKED: subagents may act on external HTTP(S), localhost (non-Ouroboros ports), and file:// under their workspace — not the Ouroboros API ports or private/link-local pages."
+
+        if normalized_action == "click":
             if not selector:
                 return "Error: selector required for click"
             page.click(selector, timeout=timeout)
             page.wait_for_timeout(500)
             return f"Clicked: {selector}"
-        elif action == "fill":
+        elif normalized_action == "fill":
             if not selector:
                 return "Error: selector required for fill"
             page.fill(selector, value, timeout=timeout)
             return f"Filled {selector} with: {value}"
-        elif action == "select":
+        elif normalized_action == "select":
             if not selector:
                 return "Error: selector required for select"
             page.select_option(selector, value, timeout=timeout)
             return f"Selected {value} in {selector}"
-        elif action == "screenshot":
+        elif normalized_action == "screenshot":
             data = page.screenshot(type="png", full_page=False)
             b64 = base64.b64encode(data).decode()
             ctx.browser_state.last_screenshot_b64 = b64
+            if readonly_subagent:
+                return (
+                    f"Screenshot captured ({len(b64)} bytes base64). "
+                    "Use analyze_screenshot to inspect it."
+                )
             return (
                 f"Screenshot captured ({len(b64)} bytes base64). "
-                f"Call send_photo(image_base64='__last_screenshot__') to deliver it to the owner."
+                f"Call send_photo(image_base64='__last_screenshot__') to deliver it to the user."
             )
-        elif action == "evaluate":
+        elif normalized_action == "evaluate":
             if not value:
                 return "Error: value (JS code) required for evaluate"
-            result = page.evaluate(value)
+            if _blocks_context_mode_self_lowering_js(value):
+                return (
+                    "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: browser JavaScript "
+                    "looks like an attempt to lower OUROBOROS_CONTEXT_MODE. "
+                    "Context mode is owner-controlled — ask the owner to use "
+                    "the Low/Max toggle."
+                )
+            if _blocks_mutative_toggle_js(value):
+                return (
+                    "⚠️ ELEVATION_BLOCKED: browser JavaScript looks like an attempt to enable "
+                    "OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS. This master toggle is owner-controlled — "
+                    "the agent must not self-enable mutative subagents."
+                )
+            if _blocks_post_task_evolution_js(value):
+                return (
+                    "⚠️ ELEVATION_BLOCKED: browser JavaScript looks like an attempt to enable "
+                    "OUROBOROS_POST_TASK_EVOLUTION. Post-task self-evolution is owner-controlled — "
+                    "the agent must not self-enable it."
+                )
+            try:
+                result = page.evaluate(value)
+            except Exception as eval_err:  # noqa: BLE001
+                msg = str(eval_err)
+                if "SyntaxError" in msg:
+                    snippet = value.strip()[:80]
+                    return (
+                        "⚠️ BROWSER_EVALUATE_SYNTAX_ERROR: the JS failed to parse "
+                        f"({msg.splitlines()[0][:160]}). First 80 chars: {snippet!r}. "
+                        "Check for stray git conflict markers (<<<<<<<) or shell "
+                        "heredocs (<<EOF) leaked into the value."
+                    )
+                raise
             out = str(result)
             return out[:20000] + ("... [truncated]" if len(out) > 20000 else "")
-        elif action == "scroll":
+        elif normalized_action == "scroll":
             direction = value or "down"
             if direction == "down":
                 page.evaluate("window.scrollBy(0, 600)")
@@ -315,16 +935,12 @@ def _browser_action(ctx: ToolContext, action: str, selector: str = "",
 
     try:
         return _do_action()
-    except (RuntimeError, Exception) as e:
-        # Catch greenlet threading errors and reset Playwright completely
-        if "cannot switch" in str(e) or "different thread" in str(e) or "greenlet" in str(e).lower():
-            log.warning(f"Browser thread error detected: {e}. Resetting Playwright and retrying...")
+    except Exception as e:
+        if _is_infrastructure_error(ctx):
+            log.warning("Browser infrastructure error: %s. Cleaning up and retrying...", e)
             cleanup_browser(ctx)
-            _reset_playwright_greenlet()
-            # Retry once with fresh state
             return _do_action()
-        else:
-            raise
+        raise
 
 
 def get_tools() -> List[ToolEntry]:
@@ -337,7 +953,10 @@ def get_tools() -> List[ToolEntry]:
                     "Open a URL in headless browser. Returns page content as text, "
                     "html, markdown, or screenshot (base64 PNG). "
                     "Browser persists across calls within a task. "
-                    "For screenshots: use send_photo tool to deliver the image to owner."
+                    "For screenshots: use send_photo tool to deliver the image to the user. "
+                    "Use viewport to test mobile layouts (e.g. '375x812'). "
+                    "Use engine='webkit' plus a Playwright iPhone device descriptor "
+                    "for iOS Safari-grade mobile verification."
                 ),
                 "parameters": {
                     "type": "object",
@@ -356,12 +975,25 @@ def get_tools() -> List[ToolEntry]:
                             "type": "integer",
                             "description": "Page load timeout in ms (default: 30000)",
                         },
+                        "viewport": {
+                            "type": "string",
+                            "description": "Viewport size as WxH (e.g. '375x812' for mobile, '1920x1080' for desktop). Default: current viewport.",
+                        },
+                        "engine": {
+                            "type": "string",
+                            "enum": ["chromium", "webkit"],
+                            "description": "Browser engine. Default: chromium. Use webkit for iOS Safari-style checks.",
+                        },
+                        "device": {
+                            "type": "string",
+                            "description": "Optional Playwright device descriptor, e.g. 'iPhone 15 Pro' or 'iPhone 13'.",
+                        },
                     },
                     "required": ["url"],
                 },
             },
             handler=_browse_page,
-            timeout_sec=60,
+            timeout_sec=180,
         ),
         ToolEntry(
             name="browser_action",
@@ -393,11 +1025,20 @@ def get_tools() -> List[ToolEntry]:
                             "type": "integer",
                             "description": "Action timeout in ms (default: 5000)",
                         },
+                        "engine": {
+                            "type": "string",
+                            "enum": ["chromium", "webkit"],
+                            "description": "Optional engine for a new browser session. Existing pages keep their current engine.",
+                        },
+                        "device": {
+                            "type": "string",
+                            "description": "Optional Playwright device descriptor for a new browser session.",
+                        },
                     },
                     "required": ["action"],
                 },
             },
             handler=_browser_action,
-            timeout_sec=60,
+            timeout_sec=180,
         ),
     ]

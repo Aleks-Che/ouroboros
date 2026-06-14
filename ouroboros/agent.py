@@ -1,14 +1,7 @@
-"""
-Ouroboros agent core — thin orchestrator.
-
-Delegates to: loop.py (LLM tool loop), tools/ (tool schemas/execution),
-llm.py (LLM calls), memory.py (scratchpad/identity),
-context.py (context building), review.py (code collection/metrics).
-"""
+"""Thin agent orchestrator around context, LLM loop, tools, memory, and review."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import pathlib
@@ -17,33 +10,45 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 log = logging.getLogger(__name__)
 
 from ouroboros.utils import (
-    utc_now_iso, read_text, append_jsonl,
-    safe_relpath, truncate_for_log,
-    get_git_info, sanitize_task_for_event,
+    append_jsonl,
+    emit_log_event,
+    get_git_info,
+    read_json_dict,
+    safe_relpath,
+    sanitize_task_for_event,
+    truncate_for_log,
+    utc_now_iso,
 )
-from ouroboros.llm import LLMClient, add_usage
+from ouroboros.llm import LLMClient
 from ouroboros.tools import ToolRegistry
 from ouroboros.tools.registry import ToolContext
 from ouroboros.memory import Memory
 from ouroboros.context import build_llm_messages
+from ouroboros.context_budget import CONTEXT_SOFT_CAP_TOKENS
 from ouroboros.loop import run_llm_loop
+from ouroboros.config import resolve_effort
+from ouroboros.agent_startup_checks import (
+    inject_crash_report,
+    verify_restart,
+    verify_system_state,
+)
+from ouroboros.agent_task_pipeline import (
+    emit_task_results, build_review_context,
+)
+from ouroboros.task_results import STATUS_RUNNING, write_task_result
+from ouroboros.contracts.task_constraint import normalize_task_constraint
+from ouroboros.contracts.task_contract import attach_task_contract
+from ouroboros.outcomes import infra_failed_axes
 
 
-# ---------------------------------------------------------------------------
-# Module-level guard for one-time worker boot logging
-# ---------------------------------------------------------------------------
 _worker_boot_logged = False
 _worker_boot_lock = threading.Lock()
 
-
-# ---------------------------------------------------------------------------
-# Environment + Paths
-# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Env:
@@ -58,12 +63,8 @@ class Env:
         return (self.drive_root / safe_relpath(rel)).resolve()
 
 
-# ---------------------------------------------------------------------------
-# Agent
-# ---------------------------------------------------------------------------
-
 class OuroborosAgent:
-    """One agent instance per worker process. Mostly stateless; long-term state lives on Drive."""
+    """Per-worker agent instance; long-term state lives on Drive."""
 
     def __init__(self, env: Env, event_queue: Any = None):
         self.env = env
@@ -71,23 +72,47 @@ class OuroborosAgent:
         self._event_queue: Any = event_queue
         self._current_chat_id: Optional[int] = None
         self._current_task_type: Optional[str] = None
+        self._current_task_id: Optional[str] = None
+        self._current_task_metadata: Dict[str, Any] = {}
 
-        # Message injection: owner can send messages while agent is busy
         self._incoming_messages: queue.Queue = queue.Queue()
         self._busy = False
         self._last_progress_ts: float = 0.0
         self._task_started_ts: float = 0.0
 
-        # SSOT modules
         self.llm = LLMClient()
         self.tools = ToolRegistry(repo_dir=env.repo_dir, drive_root=env.drive_root)
         self.memory = Memory(drive_root=env.drive_root, repo_dir=env.repo_dir)
+        self.memory.ensure_files()
 
         self._log_worker_boot_once()
 
-    def inject_message(self, text: str) -> None:
-        """Thread-safe: inject owner message into the active conversation."""
+    def inject_message(
+        self,
+        text: str,
+        image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None,
+    ) -> None:
+        """Thread-safe: inject a user message into the active conversation."""
+        if image_data:
+            payload: Dict[str, Any] = {
+                "text": text,
+                "image_base64": image_data[0],
+                "image_mime": image_data[1],
+            }
+            if len(image_data) > 2 and image_data[2]:
+                payload["image_caption"] = image_data[2]
+            self._incoming_messages.put(payload)
+            return
         self._incoming_messages.put(text)
+
+    def _emit_live_log(self, event_type: str, **fields: Any) -> None:
+        """Send a session-only live log event to supervisor/UI."""
+        emit_log_event(
+            self._event_queue,
+            {"type": event_type, "ts": utc_now_iso(), **fields},
+            blocking=True,
+            log_label="agent live",
+        )
 
     def _log_worker_boot_once(self) -> None:
         global _worker_boot_logged
@@ -101,278 +126,189 @@ class OuroborosAgent:
                 'ts': utc_now_iso(), 'type': 'worker_boot',
                 'pid': os.getpid(), 'git_branch': git_branch, 'git_sha': git_sha,
             })
-            self._verify_restart(git_sha)
-            self._verify_system_state(git_sha)
+            verify_restart(self.env, git_sha)
+            verify_system_state(self.env, git_sha)
+            inject_crash_report(self.env)
         except Exception:
             log.warning("Worker boot logging failed", exc_info=True)
             return
 
-    def _verify_restart(self, git_sha: str) -> None:
-        """Best-effort restart verification."""
-        try:
-            pending_path = self.env.drive_path('state') / 'pending_restart_verify.json'
-            claim_path = pending_path.with_name(f"pending_restart_verify.claimed.{os.getpid()}.json")
-            try:
-                os.rename(str(pending_path), str(claim_path))
-            except (FileNotFoundError, Exception):
-                return
-            try:
-                claim_data = json.loads(read_text(claim_path))
-                expected_sha = str(claim_data.get("expected_sha", "")).strip()
-                ok = bool(expected_sha and expected_sha == git_sha)
-                append_jsonl(self.env.drive_path('logs') / 'events.jsonl', {
-                    'ts': utc_now_iso(), 'type': 'restart_verify',
-                    'pid': os.getpid(), 'ok': ok,
-                    'expected_sha': expected_sha, 'observed_sha': git_sha,
-                })
-            except Exception:
-                log.debug("Failed to log restart verify event", exc_info=True)
-                pass
-            try:
-                claim_path.unlink()
-            except Exception:
-                log.debug("Failed to delete restart verify claim file", exc_info=True)
-                pass
-        except Exception:
-            log.debug("Restart verification failed", exc_info=True)
-            pass
-
-    def _check_uncommitted_changes(self) -> Tuple[dict, int]:
-        """Check for uncommitted changes and attempt auto-rescue commit & push."""
-        import re
-        import subprocess
-        try:
-            result = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(self.env.repo_dir),
-                capture_output=True, text=True, timeout=10, check=True
-            )
-            dirty_files = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-            if dirty_files:
-                # Auto-rescue: commit and push
-                auto_committed = False
-                try:
-                    # Only stage tracked files (not secrets/notebooks)
-                    subprocess.run(["git", "add", "-u"], cwd=str(self.env.repo_dir), timeout=10, check=True)
-                    subprocess.run(
-                        ["git", "commit", "-m", "auto-rescue: uncommitted changes detected on startup"],
-                        cwd=str(self.env.repo_dir), timeout=30, check=True
-                    )
-                    # Validate branch name
-                    if not re.match(r'^[a-zA-Z0-9_/-]+$', self.env.branch_dev):
-                        raise ValueError(f"Invalid branch name: {self.env.branch_dev}")
-                    # Pull with rebase before push
-                    subprocess.run(
-                        ["git", "pull", "--rebase", "origin", self.env.branch_dev],
-                        cwd=str(self.env.repo_dir), timeout=60, check=True
-                    )
-                    # Push
-                    try:
-                        subprocess.run(
-                            ["git", "push", "origin", self.env.branch_dev],
-                            cwd=str(self.env.repo_dir), timeout=60, check=True
-                        )
-                        auto_committed = True
-                        log.warning(f"Auto-rescued {len(dirty_files)} uncommitted files on startup")
-                    except subprocess.CalledProcessError:
-                        # If push fails, undo the commit
-                        subprocess.run(
-                            ["git", "reset", "HEAD~1"],
-                            cwd=str(self.env.repo_dir), timeout=10, check=True
-                        )
-                        raise
-                except Exception as e:
-                    log.warning(f"Failed to auto-rescue uncommitted changes: {e}", exc_info=True)
-                return {
-                    "status": "warning", "files": dirty_files[:20],
-                    "auto_committed": auto_committed,
-                }, 1
-            else:
-                return {"status": "ok"}, 0
-        except Exception as e:
-            return {"status": "error", "error": str(e)}, 0
-
-    def _check_version_sync(self) -> Tuple[dict, int]:
-        """Check VERSION file sync with git tags and pyproject.toml."""
-        import subprocess
-        import re
-        try:
-            version_file = read_text(self.env.repo_path("VERSION")).strip()
-            issue_count = 0
-            result_data = {"version_file": version_file}
-
-            # Check pyproject.toml version
-            pyproject_path = self.env.repo_path("pyproject.toml")
-            pyproject_content = read_text(pyproject_path)
-            match = re.search(r'^version\s*=\s*["\']([^"\']+)["\']', pyproject_content, re.MULTILINE)
-            if match:
-                pyproject_version = match.group(1)
-                result_data["pyproject_version"] = pyproject_version
-                if version_file != pyproject_version:
-                    result_data["status"] = "warning"
-                    issue_count += 1
-
-            # Check README.md version (Bible P7: VERSION == README version)
-            try:
-                readme_content = read_text(self.env.repo_path("README.md"))
-                readme_match = re.search(r'\*\*Version:\*\*\s*(\d+\.\d+\.\d+)', readme_content)
-                if readme_match:
-                    readme_version = readme_match.group(1)
-                    result_data["readme_version"] = readme_version
-                    if version_file != readme_version:
-                        result_data["status"] = "warning"
-                        issue_count += 1
-            except Exception:
-                log.debug("Failed to check README.md version", exc_info=True)
-
-            # Check git tags
-            result = subprocess.run(
-                ["git", "describe", "--tags", "--abbrev=0"],
-                cwd=str(self.env.repo_dir),
-                capture_output=True, text=True, timeout=10
-            )
-            if result.returncode != 0:
-                result_data["status"] = "warning"
-                result_data["message"] = "no_tags"
-                return result_data, issue_count
-            else:
-                latest_tag = result.stdout.strip().lstrip('v')
-                result_data["latest_tag"] = latest_tag
-                if version_file != latest_tag:
-                    result_data["status"] = "warning"
-                    issue_count += 1
-
-            if issue_count == 0:
-                result_data["status"] = "ok"
-
-            return result_data, issue_count
-        except Exception as e:
-            return {"status": "error", "error": str(e)}, 0
-
-    def _check_budget(self) -> Tuple[dict, int]:
-        """Check budget remaining with warning thresholds."""
-        try:
-            state_path = self.env.drive_path("state") / "state.json"
-            state_data = json.loads(read_text(state_path))
-            total_budget_str = os.environ.get("TOTAL_BUDGET", "")
-
-            # Handle unset or zero budget gracefully
-            if not total_budget_str or float(total_budget_str) == 0:
-                return {"status": "unconfigured"}, 0
-            else:
-                total_budget = float(total_budget_str)
-                spent = float(state_data.get("spent_usd", 0))
-                remaining = max(0, total_budget - spent)
-
-                if remaining < 10:
-                    status = "emergency"
-                    issues = 1
-                elif remaining < 50:
-                    status = "critical"
-                    issues = 1
-                elif remaining < 100:
-                    status = "warning"
-                    issues = 0
-                else:
-                    status = "ok"
-                    issues = 0
-
-                return {
-                    "status": status,
-                    "remaining_usd": round(remaining, 2),
-                    "total_usd": total_budget,
-                    "spent_usd": round(spent, 2),
-                }, issues
-        except Exception as e:
-            return {"status": "error", "error": str(e)}, 0
-
-    def _verify_system_state(self, git_sha: str) -> None:
-        """Bible Principle 1: verify system state on every startup.
-
-        Checks:
-        - Uncommitted changes (auto-rescue commit & push)
-        - VERSION file sync with git tags
-        - Budget remaining (warning thresholds)
-        """
-        checks = {}
-        issues = 0
-        drive_logs = self.env.drive_path("logs")
-
-        # 1. Uncommitted changes
-        checks["uncommitted_changes"], issue_count = self._check_uncommitted_changes()
-        issues += issue_count
-
-        # 2. VERSION vs git tag
-        checks["version_sync"], issue_count = self._check_version_sync()
-        issues += issue_count
-
-        # 3. Budget check
-        checks["budget"], issue_count = self._check_budget()
-        issues += issue_count
-
-        # Log verification result
-        event = {
-            "ts": utc_now_iso(),
-            "type": "startup_verification",
-            "checks": checks,
-            "issues_count": issues,
-            "git_sha": git_sha,
-        }
-        append_jsonl(drive_logs / "events.jsonl", event)
-
-        if issues > 0:
-            log.warning(f"Startup verification found {issues} issue(s): {checks}")
-
-    # =====================================================================
-    # Main entry point
-    # =====================================================================
-
     def _prepare_task_context(self, task: Dict[str, Any]) -> Tuple[ToolContext, List[Dict[str, Any]], Dict[str, Any]]:
         """Set up ToolContext, build messages, return (ctx, messages, cap_info)."""
         drive_logs = self.env.drive_path("logs")
+        task = attach_task_contract(task)
         sanitized_task = sanitize_task_for_event(task, drive_logs)
         append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), "type": "task_received", "task": sanitized_task})
+        try:
+            write_task_result(
+                self.env.drive_root,
+                str(task.get("id") or ""),
+                STATUS_RUNNING,
+                parent_task_id=task.get("parent_task_id"),
+                root_task_id=task.get("root_task_id"),
+                session_id=task.get("session_id"),
+                actor_id=task.get("actor_id"),
+                delegation_role=task.get("delegation_role"),
+                project_id=str(task.get("project_id") or ""),
+                role=task.get("role"),
+                description=task.get("description"),
+                objective=task.get("objective") or task.get("description"),
+                expected_output=task.get("expected_output"),
+                constraints=task.get("constraints"),
+                context=task.get("context"),
+                memory_mode=task.get("memory_mode"),
+                drive_root=task.get("drive_root"),
+                child_drive_root=task.get("child_drive_root") or task.get("drive_root"),
+                budget_drive_root=task.get("budget_drive_root"),
+                task_constraint=task.get("task_constraint"),
+                task_contract=task.get("task_contract"),
+                model_lane=task.get("model_lane"),
+                requested_model_lane=task.get("requested_model_lane"),
+                effective_model_lane=task.get("effective_model_lane"),
+                model=task.get("model"),
+                use_local_model=task.get("use_local_model"),
+                task_group_id=task.get("task_group_id"),
+                task_group=task.get("task_group"),
+                subagent_envelope=task.get("subagent_envelope"),
+                metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+                result="Task is running.",
+            )
+        except Exception:
+            log.debug("Failed to persist running task status", exc_info=True)
+        self._emit_live_log(
+            "context_building_started",
+            task_id=str(task.get("id") or ""),
+            task_type=str(task.get("type") or ""),
+        )
+        if str(task.get("delegation_role") or "") == "subagent" and self._event_queue is not None and self._current_chat_id is not None:
+            _tc = task.get("task_constraint")
+            _surface = str((_tc.get("surface") if isinstance(_tc, dict) else "") or "")
+            try:
+                self._event_queue.put({
+                    "type": "send_message",
+                    "chat_id": self._current_chat_id,
+                    "text": f"▶️ Subagent {task.get('id')} running ({task.get('role') or 'researcher'}).",
+                    "format": "markdown",
+                    "is_progress": True,
+                    "task_id": str(task.get("id") or ""),
+                    "progress_meta": {
+                        "subagent_event": "running",
+                        "subagent_task_id": str(task.get("id") or ""),
+                        "root_task_id": str(task.get("root_task_id") or ""),
+                        "parent_task_id": str(task.get("parent_task_id") or ""),
+                        "delegation_role": "subagent",
+                        "subagent_role": str(task.get("role") or ""),
+                        "write_surface": _surface,
+                        "task_group_id": str(task.get("task_group_id") or ""),
+                        "model_lane": str(task.get("requested_model_lane") or task.get("model_lane") or ""),
+                        "effective_model_lane": str(task.get("effective_model_lane") or ""),
+                        "model": str(task.get("model") or ""),
+                    },
+                    "ts": utc_now_iso(),
+                })
+            except Exception:
+                log.debug("Failed to emit subagent running progress", exc_info=True)
 
-        # Set tool context for this task
+        task_metadata = dict(task.get("metadata") or {}) if isinstance(task.get("metadata"), dict) else {}
+        for key in (
+            "parent_task_id",
+            "root_task_id",
+            "session_id",
+            "actor_id",
+            "delegation_role",
+            "role",
+            "workspace_root",
+            "workspace_mode",
+            "memory_mode",
+            "drive_root",
+            "child_drive_root",
+            "budget_drive_root",
+            "model_lane",
+            "requested_model_lane",
+            "effective_model_lane",
+            "model",
+            "use_local_model",
+            "task_group_id",
+            "task_group",
+            "subagent_envelope",
+            "executor_ref",
+        ):
+            if task.get(key) not in (None, ""):
+                task_metadata[key] = task.get(key)
+        _tc_meta = task.get("task_constraint")
+        _surface_meta = str((_tc_meta.get("surface") if isinstance(_tc_meta, dict) else "") or "")
+        if _surface_meta:
+            task_metadata["write_surface"] = _surface_meta
+        self._current_task_metadata = dict(task_metadata)
+
+        from ouroboros.project_facts import resolve_project_id
+
+        # Project scope flows to tools via ctx.project_id and to context build via
+        # resolve_project_id(task) in build_llm_messages (Env is frozen — never mutate it).
+        _resolved_project_id = resolve_project_id(task)
+
         ctx = ToolContext(
             repo_dir=self.env.repo_dir,
             drive_root=self.env.drive_root,
             branch_dev=self.env.branch_dev,
+            system_repo_dir=self.env.repo_dir,
+            workspace_root=pathlib.Path(task["workspace_root"]).resolve(strict=False)
+            if str(task.get("workspace_root") or "").strip()
+            else None,
+            workspace_mode=str(task.get("workspace_mode") or ""),
+            memory_mode=str(task.get("memory_mode") or ""),
+            budget_drive_root=str(task.get("budget_drive_root") or ""),
+            project_id=_resolved_project_id,
+            task_metadata=task_metadata,
+            executor_ref=task_metadata.get("executor_ref") if isinstance(task_metadata.get("executor_ref"), dict) else {},
             pending_events=self._pending_events,
             current_chat_id=self._current_chat_id,
             current_task_type=self._current_task_type,
             emit_progress_fn=self._emit_progress,
+            event_queue=self._event_queue,
+            task_id=str(task.get("id") or ""),
             task_depth=int(task.get("depth", 0)),
             is_direct_chat=bool(task.get("_is_direct_chat")),
+            task_constraint=normalize_task_constraint(task.get("task_constraint")),
+            task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
         )
+        if str(task_metadata.get("delegation_role") or "").lower() == "subagent":
+            model_override = str(task_metadata.get("model") or "").strip()
+            if model_override:
+                ctx.task_model_override = model_override
+            if "use_local_model" in task_metadata:
+                ctx.task_use_local_override = bool(task_metadata.get("use_local_model"))
         self.tools.set_context(ctx)
 
-        # Typing indicator via event queue (no direct Telegram API)
         self._emit_typing_start()
 
-        # --- Build context (delegated to context.py) ---
+        _use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
+        _soft_cap = CONTEXT_SOFT_CAP_TOKENS
+        if _use_local:
+            _local_ctx = int(os.environ.get("LOCAL_MODEL_CONTEXT_LENGTH", "0"))
+            if _local_ctx <= 0:
+                try:
+                    from ouroboros.local_model import get_manager
+                    _local_ctx = get_manager().get_context_length()
+                except Exception:
+                    _local_ctx = 0
+            if _local_ctx <= 0:
+                _local_ctx = 16384
+            _soft_cap = max(2048, _local_ctx // 2)
+
         messages, cap_info = build_llm_messages(
             env=self.env,
             memory=self.memory,
             task=task,
-            review_context_builder=self._build_review_context,
+            review_context_builder=lambda: build_review_context(self.env),
+            soft_cap_tokens=_soft_cap,
         )
 
-        if cap_info.get("trimmed_sections"):
-            try:
-                append_jsonl(drive_logs / "events.jsonl", {
-                    "ts": utc_now_iso(), "type": "context_soft_cap_trim",
-                    "task_id": task.get("id"), **cap_info,
-                })
-            except Exception:
-                log.warning("Failed to log context soft cap trim event", exc_info=True)
-                pass
-
-        # Read budget remaining for cost guard
         budget_remaining = None
         try:
-            state_path = self.env.drive_path("state") / "state.json"
-            state_data = json.loads(read_text(state_path))
+            budget_root_text = str(task.get("budget_drive_root") or "").strip()
+            budget_root = pathlib.Path(budget_root_text) if budget_root_text else self.env.drive_root
+            state_data = read_json_dict(budget_root / "state" / "state.json") or {}
             total_budget = float(os.environ.get("TOTAL_BUDGET", "1"))
             spent = float(state_data.get("spent_usd", 0))
             if total_budget > 0:
@@ -381,71 +317,181 @@ class OuroborosAgent:
             pass
 
         cap_info["budget_remaining"] = budget_remaining
+        self._emit_live_log(
+            "context_building_finished",
+            task_id=str(task.get("id") or ""),
+            task_type=str(task.get("type") or ""),
+            message_count=len(messages),
+            budget_remaining_usd=budget_remaining,
+        )
         return ctx, messages, cap_info
 
     def handle_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
+        # Hot-reload settings so UI changes affect the next task without restart.
+        try:
+            from ouroboros.config import load_settings, apply_settings_to_env
+            apply_settings_to_env(load_settings())
+        except Exception:
+            pass
+
         self._busy = True
         start_time = time.time()
         self._task_started_ts = start_time
         self._last_progress_ts = start_time
         self._pending_events = []
-        self._current_chat_id = int(task.get("chat_id") or 0) or None
+        # Preserve chat_id=0; it is a real session, not missing.
+        _raw_chat = task.get("chat_id")
+        if _raw_chat is None or _raw_chat == "":
+            self._current_chat_id = None
+        else:
+            try:
+                self._current_chat_id = int(_raw_chat)
+            except (TypeError, ValueError):
+                self._current_chat_id = None
         self._current_task_type = str(task.get("type") or "")
+        self._current_task_id = str(task.get("id") or "") or None
+        self._emit_live_log(
+            "task_started",
+            task_id=self._current_task_id or "",
+            task_type=self._current_task_type,
+            task_text=str(task.get("text") or "")[:200],
+            direct_chat=bool(task.get("_is_direct_chat")),
+        )
 
         drive_logs = self.env.drive_path("logs")
         heartbeat_stop = self._start_task_heartbeat_loop(str(task.get("id") or ""))
 
         try:
-            # --- Prepare task context ---
             ctx, messages, cap_info = self._prepare_task_context(task)
             budget_remaining = cap_info.get("budget_remaining")
 
-            # --- LLM loop (delegated to loop.py) ---
             usage: Dict[str, Any] = {}
-            llm_trace: Dict[str, Any] = {"assistant_notes": [], "tool_calls": []}
+            llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
 
-            # Set initial reasoning effort based on task type
             task_type_str = str(task.get("type") or "").lower()
-            if task_type_str in ("evolution", "review"):
-                initial_effort = "high"
+            initial_effort = resolve_effort(task_type_str)
+
+            if task_type_str == "deep_self_review":
+                # Deep self-review bypasses the tool loop.
+                try:
+                    from ouroboros.deep_self_review import run_deep_self_review, is_review_available
+                    self._emit_progress("Starting deep self-review... This may take several minutes.")
+                    review_model = str(task.get("model") or "")
+                    if not review_model:
+                        avail, review_model = is_review_available()
+                        if not avail:
+                            review_model = ""
+                    if not review_model:
+                        text = (
+                            "❌ Deep self-review unavailable: configure "
+                            "OUROBOROS_MODEL_DEEP_SELF_REVIEW and the matching provider API key."
+                        )
+                        usage = {
+                            "execution_status": "infra_failed",
+                            "reason_code": "deep_self_review_unavailable",
+                        }
+                    else:
+                        text, usage = run_deep_self_review(
+                            repo_dir=self.env.repo_dir,
+                            drive_root=self.env.drive_root,
+                            llm=self.llm,
+                            emit_progress=self._emit_progress,
+                            event_queue=self._event_queue,
+                            model=review_model,
+                        )
+                    if usage:
+                        self._pending_events.append({
+                            "type": "llm_usage",
+                            "ts": utc_now_iso(),
+                            "task_id": str(task.get("id") or ""),
+                            "model": review_model,
+                            "usage": usage,
+                            "category": "deep_self_review",
+                        })
+                    try:
+                        review_path = pathlib.Path(self.env.drive_root) / "memory" / "deep_review.md"
+                        review_path.write_text(text, encoding="utf-8")
+                    except Exception as save_err:
+                        log.warning("Failed to save deep review to memory: %s", save_err)
+                    llm_trace = {"reasoning_notes": ["deep_self_review"], "tool_calls": []}
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    append_jsonl(drive_logs / "events.jsonl", {
+                        "ts": utc_now_iso(), "type": "task_error",
+                        "task_id": task.get("id"), "error": repr(e),
+                        "traceback": truncate_for_log(tb, 2000),
+                    })
+                    text = f"⚠️ Deep self-review error: {type(e).__name__}: {e}"
+                    usage = {
+                        "execution_status": "infra_failed",
+                        "reason_code": "deep_self_review_error",
+                    }
+                    llm_trace = {"reasoning_notes": ["deep_self_review_error"], "tool_calls": []}
             else:
-                initial_effort = "medium"
+                try:
+                    text, usage, llm_trace = run_llm_loop(
+                        messages=messages,
+                        tools=self.tools,
+                        llm=self.llm,
+                        drive_logs=drive_logs,
+                        emit_progress=self._emit_progress,
+                        incoming_messages=self._incoming_messages,
+                        task_type=task_type_str,
+                        task_id=str(task.get("id") or ""),
+                        budget_remaining_usd=budget_remaining,
+                        event_queue=self._event_queue,
+                        initial_effort=initial_effort,
+                        drive_root=self.env.drive_root,
+                    )
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    append_jsonl(drive_logs / "events.jsonl", {
+                        "ts": utc_now_iso(), "type": "task_error",
+                        "task_id": task.get("id"), "error": repr(e),
+                        "traceback": truncate_for_log(tb, 2000),
+                    })
+                    text = f"⚠️ Error during processing: {type(e).__name__}: {e}"
+                    usage = {
+                        "execution_status": "infra_failed",
+                        "reason_code": "task_exception",
+                    }
+                    try:
+                        from ouroboros.task_results import STATUS_FAILED, write_task_result
+                        write_task_result(
+                            self.env.drive_root,
+                            str(task.get("id") or ""),
+                            STATUS_FAILED,
+                            result=text,
+                            reason_code="task_exception",
+                            outcome_axes=infra_failed_axes("task_exception", review_trigger="agent_exception"),
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        from ouroboros.task_continuation import capture_review_continuation_from_state
+                        capture_review_continuation_from_state(
+                            self.env.drive_root,
+                            task,
+                            source="task_exception",
+                            warning=f"{type(e).__name__}: {e}",
+                            repo_dir=self.env.repo_dir,
+                        )
+                    except Exception:
+                        log.debug("Failed to persist review continuation after task exception", exc_info=True)
 
-            try:
-                text, usage, llm_trace = run_llm_loop(
-                    messages=messages,
-                    tools=self.tools,
-                    llm=self.llm,
-                    drive_logs=drive_logs,
-                    emit_progress=self._emit_progress,
-                    incoming_messages=self._incoming_messages,
-                    task_type=task_type_str,
-                    task_id=str(task.get("id") or ""),
-                    budget_remaining_usd=budget_remaining,
-                    event_queue=self._event_queue,
-                    initial_effort=initial_effort,
-                    drive_root=self.env.drive_root,
-                )
-            except Exception as e:
-                tb = traceback.format_exc()
-                append_jsonl(drive_logs / "events.jsonl", {
-                    "ts": utc_now_iso(), "type": "task_error",
-                    "task_id": task.get("id"), "error": repr(e),
-                    "traceback": truncate_for_log(tb, 2000),
-                })
-                text = f"⚠️ Error during processing: {type(e).__name__}: {e}"
-
-            # Empty response guard
             if not isinstance(text, str) or not text.strip():
                 text = "⚠️ Model returned an empty response. Try rephrasing your request."
 
-            # Emit events for supervisor
-            self._emit_task_results(task, text, usage, llm_trace, start_time, drive_logs)
+            emit_task_results(
+                self.env, self.memory, self.llm,
+                self._pending_events, task, text,
+                usage, llm_trace, start_time, drive_logs,
+                ctx=ctx,
+            )
             return list(self._pending_events)
 
         finally:
             self._busy = False
-            # Clean up browser if it was used during this task
             try:
                 from ouroboros.tools.browser import cleanup_browser
                 cleanup_browser(self.tools._ctx)
@@ -460,149 +506,24 @@ class OuroborosAgent:
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
             self._current_task_type = None
-
-    # =====================================================================
-    # Task result emission
-    # =====================================================================
-
-    def _emit_task_results(
-        self, task: Dict[str, Any], text: str,
-        usage: Dict[str, Any], llm_trace: Dict[str, Any],
-        start_time: float, drive_logs: pathlib.Path,
-    ) -> None:
-        """Emit all end-of-task events to supervisor."""
-        # NOTE: per-round llm_usage events are already emitted in loop.py
-        # (_emit_llm_usage_event). Do NOT emit an aggregate llm_usage here —
-        # that would double-count in update_budget_from_usage.
-        # Cost/token summaries are carried by task_metrics and task_done events.
-
-        self._pending_events.append({
-            "type": "send_message", "chat_id": task["chat_id"],
-            "text": text or "\u200b", "log_text": text or "",
-            "format": "markdown",
-            "task_id": task.get("id"), "ts": utc_now_iso(),
-        })
-
-        duration_sec = round(time.time() - start_time, 3)
-        n_tool_calls = len(llm_trace.get("tool_calls", []))
-        n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
-                            if isinstance(tc, dict) and tc.get("is_error"))
-        try:
-            append_jsonl(drive_logs / "events.jsonl", {
-                "ts": utc_now_iso(), "type": "task_eval", "ok": True,
-                "task_id": task.get("id"), "task_type": task.get("type"),
-                "duration_sec": duration_sec,
-                "tool_calls": n_tool_calls,
-                "tool_errors": n_tool_errors,
-                "response_len": len(text),
-            })
-        except Exception:
-            log.warning("Failed to log task eval event", exc_info=True)
-            pass
-
-        self._pending_events.append({
-            "type": "task_metrics",
-            "task_id": task.get("id"), "task_type": task.get("type"),
-            "duration_sec": duration_sec,
-            "tool_calls": n_tool_calls, "tool_errors": n_tool_errors,
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "ts": utc_now_iso(),
-        })
-
-        self._pending_events.append({
-            "type": "task_done",
-            "task_id": task.get("id"),
-            "task_type": task.get("type"),
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "ts": utc_now_iso(),
-        })
-        append_jsonl(drive_logs / "events.jsonl", {
-            "ts": utc_now_iso(),
-            "type": "task_done",
-            "task_id": task.get("id"),
-            "task_type": task.get("type"),
-            "cost_usd": round(float(usage.get("cost") or 0), 6),
-            "total_rounds": int(usage.get("rounds") or 0),
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-        })
-
-        # Store task result for parent task retrieval
-        try:
-            results_dir = pathlib.Path(self.env.drive_root) / "task_results"
-            results_dir.mkdir(parents=True, exist_ok=True)
-            result_data = {
-                "task_id": task.get("id"),
-                "parent_task_id": task.get("parent_task_id"),
-                "status": "completed",
-                "result": text[:4000] if text else "",  # Truncate to avoid huge files
-                "cost_usd": round(float(usage.get("cost") or 0), 6),
-                "total_rounds": int(usage.get("rounds") or 0),
-                "ts": utc_now_iso(),
-            }
-            result_file = results_dir / f"{task.get('id')}.json"
-            tmp_file = results_dir / f"{task.get('id')}.json.tmp"
-            tmp_file.write_text(json.dumps(result_data, ensure_ascii=False, indent=2))
-            os.rename(tmp_file, result_file)
-        except Exception as e:
-            log.warning("Failed to store task result: %s", e)
-
-    # =====================================================================
-    # Review context builder
-    # =====================================================================
-
-    def _build_review_context(self) -> str:
-        """Collect code snapshot + complexity metrics for review tasks."""
-        try:
-            from ouroboros.review import collect_sections, compute_complexity_metrics, format_metrics
-            sections, stats = collect_sections(self.env.repo_dir, self.env.drive_root)
-            metrics = compute_complexity_metrics(sections)
-
-            parts = [
-                "## Code Review Context\n",
-                format_metrics(metrics),
-                f"\nFiles: {stats['files']}, chars: {stats['chars']}\n",
-                "\nUse repo_read to inspect specific files. "
-                "Use run_shell for tests. Key files below:\n",
-            ]
-
-            total_chars = 0
-            max_chars = 80_000
-            files_added = 0
-            for path, content in sections:
-                if total_chars >= max_chars:
-                    parts.append(f"\n... ({len(sections) - files_added} more files, use repo_read)")
-                    break
-                preview = content[:2000] if len(content) > 2000 else content
-                file_block = f"\n### {path}\n```\n{preview}\n```\n"
-                total_chars += len(file_block)
-                parts.append(file_block)
-                files_added += 1
-
-            return "\n".join(parts)
-        except Exception as e:
-            return f"## Code Review Context\n\n(Failed to collect: {e})\nUse repo_read and repo_list to inspect code."
-
-    # =====================================================================
-    # Event emission helpers
-    # =====================================================================
+            self._current_task_id = None
+            self._current_task_metadata = {}
 
     def _emit_progress(self, text: str) -> None:
         self._last_progress_ts = time.time()
         if self._event_queue is None or self._current_chat_id is None:
             return
         try:
-            self._event_queue.put({
+            event = {
                 "type": "send_message", "chat_id": self._current_chat_id,
                 "text": f"💬 {text}", "format": "markdown", "is_progress": True,
+                "task_id": self._current_task_id or "",
                 "ts": utc_now_iso(),
-            })
+            }
+            progress_meta = self._subagent_progress_meta("progress")
+            if progress_meta:
+                event["progress_meta"] = progress_meta
+            self._event_queue.put(event)
         except Exception:
             log.warning("Failed to emit progress event", exc_info=True)
             pass
@@ -626,10 +547,30 @@ class OuroborosAgent:
             self._event_queue.put({
                 "type": "task_heartbeat", "task_id": task_id,
                 "phase": phase, "ts": utc_now_iso(),
+                **self._subagent_progress_meta(phase),
             })
         except Exception:
             log.warning("Failed to emit task heartbeat event", exc_info=True)
             pass
+
+    def _subagent_progress_meta(self, event: str) -> Dict[str, Any]:
+        metadata = self._current_task_metadata if isinstance(self._current_task_metadata, dict) else {}
+        if str(metadata.get("delegation_role") or "").lower() != "subagent":
+            return {}
+        task_id = str(self._current_task_id or metadata.get("subagent_task_id") or metadata.get("task_id") or "")
+        return {
+            "subagent_event": str(event or "progress"),
+            "subagent_task_id": task_id,
+            "root_task_id": str(metadata.get("root_task_id") or ""),
+            "parent_task_id": str(metadata.get("parent_task_id") or ""),
+            "delegation_role": "subagent",
+            "subagent_role": str(metadata.get("role") or ""),
+            "write_surface": str(metadata.get("write_surface") or ""),
+            "task_group_id": str(metadata.get("task_group_id") or ""),
+            "model_lane": str(metadata.get("requested_model_lane") or metadata.get("model_lane") or ""),
+            "effective_model_lane": str(metadata.get("effective_model_lane") or ""),
+            "model": str(metadata.get("model") or ""),
+        }
 
     def _start_task_heartbeat_loop(self, task_id: str) -> Optional[threading.Event]:
         if self._event_queue is None or not task_id.strip():
@@ -645,10 +586,6 @@ class OuroborosAgent:
         threading.Thread(target=_loop, daemon=True).start()
         return stop
 
-
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
 
 def make_agent(repo_dir: str, drive_root: str, event_queue: Any = None) -> OuroborosAgent:
     env = Env(repo_dir=pathlib.Path(repo_dir), drive_root=pathlib.Path(drive_root))
