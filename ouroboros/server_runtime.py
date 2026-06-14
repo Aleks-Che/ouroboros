@@ -285,6 +285,8 @@ def has_remote_provider(settings: dict) -> bool:
             "OPENAI_COMPATIBLE_BASE_URL",
             "CLOUDRU_FOUNDATION_MODELS_API_KEY",
             "GIGACHAT_CREDENTIALS",
+            "DEEPSEEK_API_KEY",
+            "MINIMAX_API_KEY",
         )
     ):
         return True
