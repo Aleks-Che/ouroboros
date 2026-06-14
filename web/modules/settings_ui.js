@@ -100,6 +100,11 @@ const PROVIDER_CARDS = [
         note: 'Use model values like <code>gigachat::GigaChat-3-Ultra</code> in the Models tab to route directly through GigaChat. Authenticate with either an Authorization Key (OAuth, scope usually <code>GIGACHAT_API_PERS</code>/<code>GIGACHAT_API_CORP</code>) or User + Password.',
     },
     {
+        id: 'deepseek', title: 'DeepSeek', icon: '/static/providers/deepseek.svg', hint: 'Direct DeepSeek API',
+        fields: [{ id: 's-deepseek', settingKey: 'DEEPSEEK_API_KEY', label: 'DeepSeek API Key', placeholder: 'sk-...' }],
+        note: 'Use model values like <code>deepseek::deepseek-v4-flash</code> in the Models tab to route models directly through DeepSeek. If this is the only remote key, Ouroboros auto-remaps to deepseek:: defaults.',
+    },
+    {
         id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct runtime plus Claude tooling',
         fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
         note: 'Use model values like <code>anthropic::claude-sonnet-4-6</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
@@ -173,6 +178,7 @@ export const SECRET_KEYS = [
     ['GIGACHAT_CREDENTIALS', 'GigaChat Authorization Key', 'Base64 client_id:secret'],
     ['GIGACHAT_PASSWORD', 'GigaChat Password (basic auth)', 'password'],
     ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
+    ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
