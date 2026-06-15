@@ -897,19 +897,6 @@ class LLMClient:
                 no_proxy,
                 timeout,
             )
-        if target.get("provider") in ("minimax",):
-            return await asyncio.to_thread(
-                self._chat_anthropic,
-                target,
-                messages,
-                tools,
-                reasoning_effort,
-                max_tokens,
-                tool_choice,
-                temperature,
-                no_proxy,
-                timeout,
-            )
         if target.get("provider") == "gigachat":
             # The gigachat library client is synchronous; offload to a thread
             # like the Anthropic path so the event loop is never blocked.
