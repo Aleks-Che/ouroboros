@@ -540,6 +540,7 @@ class LLMClient:
             kwargs: Dict[str, Any] = {
                 "api_key": api_key,
                 "max_retries": 0,
+                "timeout": 60.0,
             }
             if base_url:
                 kwargs["base_url"] = base_url
@@ -2229,6 +2230,11 @@ class LLMClient:
             # Cached clients are built without a timeout; honor the caller's
             # per-request timeout instead of silently using the SDK default.
             kwargs["timeout"] = float(timeout)
+        import logging as _log
+        _log.getLogger("ouroboros.minimax_debug").info(
+            "minimax_DEBUG url=%s/chat/completions model=%s timeout=%s",
+            target.get("base_url"), kwargs.get("model"), kwargs.get("timeout"),
+        )
         prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
             kwargs.get("messages"),
             kwargs.get("tools"),
