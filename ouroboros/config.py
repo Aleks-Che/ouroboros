@@ -117,6 +117,10 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_HARD_TIMEOUT_SEC": 1800,
     "OUROBOROS_FINALIZATION_GRACE_SEC": FINALIZATION_GRACE_DEFAULT_SEC,
     "OUROBOROS_TOOL_TIMEOUT_SEC": 600,
+    # Per-request LLM timeout (seconds). Covers the HTTP read/response wait for
+    # a single LLM API call. Default 3600 (1 hour) to accommodate slow local
+    # models; overridden via env or settings.json.
+    "OUROBOROS_LLM_REQUEST_TIMEOUT_SEC": 3600,
     "OUROBOROS_BG_MAX_ROUNDS": 10,
     "OUROBOROS_BG_WAKEUP_MIN": 30,
     "OUROBOROS_BG_WAKEUP_MAX": 7200,
@@ -478,6 +482,19 @@ def get_restart_drain_max_sec() -> int:
     except (TypeError, ValueError):
         parsed = int(SETTINGS_DEFAULTS["OUROBOROS_RESTART_DRAIN_MAX_SEC"])
     return max(0, parsed)
+
+
+def get_llm_request_timeout_sec() -> float:
+    """Per-request LLM timeout in seconds (HTTP read/wait for a single API call)."""
+    raw = os.environ.get(
+        "OUROBOROS_LLM_REQUEST_TIMEOUT_SEC",
+        SETTINGS_DEFAULTS["OUROBOROS_LLM_REQUEST_TIMEOUT_SEC"],
+    )
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        parsed = float(SETTINGS_DEFAULTS["OUROBOROS_LLM_REQUEST_TIMEOUT_SEC"])
+    return max(30.0, parsed)
 
 
 def get_post_task_evolution_enabled() -> bool:

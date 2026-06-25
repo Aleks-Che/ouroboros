@@ -527,6 +527,7 @@ class LLMClient:
         return self._get_remote_client(target)
 
     def _get_remote_client(self, target: Dict[str, Any]):
+        from ouroboros.config import get_llm_request_timeout_sec
         base_url = str(target.get("base_url") or "")
         api_key = str(target.get("api_key") or "")
         headers_dict = dict(target.get("default_headers") or {})
@@ -540,6 +541,7 @@ class LLMClient:
             kwargs: Dict[str, Any] = {
                 "api_key": api_key,
                 "max_retries": 0,
+                "timeout": get_llm_request_timeout_sec(),
             }
             if base_url:
                 kwargs["base_url"] = base_url
@@ -550,6 +552,7 @@ class LLMClient:
         return client
 
     def _get_local_client(self):
+        from ouroboros.config import get_llm_request_timeout_sec
         port = int(os.environ.get("LOCAL_MODEL_PORT", "8766"))
         if self._local_client is None or self._local_port != port:
             from openai import OpenAI
@@ -557,11 +560,13 @@ class LLMClient:
                 base_url=f"http://127.0.0.1:{port}/v1",
                 api_key="local",
                 max_retries=0,
+                timeout=get_llm_request_timeout_sec(),
             )
             self._local_port = port
         return self._local_client
 
     def _get_async_remote_client(self, target: Dict[str, Any]):
+        from ouroboros.config import get_llm_request_timeout_sec
         base_url = str(target.get("base_url") or "")
         api_key = str(target.get("api_key") or "")
         headers_dict = dict(target.get("default_headers") or {})
@@ -575,6 +580,7 @@ class LLMClient:
             kwargs: Dict[str, Any] = {
                 "api_key": api_key,
                 "max_retries": 0,
+                "timeout": get_llm_request_timeout_sec(),
             }
             if base_url:
                 kwargs["base_url"] = base_url
@@ -587,8 +593,9 @@ class LLMClient:
     @staticmethod
     def _no_proxy_timeout(read_timeout: Optional[float] = None):
         import httpx
+        from ouroboros.config import get_llm_request_timeout_sec
 
-        read_write = float(read_timeout) if read_timeout and read_timeout > 0 else 3600.0
+        read_write = float(read_timeout) if read_timeout and read_timeout > 0 else get_llm_request_timeout_sec()
         return httpx.Timeout(connect=30.0, read=read_write, write=read_write, pool=30.0)
 
     @classmethod
@@ -1530,6 +1537,7 @@ class LLMClient:
         timeout: Optional[float] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         import requests
+        from ouroboros.config import get_llm_request_timeout_sec
 
         del reasoning_effort  # Anthropic direct works without an extra effort payload here.
 
@@ -1567,7 +1575,7 @@ class LLMClient:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
-        request_timeout = float(timeout) if timeout and timeout > 0 else 120
+        request_timeout = float(timeout) if timeout and timeout > 0 else get_llm_request_timeout_sec()
 
         def _send(candidate: Dict[str, Any]):
             if no_proxy:
