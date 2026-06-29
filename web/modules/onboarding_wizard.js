@@ -102,6 +102,7 @@
                 ['ANTHROPIC_API_KEY', 'anthropic'],
                 ['DEEPSEEK_API_KEY', 'deepseek'],
                 ['MINIMAX_API_KEY', 'minimax'],
+                ['MIMO_API_KEY', 'xiaomi'],
             ].filter(([settingKey]) => configured[settingKey]);
             if (hasOpenrouter) return 'openrouter';
             if (hasCompatible) return 'openai-compatible';

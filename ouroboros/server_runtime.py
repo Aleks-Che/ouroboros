@@ -196,6 +196,7 @@ def _exclusive_direct_remote_provider(settings: dict) -> str:
         return ""
     has_deepseek = bool(_setting_text(settings, "DEEPSEEK_API_KEY"))
     has_minimax = bool(_setting_text(settings, "MINIMAX_API_KEY"))
+    has_xiaomi = bool(_setting_text(settings, "MIMO_API_KEY"))
     direct = [
         name for name, present in (
             ("openai", has_official_openai),
@@ -204,8 +205,9 @@ def _exclusive_direct_remote_provider(settings: dict) -> str:
             ("gigachat", has_gigachat),
             ("deepseek", has_deepseek),
             ("minimax", has_minimax),
+            ("xiaomi", has_xiaomi),
         ) if present
-    ]
+    ]  
     return direct[0] if len(direct) == 1 else ""
 
 
@@ -305,6 +307,7 @@ def has_remote_provider(settings: dict) -> bool:
             "GIGACHAT_CREDENTIALS",
             "DEEPSEEK_API_KEY",
             "MINIMAX_API_KEY",
+            "MIMO_API_KEY",
         )
     ):
         return True

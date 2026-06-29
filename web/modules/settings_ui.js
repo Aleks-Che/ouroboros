@@ -110,6 +110,11 @@ const PROVIDER_CARDS = [
         note: 'Use model values like <code>minimax::MiniMax-M3</code> in the Models tab to route models directly through MiniMax.',
     },
     {
+        id: 'xiaomi', title: 'Xiaomi MIMO', icon: '/static/providers/xiaomi.svg', hint: 'Direct Xiaomi MIMO API',
+        fields: [{ id: 's-xiaomi', settingKey: 'MIMO_API_KEY', label: 'Xiaomi MIMO API Key', placeholder: 'Xiaomi MIMO key' }],
+        note: 'Use model values like <code>xiaomi::mimo-v2.5-pro</code> in the Models tab to route models directly through Xiaomi MIMO.',
+    },
+    {
         id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct runtime plus Claude tooling',
         fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
         note: 'Use model values like <code>anthropic::claude-sonnet-4-6</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
@@ -185,6 +190,7 @@ export const SECRET_KEYS = [
     ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
     ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
     ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
+    ['MIMO_API_KEY', 'Xiaomi MIMO API Key', 'Xiaomi MIMO key'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
