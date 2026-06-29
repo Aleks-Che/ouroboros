@@ -12,6 +12,7 @@ from ouroboros.provider_models import (
     GIGACHAT_DIRECT_DEFAULTS,
     MINIMAX_DIRECT_DEFAULTS,
     OPENAI_DIRECT_DEFAULTS,
+    XIAOMI_DIRECT_DEFAULTS,
     compute_direct_review_models_fallback,
     migrate_model_value,
 )
@@ -55,6 +56,12 @@ _DIRECT_PROVIDER_AUTO_DEFAULTS = {
         "OUROBOROS_MODEL_CODE": MINIMAX_DIRECT_DEFAULTS["code"],
         "OUROBOROS_MODEL_LIGHT": MINIMAX_DIRECT_DEFAULTS["light"],
         "OUROBOROS_MODEL_FALLBACK": MINIMAX_DIRECT_DEFAULTS["fallback"],
+    },
+    "xiaomi": {
+        "OUROBOROS_MODEL": XIAOMI_DIRECT_DEFAULTS["main"],
+        "OUROBOROS_MODEL_CODE": XIAOMI_DIRECT_DEFAULTS["code"],
+        "OUROBOROS_MODEL_LIGHT": XIAOMI_DIRECT_DEFAULTS["light"],
+        "OUROBOROS_MODEL_FALLBACK": XIAOMI_DIRECT_DEFAULTS["fallback"],
     },
 }
 # Legacy values that should be auto-replaced with a provider's direct defaults.

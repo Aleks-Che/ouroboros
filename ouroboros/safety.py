@@ -440,6 +440,9 @@ _REMOTE_PROVIDER_KEYS = (
     "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "GIGACHAT_CREDENTIALS",
     "GIGACHAT_PASSWORD",
+    "DEEPSEEK_API_KEY",
+    "MINIMAX_API_KEY",
+    "MIMO_API_KEY",
 )
 
 _LOCAL_ROUTING_KEYS = (
@@ -458,6 +461,9 @@ _PROVIDER_KEY_ENV = {
     "openai-compatible": "OPENAI_COMPATIBLE_API_KEY",
     "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "gigachat": "GIGACHAT_CREDENTIALS",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
+    "xiaomi": "MIMO_API_KEY",
 }
 
 

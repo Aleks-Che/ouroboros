@@ -274,6 +274,11 @@ const SETTINGS_FALLBACK_MODELS = [
     'openai::gpt-5.5-mini',
     'openai/gpt-5.5',
     'anthropic/claude-opus-4.6',
+    'deepseek::deepseek-v4-flash',
+    'deepseek::deepseek-chat',
+    'minimax::MiniMax-M3',
+    'xiaomi::mimo-v2.5-pro',
+    'cloudru::zai-org/GLM-4.7',
 ];
 
 let settingsModelCatalogItems = SETTINGS_FALLBACK_MODELS.map((value) => ({ value, label: 'Suggested model' }));

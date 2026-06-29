@@ -21,7 +21,7 @@ DEFAULT_COLAB_APP_ROOT = "/content/drive/MyDrive/Ouroboros"
 DEFAULT_COLAB_REPO_DIR = "/content/ouroboros_repo"
 DEFAULT_OFFICIAL_REPO_URL = "https://github.com/razzant/ouroboros.git"
 
-_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
+_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_API_KEY", "MINIMAX_API_KEY", "MIMO_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
 
 
 def get_colab_secret(name: str, *, required: bool = True) -> str:
@@ -63,6 +63,9 @@ def collect_colab_secrets() -> Dict[str, str]:
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "MINIMAX_API_KEY",
+        "MIMO_API_KEY",
     )
     out: Dict[str, str] = {}
     out["TELEGRAM_BOT_TOKEN"] = get_colab_secret("TELEGRAM_BOT_TOKEN")

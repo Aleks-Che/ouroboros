@@ -920,6 +920,19 @@ class LLMClient:
                 no_proxy,
                 timeout,
             )
+        if target.get("provider") == "minimax":
+            return await asyncio.to_thread(
+                self._chat_anthropic,
+                target,
+                messages,
+                tools,
+                reasoning_effort,
+                max_tokens,
+                tool_choice,
+                temperature,
+                no_proxy,
+                timeout,
+            )
         if target.get("provider") == "gigachat":
             # The gigachat library client is synchronous; offload to a thread
             # like the Anthropic path so the event loop is never blocked.
@@ -2204,6 +2217,13 @@ class LLMClient:
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
         if target.get("provider") == "anthropic":
+            return self._chat_anthropic(
+                target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
+                no_proxy=no_proxy,
+                timeout=timeout,
+            )
+
+        if target.get("provider") == "minimax":
             return self._chat_anthropic(
                 target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
                 no_proxy=no_proxy,

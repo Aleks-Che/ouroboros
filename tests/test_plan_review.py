@@ -394,6 +394,9 @@ class TestPlanReviewModels(unittest.TestCase):
             "OPENAI_COMPATIBLE_API_KEY": "",
             "CLOUDRU_FOUNDATION_MODELS_API_KEY": "",
             "ANTHROPIC_API_KEY": "",
+            "DEEPSEEK_API_KEY": "",
+            "MINIMAX_API_KEY": "",
+            "MIMO_API_KEY": "",
         }
         with patch.dict(os.environ, env, clear=False):
             models = _get_review_models()
@@ -465,6 +468,9 @@ class TestPlanReviewModels(unittest.TestCase):
             "OPENAI_COMPATIBLE_API_KEY": "",
             "CLOUDRU_FOUNDATION_MODELS_API_KEY": "",
             "ANTHROPIC_API_KEY": "sk-ant-test",
+            "DEEPSEEK_API_KEY": "",
+            "MINIMAX_API_KEY": "",
+            "MIMO_API_KEY": "",
         }
         with patch.dict(os.environ, env, clear=False):
             models = _get_review_models()
