@@ -103,6 +103,10 @@ MODEL_PRICING_STATIC = {
     # https://platform.minimaxi.com/document/Price
     "minimax/MiniMax-M3": (0.60, 0.12, 2.40),
     "minimax::MiniMax-M3": (0.60, 0.12, 2.40),
+    # Xiaomi MIMO pricing (per 1M tokens, input/cached/output).
+    # TBD — set to 0.0 until official pricing is published.
+    "xiaomi/mimo-v2.5-pro": (0.0, 0.0, 0.0),
+    "xiaomi::mimo-v2.5-pro": (0.0, 0.0, 0.0),
 }
 
 _pricing_fetched = False

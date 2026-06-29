@@ -768,3 +768,41 @@ def test_minimax_is_exclusive_direct_provider(monkeypatch):
 
     from ouroboros.config import _exclusive_direct_remote_provider_env
     assert _exclusive_direct_remote_provider_env() == "minimax"
+
+
+def test_resolve_xiaomi_target(monkeypatch):
+    monkeypatch.setenv("MIMO_API_KEY", "xiaomi-key")
+
+    target = LLMClient()._resolve_remote_target("xiaomi::mimo-v2.5-pro")
+
+    assert target["provider"] == "xiaomi"
+    assert target["resolved_model"] == "mimo-v2.5-pro"
+    assert target["usage_model"] == "xiaomi/mimo-v2.5-pro"
+    assert target["base_url"] == "https://token-plan-sgp.xiaomimimo.com/v1"
+    assert target["api_key"] == "xiaomi-key"
+    assert target["supports_openrouter_extensions"] is False
+
+
+def test_resolve_xiaomi_target_honors_custom_base_url(monkeypatch):
+    monkeypatch.setenv("MIMO_API_KEY", "key")
+    monkeypatch.setenv("MIMO_BASE_URL", "https://custom.example/v1")
+
+    target = LLMClient()._resolve_remote_target("xiaomi::mimo-v2.5-pro")
+
+    assert target["base_url"] == "https://custom.example/v1"
+
+
+def test_xiaomi_is_exclusive_direct_provider(monkeypatch):
+    monkeypatch.setenv("MIMO_API_KEY", "key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+    monkeypatch.delenv("CLOUDRU_FOUNDATION_MODELS_API_KEY", raising=False)
+    monkeypatch.delenv("GIGACHAT_CREDENTIALS", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_COMPATIBLE_BASE_URL", raising=False)
+
+    from ouroboros.config import _exclusive_direct_remote_provider_env
+    assert _exclusive_direct_remote_provider_env() == "xiaomi"

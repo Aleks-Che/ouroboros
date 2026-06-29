@@ -392,6 +392,8 @@ class LLMClient:
             return f"deepseek/{resolved_model}"
         if provider == "minimax":
             return f"minimax/{resolved_model}"
+        if provider == "xiaomi":
+            return f"xiaomi/{resolved_model}"
         if provider == "cloudru":
             return f"cloudru/{resolved_model}"
         if provider == "gigachat":
@@ -445,7 +447,21 @@ class LLMClient:
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
                 "api_key": os.environ.get("MINIMAX_API_KEY", ""),
-                "base_url": "https://api.minimax.io/v1",
+                "base_url": "https://api.minimax.io/anthropic",
+                "default_headers": {},
+                "supports_openrouter_extensions": False,
+                "supports_generation_cost": False,
+            }
+
+        if provider == "xiaomi":
+            return {
+                "provider": provider,
+                "resolved_model": resolved_model,
+                "usage_model": usage_model,
+                "api_key": os.environ.get("MIMO_API_KEY", ""),
+                "base_url": (
+                    os.environ.get("MIMO_BASE_URL", "") or ""
+                ).strip() or "https://token-plan-sgp.xiaomimimo.com/v1",
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,

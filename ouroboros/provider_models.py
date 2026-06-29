@@ -14,6 +14,7 @@ PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("anthropic::", "anthropic"),
     ("deepseek::", "deepseek"),
     ("minimax::", "minimax"),
+    ("xiaomi::", "xiaomi"),
     ("cloudru::", "cloudru"),
     ("gigachat::", "gigachat"),
     ("openai-compatible::", "openai-compatible"),
@@ -26,6 +27,7 @@ PROVIDER_ENV_KEYS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
     "minimax": "MINIMAX_API_KEY",
+    "xiaomi": "MIMO_API_KEY",
     "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
@@ -126,11 +128,19 @@ MINIMAX_DIRECT_DEFAULTS = {
     "fallback": "minimax::MiniMax-M3",
 }
 
+XIAOMI_DIRECT_DEFAULTS = {
+    "main": "xiaomi::mimo-v2.5-pro",
+    "code": "xiaomi::mimo-v2.5-pro",
+    "light": "xiaomi::mimo-v2.5-pro",
+    "fallback": "xiaomi::mimo-v2.5-pro",
+}
+
 _DIRECT_PROVIDER_DEFAULTS = {
     "openai": OPENAI_DIRECT_DEFAULTS,
     "anthropic": ANTHROPIC_DIRECT_DEFAULTS,
     "deepseek": DEEPSEEK_DIRECT_DEFAULTS,
     "minimax": MINIMAX_DIRECT_DEFAULTS,
+    "xiaomi": XIAOMI_DIRECT_DEFAULTS,
     "cloudru": CLOUDRU_DIRECT_DEFAULTS,
     "gigachat": GIGACHAT_DIRECT_DEFAULTS,
 }
@@ -171,6 +181,12 @@ def migrate_model_value(provider: str, value: str) -> str:
             return text
         if text.startswith("minimax/"):
             return f"minimax::{text[len('minimax/'):]}"
+        return text
+    if provider == "xiaomi":
+        if text.startswith("xiaomi::"):
+            return text
+        if text.startswith("xiaomi/"):
+            return f"xiaomi::{text[len('xiaomi/'):]}"
         return text
     if provider == "cloudru":
         if text.startswith("cloudru::"):
@@ -266,6 +282,8 @@ _CONTEXT_WINDOW_PREFIXES: tuple[tuple[str, int], ...] = (
     # MiniMax: M3 1M, other models 192K (verified 2026-06).
     ("minimax/MiniMax-M3", 1_000_000),
     ("minimax/", 1_000_000),
+    # Xiaomi MIMO: 128K (verified 2026-06).
+    ("xiaomi/", 128_000),
 )
 
 
@@ -298,6 +316,8 @@ def normalize_model_identity(model: str) -> str:
         return f"deepseek/{text[len('deepseek::'):]}"
     if text.startswith("minimax::"):
         return f"minimax/{text[len('minimax::'):]}"
+    if text.startswith("xiaomi::"):
+        return f"xiaomi/{text[len('xiaomi::'):]}"
     if text.startswith("cloudru::"):
         return f"cloudru/{text[len('cloudru::'):]}"
     if text.startswith("gigachat::"):

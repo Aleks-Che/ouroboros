@@ -259,6 +259,18 @@ def _provider_specs(
             ),
         ))
 
+    mimo_api_key = str(settings.get("MIMO_API_KEY", "") or "").strip()
+    if mimo_api_key:
+        mimo_base_url = str(settings.get("MIMO_BASE_URL", "") or "").strip()
+        if not mimo_base_url:
+            mimo_base_url = "https://token-plan-sgp.xiaomimimo.com/v1"
+        specs.append((
+            "xiaomi",
+            lambda client: _fetch_openai_compatible_model_catalog(
+                client, "xiaomi", "Xiaomi MIMO", mimo_api_key, mimo_base_url,
+            ),
+        ))
+
     cloudru_api_key = str(settings.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip()
     if cloudru_api_key:
         cloudru_base_url = str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or "").strip()
