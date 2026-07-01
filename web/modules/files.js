@@ -208,7 +208,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         return wrapper;
     }
 
-    async function showModal({ title, message, input = false, initialValue = '', confirmLabel = 'OK', cancelLabel = 'Cancel' }) {
+    async function showModal({ title, message, input = false, initialValue = '', confirmLabel = 'OK', cancelLabel = 'Отмена' }) {
         const result = await openConfirmDialog({
             title,
             body: message,

@@ -191,19 +191,19 @@ export function initEvolution({ ws, state, mount }) {
             renderRuntimeState(runtime, data.generated_at || '');
             const points = data.points || [];
             if (points.length === 0) {
-                renderEmptyState('No evolution tags yet. When evolution commits start landing, the chart will appear here.');
-                setBadge('offline', 'No data');
+                renderEmptyState('Тегов эволюции пока нет. Когда появятся коммиты эволюции, здесь отобразится график.');
+                setBadge('offline', 'Нет данных');
                 return;
             }
-            setBadge('online', data.cached ? `${points.length} tags (cached)` : `${points.length} tags`);
+            setBadge('online', data.cached ? `${points.length} тегов (кэш)` : `${points.length} тегов`);
             renderChart(points);
             renderTagsList(points);
         } catch (err) {
             console.error('Evolution load error:', err);
             if (requestId !== loadSequence) return;
-            renderEmptyState('Failed to load evolution data. Use Refresh to try again.');
-            setBadge('error', 'Error');
-            runtimeDetail.textContent = 'Failed to load evolution state. Try Refresh or wait for the runtime to reconnect.';
+            renderEmptyState('Не удалось загрузить данные эволюции. Нажмите «Обновить» для повторной попытки.');
+            setBadge('error', 'Ошибка');
+            runtimeDetail.textContent = 'Не удалось загрузить состояние эволюции. Попробуйте обновить или дождитесь переподключения рантайма.';
             runtimeMeta.innerHTML = '';
         } finally {
             if (requestId === loadSequence) refreshBtn.disabled = false;

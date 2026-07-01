@@ -109,10 +109,10 @@ export function initLogs({ ws, state, mount }) {
                 const isHidden = rawEl.hasAttribute('hidden');
                 if (isHidden) {
                     rawEl.removeAttribute('hidden');
-                    rawToggle.textContent = 'Hide raw';
+                    rawToggle.textContent = 'Скрыть сырой';
                 } else {
                     rawEl.setAttribute('hidden', '');
-                    rawToggle.textContent = 'Raw';
+                    rawToggle.textContent = 'Сырой';
                 }
             });
         });

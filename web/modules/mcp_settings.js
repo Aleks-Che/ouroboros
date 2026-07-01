@@ -207,10 +207,10 @@ function bindCardEvents(card) {
         tokenToggle.addEventListener('click', () => {
             if (tokenInput.type === 'password') {
                 tokenInput.type = 'text';
-                tokenToggle.textContent = 'Hide';
+                tokenToggle.textContent = 'Скрыть';
             } else {
                 tokenInput.type = 'password';
-                tokenToggle.textContent = 'Show';
+                tokenToggle.textContent = 'Показать';
             }
         });
     }
