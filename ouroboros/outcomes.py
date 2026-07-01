@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import pathlib
 from hashlib import sha256
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ouroboros.headless import (
     ARTIFACT_STATUS_FAILED,
@@ -48,10 +48,19 @@ EXECUTION_BEST_EFFORT = "best_effort"
 OBJECTIVE_BEST_EFFORT = "best_effort"
 
 # Reason codes whose forced finalization may yield a best-effort outcome.
+# deadline_local is the loop-local sibling of finalization_grace (v6.33.0 WS2): a
+# genuinely-extracted answer at a real deadline must land as best_effort, not an
+# agent failure — same as the supervisor finalize_now path.
 BEST_EFFORT_REASON_CODES = frozenset({
     "budget_exhausted",
     "round_limit",
     "finalization_grace",
+    "deadline_local",
+    # provider-death terminalization (WA2): a genuinely-extracted final answer
+    # after the same-model reroute + fallback exhausted must land as best_effort,
+    # not a flat failure — the same honest-shelf semantics as deadline/budget.
+    "provider_unavailable",
+    "children_unabsorbed",
 })
 
 # Typed final-answer protocol marker (machine-readable deliverable payload,
@@ -114,6 +123,276 @@ _RECOVERY_TOOL_NAMES = frozenset({
     "stop_service",
     "write_file",
 })
+# T4 (v6.35.0): an unrecovered run_command/run_script non-zero exit / shell
+# error — e.g. an X11-teardown `exit=1` after "138 passed", or an abandoned
+# `find` probe on a nonexistent path — is cosmetic, not a degraded execution.
+# NOTE: `non_zero_exit`/`shell_error` ARE in _BLOCKING_TOOL_STATUSES; this branch
+# DELIBERATELY demotes them to a non-degrading "cosmetic" bucket (still recorded
+# on the execution axis for monitoring) because the owner accepted that an
+# ignored shell failure belongs on the LLM-review/objective axis, not the
+# execution axis. `timeout` is intentionally EXCLUDED — a stuck/aborted command
+# is a real failure. Structural status/tool-name partition, never content
+# matching (Bible P5).
+_NON_BLOCKING_RECOVERABLE_STATUSES = frozenset({"non_zero_exit", "shell_error"})
+_COSMETIC_TOOL_NAMES = frozenset({"run_command", "run_script"})
+# A2: an UNRECOVERED access-policy block (resource_policy_blocked /
+# resource_constraint_blocked) on a READ-ONLY exploratory tool — e.g. a
+# read_file/search_code/query_code refused by the resource policy — is honest
+# telemetry, not a degraded execution: the agent simply could not look there.
+# DISTINCT from _NON_BLOCKING_RECOVERABLE_STATUSES / _COSMETIC_TOOL_NAMES so this
+# never demotes a run_command resource block. Routed to a FULLY-IGNORED bucket (not
+# cosmetic) so it raises no WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW — the goal is
+# honest telemetry, not a new visible warning. The read-only tool whitelist reuses
+# the capability SSOT (READ_ONLY_PARALLEL_TOOLS). Write/edit/data/protected/
+# light_mode/integration blocks are intentionally NOT demoted here.
+_NON_BLOCKING_READONLY_BLOCK_STATUSES = frozenset({"resource_policy_blocked", "resource_constraint_blocked"})
+# When cosmetic residual errors exist but no acceptance review ran, the
+# execution axis is OK yet "did it actually work?" was never judged: surface a
+# structural warning so a default-`auto` overclaim isn't displayed as clean.
+WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW = "residual_tool_errors_without_review"
+# FR3: a turn produced real effects and finished cleanly, but the agent recorded
+# NO host-attested verification (no verify_and_record receipt and no trivial
+# write/edit deliverable). A BINARY transparency flag that keeps the result solved
+# (never a downgrade — anti-oscillation), surfaced loudly on the objective axis.
+WARN_RECEIPT_ABSENT = "receipt_absent"
+# M2 zero-grounding: the task declared a TYPED expected_output, finished cleanly,
+# but the agent did literally no tool work and produced no structured FINAL ANSWER —
+# a structural overclaim. Advisory flag (keeps solved); conservative so a normal
+# text-answer or tool-using task is never false-flagged.
+WARN_EXPECTED_OUTPUT_UNGROUNDED = "expected_output_ungrounded"
+# Receipt statuses that count as host-attested grounding (suppress receipt_absent):
+# a verify_and_record pass, an observed artifact, or an honest no_visible_machine_contract
+# declaration. NOT a fail (that is an overclaim signal, not grounding). A trivial write/
+# edit deliverable is its OWN grounding via _trace_has_write_edit_grounding (derived from
+# the trace, not a receipt), so it needs no receipt status here.
+_RECEIPT_GROUNDING_STATUSES = frozenset({"pass", "observed", "declared"})
+
+# A failed verification receipt (``status=="fail"``) is "reconciled" ONLY by a LATER
+# genuine grounding receipt — a passing run-kind check (``pass``) or an observed artifact
+# (``observed``). A later ``declared`` (the no_visible_machine_contract escape hatch) does
+# NOT reconcile a red: that would let an agent see red, then declare-away the finalization
+# nudge. So this is deliberately NARROWER than _RECEIPT_GROUNDING_STATUSES (no ``declared``).
+_RECEIPT_RED_RECONCILING_STATUSES = frozenset({"pass", "observed"})
+
+# Ledger entry statuses that do NOT count as a failure for ``summary.has_failures``.
+# SSOT: the receipt grounding statuses (pass/observed/declared) are folded in so a turn
+# that grounded itself via a successful artifact_observation (``observed``) or an honest
+# no_visible_machine_contract declaration (``declared``) is NOT mis-read as a ledger
+# failure. A plain run-kind verify pass is already ``pass``.
+_LEDGER_NON_FAILURE_STATUSES = (
+    frozenset({"", "ok", RESULT_SUCCEEDED, "pass", OBJECTIVE_NOT_EVALUATED, "ignored"})
+    | _RECEIPT_GROUNDING_STATUSES
+)
+
+
+def _is_ignored_readonly_block(tool: str, status: str) -> bool:
+    """A2 (v6.50.2) SSOT predicate: an access-policy block (resource_policy_blocked /
+    resource_constraint_blocked) on a READ-ONLY exploratory tool is honest telemetry, not a
+    degraded execution NOR a verification-ledger failure — the agent simply could not look
+    there. Shared by ``_classify_tool_errors`` (execution axis) and ``build_verification_ledger``
+    (has_failures) so both axes classify it identically. Non-read-only/effect tools (e.g. a
+    run_command resource block) are NOT matched and stay real failures."""
+    from ouroboros.tool_capabilities import READ_ONLY_PARALLEL_TOOLS
+
+    return status in _NON_BLOCKING_READONLY_BLOCK_STATUSES and tool in READ_ONLY_PARALLEL_TOOLS
+
+
+def _clip(text: Any, cap: int) -> str:
+    """Bound a string for a ledger INDEX projection with a DISCLOSED marker (BIBLE P1 —
+    never silent). The full content stays durable elsewhere (the receipt store / blobs)."""
+    t = str(text or "")
+    return t if len(t) <= cap else t[:cap] + f"…[+{len(t) - cap} chars]"
+
+
+def _merge_objective_warning(objective: Dict[str, Any], code: str) -> None:
+    """Add a structural objective warning WITHOUT clobbering an existing one.
+    Warnings can co-occur (cosmetic residual + receipt_absent), so ``warning``
+    (singular) stays the primary string for back-compat while ``warnings`` (list)
+    accumulates every distinct code. Explicit merge semantics (no last-writer-wins)."""
+    if not isinstance(objective, dict) or not code:
+        return
+    existing = objective.get("warnings")
+    warnings = list(existing) if isinstance(existing, list) else []
+    primary = objective.get("warning")
+    if primary and primary not in warnings:
+        warnings.append(primary)
+    if code not in warnings:
+        warnings.append(code)
+    objective["warnings"] = warnings
+    if not objective.get("warning"):
+        objective["warning"] = code
+
+
+def verification_receipts_path(drive_root: Any, task_id: str, *, create: bool = False) -> pathlib.Path:
+    """Durable per-task receipt store, a sibling of the verification-ledger artifact
+    under the canonical task-artifacts dir (``validate_task_id``-guarded)."""
+    safe = validate_task_id(task_id)
+    artifact_dir = pathlib.Path(drive_root) / "task_results" / "artifacts" / safe
+    if create:
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+    return artifact_dir / "verification_receipts.jsonl"
+
+
+def append_verification_receipt(drive_root: Any, task_id: str, receipt: Dict[str, Any]) -> None:
+    """Append a host-attested verification receipt for a task. Advisory: a write
+    failure never breaks the tool or task (receipts only shape a transparency flag)."""
+    try:
+        from ouroboros.utils import append_jsonl
+
+        append_jsonl(verification_receipts_path(drive_root, task_id, create=True), receipt)
+    except Exception:
+        pass
+
+
+def read_verification_receipts(drive_root: Any, task_id: str) -> List[Dict[str, Any]]:
+    try:
+        path = verification_receipts_path(drive_root, task_id, create=False)
+        if not path.exists():
+            return []
+        out: List[Dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+        return out
+    except Exception:
+        return []
+
+
+def _trace_has_write_edit_grounding(llm_trace: Dict[str, Any]) -> bool:
+    """Host-derived trivial grounding (FR3): a successful non-scratch write_file/
+    edit_text IS its own file-exists receipt (the deliverable provably exists), so it
+    suppresses receipt_absent without forcing the agent to call verify_and_record for
+    a plain write. Derived from the durable trace at finalization, so no per-write
+    handler hook is needed."""
+    for call in llm_trace.get("tool_calls") or []:
+        if not isinstance(call, dict) or call.get("is_error"):
+            continue
+        if str(call.get("status") or "ok") not in _OK_TOOL_STATUSES:
+            continue
+        if str(call.get("tool") or "") in _ROOT_WRITE_TOOLS:
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            if str(args.get("root") or "active_workspace") not in _SCRATCH_ROOTS:
+                return True
+    return False
+
+
+def verification_grounding_present(llm_trace: Dict[str, Any], drive_root: Any, task_id: str) -> bool:
+    """True when the turn already carries host-attested grounding — a verify_and_record
+    receipt with a grounding status, or a trivial write/edit deliverable. Read-only
+    (shared by the one-shot nudge gate and the receipt_absent flag)."""
+    receipts = read_verification_receipts(drive_root, task_id)
+    if any(str(r.get("status") or "") in _RECEIPT_GROUNDING_STATUSES for r in receipts):
+        return True
+    return _trace_has_write_edit_grounding(llm_trace)
+
+
+def should_nudge_verification(llm_trace: Dict[str, Any], drive_root: Any, task_id: str) -> bool:
+    """FR3 one-shot nudge gate: the turn produced real reviewable effects but recorded
+    NO host-attested grounding yet — ping the agent ONCE to verify_and_record before it
+    finalizes. Binary; the caller latches it so it fires at most once per task."""
+    if not turn_has_reviewable_effects(llm_trace):
+        return False
+    return not verification_grounding_present(llm_trace, drive_root, task_id)
+
+
+def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pure core: the most recent RED receipt (``status=="fail"``) with NO later genuine
+    grounding receipt (a passing run-kind check or an observed artifact — see
+    ``_RECEIPT_RED_RECONCILING_STATUSES``; a later ``declared`` does NOT reconcile). Returns
+    the failing receipt, or ``None``. Structural — typed receipt status only, NO content
+    matching (Bible P5). Shared SSOT by the finalize nudge and the acceptance
+    verification_summary so the reconciliation rule lives in one place."""
+    latest_fail: Optional[Dict[str, Any]] = None
+    reconciled = False
+    for r in receipts:
+        if not isinstance(r, dict):
+            continue
+        status = str(r.get("status") or "")
+        if status == "fail":
+            latest_fail, reconciled = r, False
+        elif latest_fail is not None and status in _RECEIPT_RED_RECONCILING_STATUSES:
+            reconciled = True
+    return None if (latest_fail is None or reconciled) else latest_fail
+
+
+def latest_unreconciled_failed_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+    """Disk-backed wrapper of ``latest_unreconciled_failed_receipt`` — reads the task's
+    durable receipts. Feeds the one-shot red-verification finalization nudge: finalizing over
+    your own host-attested red is a self-contradiction (Bible P3/P12), distinct from the
+    receipt_absent case."""
+    return latest_unreconciled_failed_receipt(read_verification_receipts(drive_root, task_id))
+
+
+def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pure core (v6.52.2): the most recent PASS receipt whose check can MASK the real exit code
+    (``check_exit_masking`` flag from the verify sensor — e.g. ``... | tail``, ``|| true``), with
+    NO later CLEAN (non-masked) grounding receipt (a pass/observed whose check is not masked).
+    Returns the masked passing receipt, or ``None``. A masked PASS is 'reconciled' by a later
+    genuine clean grounding. FLAG-driven (typed receipt field), never content matching (Bible P5);
+    advisory only. Shared SSOT by the finalize nudge and the acceptance verification_summary."""
+    latest_masked: Optional[Dict[str, Any]] = None
+    reconciled = False
+    for r in receipts:
+        if not isinstance(r, dict):
+            continue
+        status = str(r.get("status") or "")
+        masked = bool(r.get("check_exit_masking"))
+        if status == "pass" and masked:
+            latest_masked, reconciled = r, False
+        elif latest_masked is not None and status in _RECEIPT_RED_RECONCILING_STATUSES and not masked:
+            reconciled = True
+    return None if (latest_masked is None or reconciled) else latest_masked
+
+
+def latest_unreconciled_masked_verification(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+    """Disk-backed wrapper of ``latest_unreconciled_masked_pass`` — feeds the one-shot ADVISORY
+    masked-check finalization nudge (the agent may still finalize). Distinct from the red nudge:
+    that fires on a RED check; this fires on a green check whose exit code may be laundered."""
+    return latest_unreconciled_masked_pass(read_verification_receipts(drive_root, task_id))
+
+
+def apply_receipt_absent_flag(
+    loop_outcome: Dict[str, Any], llm_trace: Dict[str, Any], drive_root: Any, task_id: str, *, expected_output: str = ""
+) -> None:
+    """FR3 flag (+ M2) — run by the host AFTER ``derive_loop_outcome`` and BEFORE the
+    verification ledger. Inject durable verify_and_record receipts into the trace so
+    the ledger records them, then on a clean turn (execution ok — NOT best_effort/
+    degraded/failed) flag one of two structural transparency signals on the objective
+    axis: ``receipt_absent`` (real reviewable effects but no host-attested grounding)
+    or, when there were no effects at all, the M2 ``expected_output_ungrounded`` zero-
+    grounding signal (a TYPED expected_output was declared yet the agent did no tool
+    work and produced no structured FINAL ANSWER). Both are BINARY warnings that keep
+    the result solved (never a downgrade — anti-oscillation). Applied before
+    ``outcome_axes`` is normalized so the persisted axes and the ledger agree."""
+    receipts = read_verification_receipts(drive_root, task_id)
+    if receipts:
+        llm_trace["verification_receipts"] = receipts
+    axes = loop_outcome.get("outcome_axes") if isinstance(loop_outcome.get("outcome_axes"), dict) else {}
+    objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else None
+    execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+    if not isinstance(objective, dict):
+        return
+    if str(execution.get("status") or "") != EXECUTION_OK:
+        return
+    if not turn_has_reviewable_effects(llm_trace):
+        # M2 zero-grounding: a declared deliverable, no tool work, no structured answer.
+        if (
+            str(expected_output or "").strip()
+            and not (llm_trace.get("tool_calls") or [])
+            and not str(loop_outcome.get("final_answer") or "").strip()
+        ):
+            _merge_objective_warning(objective, WARN_EXPECTED_OUTPUT_UNGROUNDED)
+        return
+    if verification_grounding_present(llm_trace, drive_root, task_id):
+        return
+    _merge_objective_warning(objective, WARN_RECEIPT_ABSENT)
 
 
 def terminal_outcome_axes(
@@ -232,6 +511,8 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
     calls = [item for item in (llm_trace.get("tool_calls") or []) if isinstance(item, dict)]
     unresolved: List[Dict[str, Any]] = []
     recovered_items: List[Dict[str, Any]] = []
+    cosmetic_items: List[Dict[str, Any]] = []
+    ignored_items: List[Dict[str, Any]] = []
     for idx, item in enumerate(calls):
         if not item.get("is_error"):
             continue
@@ -242,6 +523,12 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
         # a self-initiated cognitive write through the wrong tool must never fail the
         # task (that was the original "Привет fails" regression). Skip it entirely.
         if status == "cognitive_tool_required":
+            continue
+        # A2: an access-policy block on a READ-ONLY exploratory tool is honest
+        # telemetry, not a degraded execution — fully ignored (recorded for
+        # forensics) so it neither sets tool_failure nor raises a residual warning.
+        if _is_ignored_readonly_block(tool, status):
+            ignored_items.append(_tool_error_record(item))
             continue
         if status not in _BLOCKING_TOOL_STATUSES and tool not in _RECOVERY_TOOL_NAMES:
             continue
@@ -288,7 +575,6 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
                 continue
             later_tool = str(later.get("tool") or "")
             later_status = str(later.get("status") or "ok")
-            later_result = str(later.get("result") or "")
             if later_status not in {"", "ok", "ok_autocorrected"}:
                 continue
             later_args = later.get("args") if isinstance(later.get("args"), dict) else {}
@@ -305,7 +591,11 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
                     later_paths.update(str(part) for part in value if str(part or "").strip())
             same_target = later_tool == tool and target_key == json.dumps(later_parts, sort_keys=True, default=str)
             same_path = bool(target_paths and later_paths and target_paths.intersection(later_paths))
-            artifact_registered = "ARTIFACT_OUTPUTS" in later_result or "registered output" in later_result
+            # Read the TYPED artifact-registration flag captured from the full result at
+            # execution time (loop_tool_execution), not a substring of the (truncatable)
+            # trace preview — the same typed signal turn_has_reviewable_effects uses, so
+            # the marker is never re-derived from prose on this layer (C9.5).
+            artifact_registered = bool(later.get("artifact_registered"))
             if status == "artifact_output_error":
                 recovered = artifact_registered and (same_path or not target_paths)
             else:
@@ -316,8 +606,12 @@ def _classify_tool_errors(llm_trace: Dict[str, Any]) -> Dict[str, List[Dict[str,
         if recovered_by is not None:
             recovered_items.append(_tool_error_record(item, recovered_by=recovered_by))
             continue
+        if status in _NON_BLOCKING_RECOVERABLE_STATUSES and tool in _COSMETIC_TOOL_NAMES:
+            # Unrecovered run_command/run_script non-zero exit: cosmetic, not degrading.
+            cosmetic_items.append(_tool_error_record(item))
+            continue
         unresolved.append(_tool_error_record(item))
-    return {"unresolved": unresolved, "recovered": recovered_items}
+    return {"unresolved": unresolved, "recovered": recovered_items, "cosmetic": cosmetic_items, "ignored": ignored_items}
 
 
 def _unresolved_tool_errors(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -325,17 +619,33 @@ def _unresolved_tool_errors(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _extract_outcome_tiers(runs: List[Dict[str, Any]]) -> List[str]:
-    """Collect per-actor outcome_tier classifications from review runs."""
+    """Collect per-actor outcome_tier classifications from review runs.
+
+    On a quorum PASS run, only the actors that CONTRIBUTED the PASS lend their
+    tier — a single dissenting/degraded slot's pessimistic tier must not poison a
+    clean quorum through the objective axis (the same non-surrender rule the
+    aggregate-signal quorum already follows). FAIL/DEGRADED runs stay conservative
+    and count every parsed tier.
+    """
     tiers: List[str] = []
     for run in runs:
+        run_pass = str(run.get("aggregate_signal") or "").upper() == "PASS"
         for actor in run.get("actors") or []:
             if not isinstance(actor, dict):
                 continue
             parsed = actor.get("parsed")
-            if isinstance(parsed, dict):
-                tier = str(parsed.get("outcome_tier") or "").strip().lower()
-                if tier in _OUTCOME_TIERS:
-                    tiers.append(tier)
+            if not isinstance(parsed, dict):
+                continue
+            if run_pass:
+                # Prefer the substrate-recorded signal; fall back to the parsed
+                # verdict/status so historical runs (pre-`signal` field) still
+                # filter correctly.
+                sig = str(actor.get("signal") or parsed.get("verdict") or parsed.get("status") or "").upper()
+                if sig != "PASS":
+                    continue
+            tier = str(parsed.get("outcome_tier") or "").strip().lower()
+            if tier in _OUTCOME_TIERS:
+                tiers.append(tier)
     return tiers
 
 
@@ -352,14 +662,31 @@ def _aggregate_outcome_tier(tiers: List[str]) -> str:
 
 def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     review_decision = llm_trace.get("review_decision") if isinstance(llm_trace.get("review_decision"), dict) else {}
-    runs = [run for run in (llm_trace.get("review_runs") or []) if isinstance(run, dict)]
+    acceptance_decision = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
+    # A pre-revision acceptance run marked superseded_by_revision is kept in the
+    # trace for forensics but must NOT count toward the objective when a REPLACEMENT
+    # (non-superseded) review actually landed: the re-reviewed final deliverable's
+    # verdict is authoritative, so a stale pre-revision FAIL cannot worst-case-poison
+    # a final PASS (the reducer is worst-of-all-runs). BUT if the revision never
+    # reached a terminal re-review (provider death, round limit, ...), the superseded
+    # run is the SOLE verdict — keep it, never erase a failing verdict (P3 integrity).
+    _all_runs = [run for run in (llm_trace.get("review_runs") or []) if isinstance(run, dict)]
+    _non_superseded = [run for run in _all_runs if not run.get("superseded_by_revision")]
+    runs = _non_superseded if _non_superseded else _all_runs
     if not runs:
-        return {
+        axis = {
             "status": "skipped",
             "eligibility": str(review_decision.get("eligibility") or "not_eligible"),
             "trigger": str(review_decision.get("trigger") or "not_evaluated"),
             "run_count": 0,
         }
+        if acceptance_decision:
+            axis["acceptance_decision"] = {
+                "status": str(acceptance_decision.get("status") or ""),
+                "source": str(acceptance_decision.get("source") or ""),
+                "rationale": str(acceptance_decision.get("rationale") or "")[:500],
+            }
+        return axis
     signals = [str(run.get("aggregate_signal") or "").upper() for run in runs]
     if "FAIL" in signals:
         status = "fail"
@@ -379,6 +706,12 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     tier = _aggregate_outcome_tier(_extract_outcome_tiers(runs))
     if tier:
         axis["outcome_tier"] = tier
+    if acceptance_decision:
+        axis["acceptance_decision"] = {
+            "status": str(acceptance_decision.get("status") or ""),
+            "source": str(acceptance_decision.get("source") or ""),
+            "rationale": str(acceptance_decision.get("rationale") or "")[:500],
+        }
     return axis
 
 
@@ -579,6 +912,10 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     tool_error_state = _classify_tool_errors(llm_trace)
     tool_errors = tool_error_state.get("unresolved") or []
     recovered_tool_errors = tool_error_state.get("recovered") or []
+    cosmetic_tool_errors = tool_error_state.get("cosmetic") or []
+    # A2: read-only access-policy blocks — recorded for forensics, never degrading
+    # and (unlike cosmetic) never a residual-warning trigger.
+    ignored_tool_errors = tool_error_state.get("ignored") or []
     verification_failures: List[Dict[str, Any]] = []
     for event in llm_trace.get("verification_events") or []:
         if not isinstance(event, dict):
@@ -658,6 +995,37 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
 
     review = _review_axis(llm_trace)
     objective = _objective_axis(review)
+    # T4 honest residual: cosmetic shell errors no longer degrade execution, so
+    # when the objective was never judged (default "auto" with no self-call ->
+    # objective not_evaluated) a real overclaim could read as clean. Surface a
+    # structural warning (not a failure) so the UI escalates it. Gating on the
+    # objective being genuinely unjudged is the honest condition: a review that
+    # ran (any verdict) already judged it. No review is auto-run, no env knob, no
+    # content inference (Bible P5).
+    if cosmetic_tool_errors and objective.get("status") == OBJECTIVE_NOT_EVALUATED:
+        _merge_objective_warning(objective, WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW)
+    final_answer_payload = (
+        extract_final_answer(text)
+        or (
+            str(llm_trace.get("best_valid_final_answer") or "")
+            if len(llm_trace.get("tool_calls") or []) <= int(llm_trace.get("best_valid_final_answer_tools") or 0)
+            else ""
+        )
+    )
+    headline_reason = reason_code
+    headline_failure = failure
+    if (
+        final_answer_payload
+        and execution_status == EXECUTION_DEGRADED
+        and reason_code == REASON_TOOL_FAILURE
+        and text.strip()
+        and not text.lstrip().startswith(("⚠️", "❌"))
+    ):
+        # Keep execution-health honest in outcome_axes.execution, but do not
+        # headline a completed answer-bearing task as a top-level tool failure.
+        headline_reason = REASON_FINAL_MESSAGE
+        headline_failure = None
+
     outcome_axes = {
         "schema_version": 1,
         "lifecycle": {"status": "completed"},
@@ -666,6 +1034,8 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "reason_code": reason_code,
             "failure": failure,
             "recoveries": recovered_tool_errors[:20],
+            "cosmetic_tool_errors": cosmetic_tool_errors[:20],
+            "ignored_tool_errors": ignored_tool_errors[:20],
         },
         "artifacts": {"status": "not_applicable"},
         "objective": objective,
@@ -676,11 +1046,20 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         "outcome_axes": outcome_axes,
         "review_eligibility": str(review.get("eligibility") or "not_eligible"),
         "review_trigger": str(review.get("trigger") or "not_evaluated"),
-        "finish_reason": reason_code,
-        "reason_code": reason_code,
+        "finish_reason": headline_reason,
+        "reason_code": headline_reason,
         "final_text": text,
-        "final_answer": extract_final_answer(text),
-        "failure": failure,
+        # Answer precedence: the final text's explicit FINAL ANSWER marker > the latched
+        # answer from an earlier round. The latch recovers a produced answer whenever the
+        # final text LACKS a marker (whether empty OR marker-less prose — both lose the
+        # structured deliverable a downstream extractor needs) AND no NEW tool work
+        # happened since it was stamped. The tool-count guard is the key invariant: with
+        # no new grounding, a later marker-less round is the model second-guessing its OWN
+        # answer under review PRESSURE, which BIBLE Q7 says review must not let DOWNGRADE a
+        # produced answer; new grounding (a higher tool count) instead invalidates the latch.
+        "final_answer": final_answer_payload,
+        "final_answer_missing_sentinel": not extract_final_answer(text),
+        "failure": headline_failure,
         "recoveries": recovered_tool_errors[:20],
         "usage": {
             "cost_usd": round(float(usage.get("cost") or 0), 6),
@@ -826,7 +1205,7 @@ def refresh_verification_ledger_artifacts(
     updated["summary"] = {
         "entry_count": len(entries),
         "has_failures": any(
-            str(item.get("status") or "").lower() not in {"", "ok", RESULT_SUCCEEDED, "pass", OBJECTIVE_NOT_EVALUATED}
+            str(item.get("status") or "").lower() not in _LEDGER_NON_FAILURE_STATUSES
             and not (str(item.get("kind") or "") == "task_contract" and str(item.get("status") or "").lower() in {"draft", "recorded"})
             for item in entries
             if isinstance(item, dict)
@@ -875,15 +1254,22 @@ def build_verification_ledger(
             continue
         status = str(call.get("status") or ("error" if call.get("is_error") else "ok"))
         if call.get("is_error") or status not in {"ok", ""}:
-            entries.append({
+            # A2: an ignored read-only access-policy block is recorded transparently but as
+            # status="ignored" (its real status kept in blocked_status) so it is NOT counted
+            # in summary.has_failures — same classification the execution axis applies.
+            ignored = _is_ignored_readonly_block(str(call.get("tool") or ""), status)
+            entry = {
                 "kind": "tool_call",
                 "index": idx,
                 "tool": call.get("tool"),
-                "status": status,
+                "status": "ignored" if ignored else status,
                 "exit_code": call.get("exit_code"),
                 "signal": call.get("signal"),
                 "trace_ref": call.get("trace_ref"),
-            })
+            }
+            if ignored:
+                entry["blocked_status"] = status
+            entries.append(entry)
 
     for recovery in execution_axis.get("recoveries") or []:
         if isinstance(recovery, dict):
@@ -899,16 +1285,50 @@ def build_verification_ledger(
         if isinstance(event, dict):
             entries.append({"kind": "runtime_event", **event})
 
-    for run in llm_trace.get("review_runs") or []:
-        if isinstance(run, dict):
-            failed = run.get("aggregate_signal") in {"FAIL", "DEGRADED"} or bool(run.get("degraded"))
+    # FR3: host-attested verify_and_record receipts (injected into the trace by
+    # _store_task_result before this build) become first-class ledger entries.
+    for receipt in llm_trace.get("verification_receipts") or []:
+        if isinstance(receipt, dict):
             entries.append({
-                "kind": "task_acceptance_review",
-                "status": "failed" if failed else "ok",
-                "aggregate_signal": run.get("aggregate_signal"),
-                "degraded": run.get("degraded"),
-                "finding_count": len(run.get("parsed_findings") or []),
+                "kind": "verification_receipt",
+                "status": str(receipt.get("status") or "unknown"),
+                "contract_kind": str(receipt.get("contract_kind") or ""),
+                "criterion_id": str(receipt.get("criterion_id") or ""),
+                "check": _clip(receipt.get("check"), 300),
+                "expected": _clip(receipt.get("expected"), 200),
+                # Verification SEMANTICS so a reviewer sees how `expected` was matched
+                # (substring-only is weak evidence for a metric-graded task).
+                "expected_match": str(receipt.get("expected_match") or "substring"),
+                "matched": receipt.get("matched"),
+                "returncode": receipt.get("returncode"),
+                "summary": _clip(receipt.get("summary"), 300),
+                # C: after-only artifact-lifecycle flag (a check that built then deleted a
+                # declared deliverable). The receipt entry is a FIXED projection — a new
+                # receipt key is silently dropped unless added here. Bounded for ledger size.
+                "artifact_lifecycle": (receipt.get("artifact_lifecycle") or [])[:50],
+                "artifacts_missing_after": (receipt.get("artifacts_missing_after") or [])[:50],
+                # v6.52.2: exit-masking sensor flag — the check's shell pipeline can launder the
+                # real exit code (e.g. `... | tail`, `|| true`). FLAG-ONLY (status unchanged).
+                "check_exit_masking": bool(receipt.get("check_exit_masking")),
+                "check_exit_masking_reasons": (receipt.get("check_exit_masking_reasons") or [])[:10],
             })
+
+    _accept_runs = [r for r in (llm_trace.get("review_runs") or []) if isinstance(r, dict)]
+    _has_replacement = any(not r.get("superseded_by_revision") for r in _accept_runs)
+    for run in _accept_runs:
+        # A superseded pre-revision run is only forensic (status 'superseded') when a
+        # REPLACEMENT review landed; with no replacement it is the sole verdict and
+        # must still read as its real failed/ok status (never hide a failing verdict).
+        superseded = bool(run.get("superseded_by_revision")) and _has_replacement
+        failed = run.get("aggregate_signal") in {"FAIL", "DEGRADED"} or bool(run.get("degraded"))
+        entries.append({
+            "kind": "task_acceptance_review",
+            "status": "superseded" if superseded else ("failed" if failed else "ok"),
+            "aggregate_signal": run.get("aggregate_signal"),
+            "degraded": run.get("degraded"),
+            "superseded": superseded,
+            "finding_count": len(run.get("parsed_findings") or []),
+        })
 
     artifact_status = str(artifact_bundle.get("status") or "")
     if artifact_status in {ARTIFACT_STATUS_FAILED, ARTIFACT_STATUS_PENDING, ARTIFACT_STATUS_FINALIZING, "missing"}:
@@ -942,7 +1362,7 @@ def build_verification_ledger(
         "summary": {
             "entry_count": len(entries),
             "has_failures": any(
-                str(item.get("status") or "").lower() not in {"", "ok", RESULT_SUCCEEDED, "pass", OBJECTIVE_NOT_EVALUATED}
+                str(item.get("status") or "").lower() not in _LEDGER_NON_FAILURE_STATUSES
                 and not (str(item.get("kind") or "") == "task_contract" and str(item.get("status") or "").lower() in {"draft", "recorded"})
                 for item in entries
                 if isinstance(item, dict)

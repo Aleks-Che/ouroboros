@@ -36,6 +36,7 @@ from ouroboros.contracts import (
     build_task_contract,  # noqa: F401  — imported for ``public API`` assertion
     GetToolsProtocol,  # noqa: F401  — imported for ``public API`` assertion
     normalize_allowed_resources,  # noqa: F401  — imported for ``public API`` assertion
+    normalize_acceptance_claims,  # noqa: F401  — imported for ``public API`` assertion
     normalize_resource_policy,  # noqa: F401  — imported for ``public API`` assertion
     SKILL_MANIFEST_SCHEMA_VERSION,
     SCHEMA_VERSION_KEY,
@@ -75,6 +76,7 @@ def test_public_api_is_stable():
         "read_schema_version",
         "attach_task_contract",
         "build_task_contract",
+        "normalize_acceptance_claims",
         "normalize_allowed_resources",
         "normalize_resource_policy",
     }
@@ -106,6 +108,40 @@ def test_task_contract_preserves_protected_artifact_policy():
             "allow": ["execute"],
             "deny": ["read_bytes", "hash"],
         }
+    ]
+
+
+def test_task_contract_normalizes_observable_acceptance_claims():
+    contract = build_task_contract({
+        "task_contract": {
+            "acceptance_claims": [
+                {
+                    "id": "answer.ok",
+                    "claim": "  final answer is a bare number  ",
+                    "surface": "FINAL ANSWER line",
+                    "support": "host-attested exact check",
+                    "priority": "should",
+                },
+                "deliverable exists",
+            ]
+        }
+    })
+
+    assert contract["acceptance_claims"] == [
+        {
+            "id": "answer_ok",
+            "claim": "final answer is a bare number",
+            "surface": "FINAL ANSWER line",
+            "support": "host-attested exact check",
+            "priority": "should",
+        },
+        {
+            "id": "claim_2",
+            "claim": "deliverable exists",
+            "surface": "",
+            "support": "",
+            "priority": "must",
+        },
     ]
 
 
@@ -206,6 +242,23 @@ def test_api_v1_declares_core_ws_message_types():
 
     for name in ("ChatInbound", "ChatOutbound", "PhotoOutbound", "VideoOutbound", "TypingOutbound", "LogOutbound"):
         assert hasattr(api_v1, name), f"api_v1 missing {name}"
+
+
+def test_api_v1_declares_task_named_outbound():
+    """v6.40: the proactive card-naming broadcast is a frozen WS message envelope, in
+    WS_MESSAGE_TYPES, with a JSDoc mirror in the frontend contract surface (ABI extension
+    contract per ARCHITECTURE)."""
+    import pathlib
+
+    from ouroboros.contracts import api_v1
+    from ouroboros.gateway.contracts import WS_MESSAGE_TYPES
+
+    assert hasattr(api_v1, "TaskNamedOutbound"), "api_v1 missing TaskNamedOutbound"
+    assert set(api_v1.TaskNamedOutbound.__annotations__) >= {"type", "task_id", "suggested_name"}
+    assert "task_named" in WS_MESSAGE_TYPES
+    api_types = pathlib.Path(__file__).resolve().parents[1] / "web" / "modules" / "api_types.js"
+    txt = api_types.read_text(encoding="utf-8")
+    assert "TaskNamedOutbound" in txt and "task_named" in txt
 
 
 def _dict_literal_keys(node: ast.Dict) -> tuple[set[str], list[str]]:
@@ -1095,8 +1148,10 @@ def test_task_create_request_declares_executor_ref_contract():
         "memory_mode",
         "project_id",
         "attachments",
+        "acceptance_claims",
         "allowed_resources",
         "resource_policy",
+        "disabled_tools",
         "executor_ref",
         "service_teardown",
         "deadline_at",

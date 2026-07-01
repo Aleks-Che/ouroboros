@@ -459,6 +459,170 @@ def test_light_mode_blocks_relative_run_script_runtime_data_upload_writes(tmp_pa
     assert not upload.exists()
 
 
+def test_light_run_script_allows_readonly_repo_analysis_with_external_write(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    registry, repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    out = registry._ctx.task_drive_root() / "evidence.json"
+
+    result = registry.execute(
+        "run_script",
+        {
+            "script": (
+                "from pathlib import Path\n"
+                f"repo = {str(repo)!r}\n"
+                f"out = Path({str(out)!r})\n"
+                "out.write_text(repo)\n"
+                "import sys; sys.stdout.write(repo)\n"
+            ),
+            "outputs": [str(out)],
+        },
+    )
+
+    assert "LIGHT_MODE_BLOCKED" not in result, result
+    assert out.read_text(encoding="utf-8") == str(repo)
+
+
+def test_light_run_script_blocks_dynamic_repo_write_even_from_task_drive(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    registry, repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    target = repo / "dynamic.txt"
+
+    result = registry.execute(
+        "run_script",
+        {
+            "script": (
+                "from pathlib import Path\n"
+                f"repo = Path({str(repo)!r})\n"
+                "name = 'dynamic.txt'\n"
+                "(repo / name).write_text('bad')\n"
+            ),
+        },
+    )
+
+    assert "LIGHT_MODE_BLOCKED" in result
+    assert not target.exists()
+
+
+def test_light_run_script_blocks_path_open_repo_write(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    registry, repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    target = repo / "path-open.txt"
+
+    result = registry.execute(
+        "run_script",
+        {
+            "script": (
+                "from pathlib import Path\n"
+                f"Path({str(target)!r}).open('w').write('bad')\n"
+            ),
+        },
+    )
+
+    assert "LIGHT_MODE_BLOCKED" in result
+    assert not target.exists()
+
+
+def test_light_run_script_allows_constant_expression_task_drive_write(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    target = registry._ctx.task_drive_root() / "out.txt"
+
+    result = registry.execute(
+        "run_script",
+        {
+            "script": (
+                "from pathlib import Path\n"
+                "name = 'out' + '.txt'\n"
+                "Path(name).write_text('ok')\n"
+            ),
+        },
+    )
+
+    assert "LIGHT_MODE_BLOCKED" not in result, result
+    assert target.read_text(encoding="utf-8") == "ok"
+
+
+def test_light_run_script_allows_resolved_open_handle_task_drive_write(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    target = registry._ctx.task_drive_root() / "handle.txt"
+
+    result = registry.execute(
+        "run_script",
+        {
+            "script": (
+                "f = open('handle.txt', 'w')\n"
+                "f.write('ok')\n"
+                "f.close()\n"
+            ),
+        },
+    )
+
+    assert "LIGHT_MODE_BLOCKED" not in result, result
+    assert target.read_text(encoding="utf-8") == "ok"
+
+
+def test_light_run_script_allows_with_open_handle_task_drive_write(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    target = registry._ctx.task_drive_root() / "with-open.txt"
+
+    result = registry.execute(
+        "run_script",
+        {"script": "with open('with-open.txt', 'w') as f:\n    f.write('ok')\n"},
+    )
+
+    assert "LIGHT_MODE_BLOCKED" not in result, result
+    assert target.read_text(encoding="utf-8") == "ok"
+
+
+def test_light_run_script_allows_path_cwd_task_drive_write(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    target = registry._ctx.task_drive_root() / "cwd-write.txt"
+
+    result = registry.execute(
+        "run_script",
+        {
+            "script": (
+                "from pathlib import Path\n"
+                "(Path.cwd() / 'cwd-write.txt').write_text('ok')\n"
+            ),
+        },
+    )
+
+    assert "LIGHT_MODE_BLOCKED" not in result, result
+    assert target.read_text(encoding="utf-8") == "ok"
+
+
+def test_light_run_script_allows_in_memory_write_method(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+
+    result = registry.execute(
+        "run_script",
+        {
+            "script": (
+                "import io\n"
+                "buf = io.StringIO()\n"
+                "buf.write('ok')\n"
+                "print(buf.getvalue())\n"
+            ),
+        },
+    )
+
+    assert "LIGHT_MODE_BLOCKED" not in result, result
+    assert "ok" in result
+
+
 def test_artifact_store_blocks_control_manifest_edits(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
@@ -633,15 +797,25 @@ def test_run_command_light_creates_fresh_task_scoped_cwds(tmp_path, monkeypatch)
         assert (artifact_store / filename).read_text(encoding="utf-8") == "ok"
 
 
-def test_run_command_user_files_without_outputs_discloses_audit_gap(tmp_path, monkeypatch):
+def test_run_command_user_files_audit_gap_is_effect_based(tmp_path, monkeypatch):
+    # R5: the artifact-audit nudge is now EFFECT-BASED — it fires only when a user_files
+    # command actually changed the cwd, not on every command. A read-only command no
+    # longer false-triggers it; a command that creates a deliverable (whose name is not a
+    # literal in the cmd, so the declaration-regex does not pre-empt it) still does.
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, _data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
 
-    result = registry.execute("run_command", {"cmd": ["python3", "-c", "print('ok')"], "cwd": str(desktop)})
+    read_only = registry.execute("run_command", {"cmd": ["python3", "-c", "print('ok')"], "cwd": str(desktop)})
+    assert "exit_code=0" in read_only
+    assert "ARTIFACT_AUDIT_GAP" not in read_only
 
-    assert "exit_code=0" in result
-    assert "ARTIFACT_AUDIT_GAP" in result
+    creates_file = registry.execute(
+        "run_command",
+        {"cmd": ["python3", "-c", "open(chr(100)+'eliverable.dat','w').write('x')"], "cwd": str(desktop)},
+    )
+    assert "exit_code=0" in creates_file
+    assert "ARTIFACT_AUDIT_GAP" in creates_file
 
 
 def test_run_command_outputs_registers_artifact(tmp_path, monkeypatch):
@@ -669,7 +843,7 @@ def test_run_command_outputs_registers_artifact(tmp_path, monkeypatch):
     assert records[0]["source_path"] == str(desktop / "deliverable.txt")
 
 
-def test_run_command_outputs_require_fresh_file_change(tmp_path, monkeypatch):
+def test_run_command_unchanged_output_is_cosmetic(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -684,9 +858,16 @@ def test_run_command_outputs_require_fresh_file_change(tmp_path, monkeypatch):
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "unchanged output" in result
+    # C2 (v6.36.0): present-but-unchanged declared output is a cosmetic note, not a
+    # blocking ARTIFACT_OUTPUT_ERROR (a missing output still blocks — sibling test).
+    assert not result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert "unchanged output (cosmetic)" in result
     assert not (data / "task_results" / "artifacts" / "task1" / "personal_notes.txt").exists()
+    # round-5: a cosmetic-only note must NOT borrow the canonical "ARTIFACT_OUTPUTS"
+    # marker — downstream (outcomes.py / loop_tool_execution.py) reads that exact
+    # substring as a real registration / false recovery signal. Use ARTIFACT_OUTPUT_NOTE.
+    assert "ARTIFACT_OUTPUT_NOTE" in result
+    assert "ARTIFACT_OUTPUTS" not in result
 
 
 def test_run_command_outputs_missing_is_semantic_failure(tmp_path, monkeypatch):
@@ -1113,8 +1294,9 @@ def test_claude_code_edit_outputs_require_fresh_file_change(tmp_path, monkeypatc
 
     result = registry.execute("claude_code_edit", {"prompt": "create external file", "cwd": str(desktop), "outputs": ["deck.html"]})
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "unchanged output" in result
+    # C2 (v6.36.0): present-but-unchanged declared output is cosmetic, not blocking.
+    assert not result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert "unchanged output (cosmetic)" in result
     assert not (data / "task_results" / "artifacts" / "task1" / "deck.html").exists()
 
 

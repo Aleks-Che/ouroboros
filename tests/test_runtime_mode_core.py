@@ -41,9 +41,11 @@ def test_settings_defaults_include_phase2_keys():
     assert SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert SETTINGS_DEFAULTS["OUROBOROS_SKILLS_REPO_PATH"] == ""
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL"] == "google/gemini-3.5-flash"
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_CODE"] == "google/gemini-3.5-flash"
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACK"] == "anthropic/claude-sonnet-4.6"
+    # Heavy/Light default EMPTY -> fall back to Main (role-model, v6.39); only Main and
+    # the resilience Fallbacks chain carry a real default.
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_HEAVY"] == ""
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == ""
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"] == "anthropic/claude-sonnet-4.6"
 
 
 def test_valid_runtime_modes_is_frozen_tuple():
@@ -180,9 +182,9 @@ def _onboarding_payload_with_runtime(mode: str | None = None, skills_path: str =
         "LOCAL_MODEL_CHAT_FORMAT": "",
         "LOCAL_ROUTING_MODE": "cloud",
         "OUROBOROS_MODEL": "anthropic/claude-opus-4.6",
-        "OUROBOROS_MODEL_CODE": "anthropic/claude-opus-4.6",
+        "OUROBOROS_MODEL_HEAVY": "anthropic/claude-opus-4.6",
         "OUROBOROS_MODEL_LIGHT": "anthropic/claude-sonnet-4.6",
-        "OUROBOROS_MODEL_FALLBACK": "anthropic/claude-sonnet-4.6",
+        "OUROBOROS_MODEL_FALLBACKS": "anthropic/claude-sonnet-4.6",
         "OUROBOROS_SKILLS_REPO_PATH": skills_path,
     }
     if mode is not None:
@@ -289,9 +291,12 @@ def test_state_response_typeddict_declares_phase2_keys():
 def test_settings_ui_renders_runtime_mode_and_skills_path():
     src = (REPO / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
     assert 'id="s-runtime-mode"' in src
-    assert 'data-runtime-mode-group' in src
+    # Runtime-mode segmented control is built by the renderSegmentedField SSOT
+    # (C7.1): the column-override modifier and the light/advanced/pro options come
+    # through its params, not inline data-effort-value markup.
+    assert "modifier: 'data-runtime-mode-group'" in src
     for mode in ("light", "advanced", "pro"):
-        assert f'data-effort-value="{mode}"' in src
+        assert f"value: '{mode}'" in src
     assert 'id="s-skills-repo-path"' in src
 
 
@@ -343,8 +348,8 @@ def test_skills_ui_reads_live_extension_state_fields():
     assert "review_gate?.executable_review" in src or "review_gate.executable_review" in src
     assert "executable_review" in src
     assert "skill.review_status === 'blockers' && !reviewReady(skill)" in src
-    assert "function statusBadge(status, gate = null)" in src
-    assert "statusBadge(skill.review_status, skill.review_gate)" in src
+    assert "function statusBadge(status, gate = null, profile = '')" in src
+    assert "statusBadge(skill.review_status, skill.review_gate, skill.review_profile)" in src
     assert "Open widgets" in src
     assert "retry_install" in src
     assert "Retry install" in src
@@ -384,7 +389,9 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
         out.update(saved)
         return out
 
-    def fake_save_settings(payload, *, allow_elevation: bool = False):
+    def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False):
+        # Stands in for both save_settings (allow_elevation) and
+        # _owner_write_settings (allow_context_lowering, added in v6.33.0 P4).
         saved.clear()
         saved.update(payload)
 
@@ -425,7 +432,9 @@ def test_api_settings_post_silently_drops_runtime_mode_changes():
         out.update(saved)
         return out
 
-    def fake_save_settings(payload, *, allow_elevation: bool = False):
+    def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False):
+        # Stands in for both save_settings (allow_elevation) and
+        # _owner_write_settings (allow_context_lowering, added in v6.33.0 P4).
         saved.clear()
         saved.update(payload)
 
@@ -1162,6 +1171,45 @@ def test_light_partial_args_surface_specific_error_not_generic_light_block(
         f"got: {result[:300]}"
     )
     assert "bucket and skill_name must be supplied together" in result, result[:300]
+
+
+def test_b2_external_workspace_stray_bucket_is_ignored_not_blocked(tmp_path, monkeypatch):
+    """B2 (v6.33.0) footgun: in an external WORKSPACE edit, a reflexive
+    bucket="external" (a real skill-bucket name) on a normal active_workspace
+    edit must NOT hard-block with SKILL_PAYLOAD_ARG_ERROR — the stray
+    bucket/skill_name are dropped and the workspace edit proceeds. An explicit
+    root=skill_payload edit still surfaces the specific error."""
+    import ouroboros.safety as safety_mod
+    from ouroboros.tools.registry import ToolContext
+
+    system_repo = _git_repo(tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "drive"
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
+    reg = ToolRegistry(repo_dir=system_repo, drive_root=data)
+    reg.set_context(ToolContext(
+        repo_dir=system_repo,
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+    ))
+
+    # Footgun: stray bucket on a normal workspace edit -> ignored, edit lands.
+    result = reg.execute(
+        "write_file",
+        {"root": "active_workspace", "path": "module.py", "content": "x = 1\n", "bucket": "external"},
+    )
+    assert "SKILL_PAYLOAD_ARG_ERROR" not in result, result[:300]
+    assert (workspace / "module.py").read_text(encoding="utf-8") == "x = 1\n"
+
+    # Explicit skill-payload intent still surfaces the specific error.
+    result2 = reg.execute(
+        "write_file",
+        {"root": "skill_payload", "path": "plugin.py", "content": "x", "bucket": "external"},
+    )
+    assert "SKILL_PAYLOAD_ARG_ERROR" in result2, result2[:300]
 
 
 def test_light_control_plane_sidecar_still_blocked_with_bucket_skill_name(tmp_path, monkeypatch):

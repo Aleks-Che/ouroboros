@@ -107,7 +107,7 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
 
 
 def test_cancel_task_latches_cancel_requested_and_emits_live(tmp_path):
-    from ouroboros.tools.control import _cancel_task
+    from ouroboros.tools.join_ledger import _cancel_task
     from ouroboros.task_results import (
         STATUS_CANCEL_REQUESTED, STATUS_RUNNING, load_task_result, write_task_result,
     )
@@ -1192,7 +1192,7 @@ def test_handle_schedule_task_rejects_internal_subagent_without_child_drive_cont
 
 def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from ouroboros.task_results import STATUS_FAILED, STATUS_SCHEDULED
+    from ouroboros.task_results import STATUS_SCHEDULED
 
     monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
@@ -1254,9 +1254,16 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
         FakeCtx(),
     )
 
-    failed = json.loads((tmp_path / "task_results" / "headless2.json").read_text(encoding="utf-8"))
-    assert failed["status"] == STATUS_FAILED
-    assert "no chat target" in failed["result"]
+    # B1 (v6.33.0): a headless subagent with no chat target is no longer
+    # rejected — it is enqueued and runs (the live "🗓️ Scheduled" notification is
+    # skipped because chat_id is 0). Restores headless/CLI multi-agent.
+    assert len(enqueued) == 2
+    assert enqueued[1]["id"] == "headless2"
+    scheduled2 = json.loads((tmp_path / "task_results" / "headless2.json").read_text(encoding="utf-8"))
+    assert scheduled2["status"] == STATUS_SCHEDULED
+    # No chat notification was emitted for the chat-less subagent.
+    assert all(s[0] != 0 for s in sent)
+    assert len(sent) == 1
 
 
 def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, monkeypatch):
@@ -1329,6 +1336,9 @@ def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, mon
         def enqueue_task(self, task):
             enqueued.append(task)
 
+        def persist_queue_snapshot(self, reason=""):
+            return None
+
     ev_module._handle_schedule_task(
         {
             "type": "schedule_subagent",
@@ -1352,13 +1362,14 @@ def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, mon
     assert sent[0][2]["progress_meta"]["status"] == STATUS_FAILED
 
 
-def test_handle_schedule_task_rejects_fourth_active_subagent(tmp_path, monkeypatch):
+def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, monkeypatch):
     from supervisor import events as ev_module
-    from ouroboros.task_results import STATUS_COMPLETED, STATUS_FAILED, load_task_result, write_task_result
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_FAILED, STATUS_SCHEDULED, load_task_result, write_task_result
 
     monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "3")  # pin cap (v6.20.0 raised default to 6)
     sent = []
+    enqueued = []
 
     class FakeCtx:
         DRIVE_ROOT = tmp_path
@@ -1373,7 +1384,10 @@ def test_handle_schedule_task_rejects_fourth_active_subagent(tmp_path, monkeypat
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            raise AssertionError("should not enqueue")
+            enqueued.append(task)
+
+        def persist_queue_snapshot(self, reason=""):
+            pass
 
     ev_module._handle_schedule_task(
         {
@@ -1392,12 +1406,31 @@ def test_handle_schedule_task_rejects_fourth_active_subagent(tmp_path, monkeypat
     )
 
     data = json.loads((tmp_path / "task_results" / "child999.json").read_text(encoding="utf-8"))
-    assert data["status"] == STATUS_FAILED
-    assert "active child limit" in data["result"]
-    assert sent and "active child limit" in sent[0][1]
+    assert data["status"] == STATUS_SCHEDULED
+    assert enqueued and enqueued[0]["id"] == "child999"
+    assert sent and "queued behind active subagent cap" in sent[0][1]
     assert sent[0][2]["is_progress"] is True
     assert sent[0][2]["progress_meta"]["delegation_role"] == "subagent"
-    assert sent[0][2]["progress_meta"]["status"] == STATUS_FAILED
+    assert sent[0][2]["progress_meta"]["queued_behind_active_cap"] is True
+
+    ev_module._handle_schedule_task(
+        {
+            "type": "schedule_subagent",
+            "task_id": "child1000",
+            "objective": "Too many again",
+            "expected_output": "Nothing",
+            "depth": 1,
+            "root_task_id": "root123",
+            "delegation_role": "subagent",
+            "memory_mode": "forked",
+            "drive_root": str(tmp_path / "state" / "headless_tasks" / "child1000" / "data"),
+            "child_drive_root": str(tmp_path / "state" / "headless_tasks" / "child1000" / "data"),
+        },
+        FakeCtx(),
+    )
+    data2 = json.loads((tmp_path / "task_results" / "child1000.json").read_text(encoding="utf-8"))
+    assert data2["status"] == STATUS_SCHEDULED
+    assert any(task["id"] == "child1000" for task in enqueued)
 
     child_drive = tmp_path / "state" / "headless_tasks" / "childdone" / "data"
     (child_drive / "memory").mkdir(parents=True)
@@ -1706,6 +1739,121 @@ def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, 
     assert delivered and delivered[0]["id"] == "childrun"
 
 
+def test_assign_tasks_leaves_subagent_pending_when_running_cap_full(tmp_path, monkeypatch):
+    from supervisor import queue as queue_module
+    from supervisor import workers as workers_module
+    from supervisor import state as state_module
+
+    delivered = []
+
+    class FakeWorkerQueue:
+        def put(self, task):
+            delivered.append(task)
+
+    pending = [{
+        "id": "child2",
+        "type": "task",
+        "chat_id": 1,
+        "description": "Wait",
+        "root_task_id": "root123",
+        "delegation_role": "subagent",
+        "budget_drive_root": str(tmp_path),
+    }]
+    running = {
+        "child1": {
+            "task": {
+                "id": "child1",
+                "root_task_id": "root123",
+                "delegation_role": "subagent",
+            }
+        }
+    }
+    monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "1")
+    monkeypatch.setattr(workers_module, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers_module, "PENDING", pending)
+    monkeypatch.setattr(workers_module, "RUNNING", running)
+    monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
+    monkeypatch.setattr(workers_module, "load_state", lambda: {})
+    monkeypatch.setattr(state_module, "budget_remaining", lambda _state: 100.0)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+
+    workers_module.assign_tasks()
+
+    assert pending and pending[0]["id"] == "child2"
+    assert delivered == []
+
+
+def test_assign_tasks_honors_depth_reservation_for_first_grandchild(tmp_path, monkeypatch):
+    from supervisor import queue as queue_module
+    from supervisor import workers as workers_module
+    from supervisor import state as state_module
+
+    delivered = []
+
+    class FakeWorkerQueue:
+        def put(self, task):
+            delivered.append(task)
+
+    pending = [{
+        "id": "grandchild1",
+        "type": "task",
+        "chat_id": 1,
+        "description": "Reserved depth child",
+        "root_task_id": "root123",
+        "parent_task_id": "child1",
+        "delegation_role": "subagent",
+        "budget_drive_root": str(tmp_path),
+    }]
+    running = {
+        "child1": {
+            "task": {
+                "id": "child1",
+                "root_task_id": "root123",
+                "delegation_role": "subagent",
+            }
+        }
+    }
+    monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "1")
+    monkeypatch.setattr(workers_module, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers_module, "PENDING", pending)
+    monkeypatch.setattr(workers_module, "RUNNING", running)
+    monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
+    monkeypatch.setattr(workers_module, "load_state", lambda: {})
+    monkeypatch.setattr(state_module, "budget_remaining", lambda _state: 100.0)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+
+    workers_module.assign_tasks()
+
+    assert delivered and delivered[0]["id"] == "grandchild1"
+    assert "grandchild1" in workers_module.RUNNING
+
+
+def test_override_delegation_constraint_requires_parent_lineage(tmp_path, monkeypatch):
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools.join_ledger import _override_delegation_constraint
+    from ouroboros.tools.registry import ToolContext
+    import ouroboros.task_tree_ledger as ledger
+
+    monkeypatch.setattr(ledger, "DATA_DIR", str(tmp_path))
+    write_task_result(tmp_path, "child1", STATUS_RUNNING, parent_task_id="parent1", root_task_id="root1", delegation_role="subagent")
+    ledger.tree_ledger_append(
+        "root1",
+        "delegation_constraint",
+        "child asks parent to stop fanout",
+        task_id="child1",
+        role="scout",
+        payload={"constraint_id": "c1", "directive": "halt_fanout", "scope": {}, "rationale": "wait for evidence"},
+    )
+    sibling = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="sibling", task_metadata={"root_task_id": "root1"})
+    child = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="child1", task_metadata={"root_task_id": "root1"})
+    parent = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="parent1", task_metadata={"root_task_id": "root1"})
+
+    assert "only the parent" in _override_delegation_constraint(child, "c1", "self-clear")
+    assert "only the parent" in _override_delegation_constraint(sibling, "c1", "not my constraint")
+    assert _override_delegation_constraint(parent, "c1", "I gathered the evidence").startswith("OK:")
+    assert ledger.open_delegation_constraints("root1") == []
+
+
 def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
     from supervisor import queue as queue_module
     from supervisor import workers as workers_module
@@ -1734,7 +1882,14 @@ def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "load_state", lambda: {})
     monkeypatch.setattr(queue_module, "append_jsonl", lambda *args, **kwargs: None)
     monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
-    worker = SimpleNamespace(busy_task_id="childtimeout", proc=FakeProc())
+    # Activity model: a "timed out" task is one with no real progress for the idle
+    # window AND no progressing subtree (heartbeat alone is not progress). Variant A:
+    # run the heavy teardown reaper synchronously (no daemon) for a deterministic test.
+    monkeypatch.setattr(queue_module, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(queue_module, "_reap_queue", queue_module._stdqueue.Queue())
+    monkeypatch.setattr(queue_module, "get_task_idle_timeout_sec", lambda: 1)
+    monkeypatch.setattr(queue_module, "get_per_call_timeout_ceiling_sec", lambda: 1)
+    worker = SimpleNamespace(busy_task_id="childtimeout", proc=FakeProc(), reaping=False)
     monkeypatch.setattr(workers_module, "WORKERS", {9: worker})
     monkeypatch.setattr(workers_module, "respawn_worker", lambda worker_id: None)
     child_drive = tmp_path / "child-drive"
@@ -1752,13 +1907,18 @@ def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
             "child_drive_root": str(child_drive),
             "_attempt": 1,
         },
-        "started_at": time.time() - 10,
-        "last_heartbeat_at": time.time() - 10,
+        # idle for ~1000s, far beyond the monkeypatched idle window max(1, 1+120)=121s,
+        # with no progressing subtree -> activity-based stop.
+        "started_at": time.time() - 1000,
+        "last_heartbeat_at": time.time() - 1000,
         "worker_id": 9,
         "attempt": 1,
     }
 
     queue_module.enforce_task_timeouts()
+    # Drain the off-loop reaper synchronously (kill/archive/respawn).
+    while not queue_module._reap_queue.empty():
+        queue_module._reap_timed_out_task(queue_module._reap_queue.get_nowait())
 
     assert queue_module.PENDING
     retried = queue_module.PENDING[0]
@@ -1798,7 +1958,11 @@ def test_absolute_deadline_does_not_retry_expired_task(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "load_state", lambda: {})
     monkeypatch.setattr(queue_module, "append_jsonl", lambda *args, **kwargs: None)
     monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
-    worker = SimpleNamespace(busy_task_id="deadline1", proc=FakeProc())
+    monkeypatch.setattr(queue_module, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(queue_module, "_reap_queue", queue_module._stdqueue.Queue())
+    monkeypatch.setattr(queue_module, "get_task_idle_timeout_sec", lambda: 1)
+    monkeypatch.setattr(queue_module, "get_per_call_timeout_ceiling_sec", lambda: 1)
+    worker = SimpleNamespace(busy_task_id="deadline1", proc=FakeProc(), reaping=False)
     monkeypatch.setattr(workers_module, "WORKERS", {9: worker})
     monkeypatch.setattr(workers_module, "respawn_worker", lambda worker_id: None)
 
@@ -1810,13 +1974,18 @@ def test_absolute_deadline_does_not_retry_expired_task(tmp_path, monkeypatch):
             "deadline_at": "2000-01-01T00:00:00Z",
             "_attempt": 1,
         },
-        "started_at": time.time() - 10,
-        "last_heartbeat_at": time.time() - 10,
+        # Past deadline AND idle (no progress for ~1000s): the deadline is gated through
+        # idle/subtree-liveness, so an expired-but-idle task is stopped without retry.
+        "started_at": time.time() - 1000,
+        "last_heartbeat_at": time.time() - 1000,
         "worker_id": 9,
         "attempt": 1,
     }
 
     queue_module.enforce_task_timeouts()
+    # Variant A: the terminal write + retry decision now happen in the off-loop reaper.
+    while not queue_module._reap_queue.empty():
+        queue_module._reap_timed_out_task(queue_module._reap_queue.get_nowait())
 
     assert queue_module.PENDING == []
     result = load_task_result(tmp_path, "deadline1")

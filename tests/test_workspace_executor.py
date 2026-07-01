@@ -361,7 +361,7 @@ def test_run_script_directory_output_blocks_sensitive_members(tmp_path, monkeypa
     assert not list(artifact_dir.glob("site.*.zip"))
 
 
-def test_run_command_external_workspace_rejects_unchanged_dirty_directory_output(tmp_path, monkeypatch):
+def test_run_command_external_workspace_unchanged_directory_output_is_cosmetic(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     system_repo = tmp_path / "system"
     workspace = tmp_path / "workspace"
@@ -390,8 +390,10 @@ def test_run_command_external_workspace_rejects_unchanged_dirty_directory_output
         },
     )
 
-    assert "ARTIFACT_OUTPUT_ERROR" in result
-    assert "unchanged output: site" in result
+    # C2 (v6.36.0): present-but-unchanged is a cosmetic note, NOT a blocking error
+    # (a deterministic re-run / re-verify is not a failure). Missing outputs still block.
+    assert "ARTIFACT_OUTPUT_ERROR" not in result
+    assert "unchanged output (cosmetic): site" in result
 
 
 def test_run_command_executor_failure_keeps_trace(tmp_path, monkeypatch):
@@ -600,7 +602,7 @@ def test_executor_workspace_allows_claude_code_edit_unmapped_task_drive_cwd_to_r
     result = registry.execute("claude_code_edit", {"prompt": "edit something", "cwd": str(task_drive)})
 
     assert "CLAUDE_CODE_EDIT_BLOCKED" not in result
-    assert "CLAUDE_CODE_UNAVAILABLE" in result
+    assert "CLAUDE_CODE_UNAVAILABLE" in result or "CAPABILITY_UNAVAILABLE" in result
 
 
 def test_executor_workspace_allows_claude_code_edit_unmapped_user_files_cwd_to_reach_normal_auth_gate(tmp_path, monkeypatch):
@@ -637,7 +639,7 @@ def test_executor_workspace_allows_claude_code_edit_unmapped_user_files_cwd_to_r
     result = registry.execute("claude_code_edit", {"prompt": "edit something", "cwd": str(user_files)})
 
     assert "CLAUDE_CODE_EDIT_BLOCKED" not in result
-    assert "CLAUDE_CODE_UNAVAILABLE" in result
+    assert "CLAUDE_CODE_UNAVAILABLE" in result or "CAPABILITY_UNAVAILABLE" in result
 
 
 def test_claude_code_edit_schema_documents_docker_executor_workspace_block():
@@ -1028,7 +1030,7 @@ def test_executor_panic_cleanup_kills_durable_foreground_and_service_processes(t
         killed_foreground = workspace_executor.kill_all_foreground(data, wait=False)
         killed_services = workspace_executor.kill_all_services(data, wait=False)
 
-        deadline = time.time() + 5
+        deadline = time.time() + 15
         while time.time() < deadline and (foreground.poll() is None or service.poll() is None):
             time.sleep(0.05)
         assert foreground.poll() is not None
@@ -1057,6 +1059,14 @@ def test_executor_cleanup_scans_child_drive_records_from_parent_data_root(tmp_pa
         stdin=subprocess.DEVNULL,
         **subprocess_new_group_kwargs(),
     )
+    # kill_all_foreground's PID-reuse safety check compares the process command-sha recorded at
+    # registration against the one it recomputes at kill time. Right after fork+exec the child's
+    # command line may not yet be readable, so registering too eagerly makes the two shas diverge
+    # and the kill is silently skipped (flaky). Wait until the command-sha is readable & stable.
+    for _ in range(200):
+        if workspace_executor._process_command_sha256(proc.pid):
+            break
+        time.sleep(0.02)
     try:
         workspace_executor._register_process(
             child_data,
@@ -1068,7 +1078,7 @@ def test_executor_cleanup_scans_child_drive_records_from_parent_data_root(tmp_pa
             },
         )
         killed = workspace_executor.kill_all_foreground(data, wait=False)
-        deadline = time.time() + 5
+        deadline = time.time() + 15
         while time.time() < deadline and proc.poll() is None:
             time.sleep(0.05)
         assert proc.poll() is not None

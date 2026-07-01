@@ -118,10 +118,14 @@ def test_benchmark_manifest_model_slots_cover_runtime_model_settings():
     from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS
     from ouroboros.config import SETTINGS_DEFAULTS
 
+    # These match the OUROBOROS_MODEL* prefix but are a concurrency CAP / slot-wait
+    # CEILING, not model-id slots, so they are not part of the model-slot manifest.
+    _non_model_slot = {"OUROBOROS_MODEL_MAX_CONCURRENCY", "OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC"}
     relevant = {
         key
         for key in SETTINGS_DEFAULTS
-        if (
+        if key not in _non_model_slot
+        and (
             key.startswith("OUROBOROS_MODEL")
             or key in {"CLAUDE_CODE_MODEL", "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_REVIEW_MODELS"}
             or key.startswith("OUROBOROS_SCOPE_REVIEW_MODEL")
@@ -210,6 +214,8 @@ def test_executable_devtools_entrypoints_support_direct_help():
         "devtools/benchmarks/swe_bench_pro/e1v2/build_predictions.py",
         "devtools/benchmarks/swe_bench_pro/e1v2/plot_e1v2_curves.py",
         "devtools/benchmarks/swe_bench_pro/e1v2/run_pro.py",
+        "devtools/benchmarks/gaia/run_gaia.py",
+        "devtools/benchmarks/gaia/score_gaia.py",
         "devtools/benchmarks/osworld/normalize_logs.py",
         "devtools/benchmarks/osworld/osworld_adapter_skeleton.py",
         "devtools/benchmarks/osworld/run_step_agent.py",
@@ -228,11 +234,19 @@ def test_executable_devtools_entrypoints_support_direct_help():
 
 
 def test_harness_bench_fast_wrapper_builds_ouroboros_run_command():
-    from devtools.benchmarks.harness_bench_fast.ouroboros_cli_wrapper import build_command
+    # The upgraded harness-bench-fast wrapper builds the `ouroboros run` command inline in
+    # main() (per-task logs, retries, --result-json-out, --start). Verify the command shape
+    # and the v6.39 Phase-2 slot rename (HEAVY/FALLBACKS, never the legacy CODE/FALLBACK).
+    from devtools.benchmarks.harness_bench_fast import ouroboros_cli_wrapper as w
 
-    cmd = build_command(ouroboros_bin="/bin/ouroboros", prompt="create hello.py", memory_mode="empty")
-
-    assert cmd == ["/bin/ouroboros", "run", "--memory-mode", "empty", "--quiet", "create hello.py"]
+    assert hasattr(w, "main")
+    src = (
+        REPO_ROOT / "devtools" / "benchmarks" / "harness_bench_fast" / "ouroboros_cli_wrapper.py"
+    ).read_text(encoding="utf-8")
+    for token in ('"run",', '"--memory-mode",', '"--quiet",', '"--result-json-out",', '"--actor-id",'):
+        assert token in src, token
+    assert '"OUROBOROS_MODEL_HEAVY": args.model' in src
+    assert "OUROBOROS_MODEL_CODE" not in src
 
 
 def test_swe_pro_e1v2_port_has_csv_option_a_heal_and_no_secrets():
@@ -251,6 +265,12 @@ def test_swe_pro_e1v2_port_has_csv_option_a_heal_and_no_secrets():
     assert "Option A:" in entrypoint
     assert "merge-base" in entrypoint and "--is-ancestor" in entrypoint
     assert "boot reconciliation" in entrypoint  # documents the no-op interaction
+    assert "/opt/ouroboros-ro/devtools/benchmarks/swe_bench_pro/capture_patch.sh" in entrypoint
+    assert '"/opt/capture_patch.sh"' not in (e1v2 / "run_pro.py").read_text(encoding="utf-8")
+    assert 'post-task evolution=disabled baseline' in entrypoint
+    assert 'reason":"evolution_disabled' in entrypoint
+    assert 'if [ "${OBO_SELFIMPROVE:-0}" = "1" ]' in entrypoint
+    assert "view_image" in entrypoint
     # owner_chat_id must be seeded BEFORE the budget reset (else native
     # post-task evolution is dropped on fresh volumes -> E1v2 silently == E0).
     assert entrypoint.index('printf \'{"owner_chat_id": 1}\'') < entrypoint.index('reset_per_task_budget("/obo-data"')
@@ -259,6 +279,16 @@ def test_swe_pro_e1v2_port_has_csv_option_a_heal_and_no_secrets():
         for key, value in payload.items():
             if any(token in key for token in ("API_KEY", "TOKEN", "PASSWORD", "CREDENTIAL")):
                 assert value in ("", None, False), (name, key)
+        if name == "settings_base.json":
+            assert payload["OUROBOROS_TASK_REVIEW_MODE"] == "required"
+            assert payload["OUROBOROS_POST_TASK_EVOLUTION"] == "false"
+
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    assert SETTINGS_DEFAULTS["OUROBOROS_TASK_REVIEW_MODE"] == "auto"
+    run_pro = (e1v2 / "run_pro.py").read_text(encoding="utf-8")
+    assert "default fixed-model baseline" in run_pro
+    assert "default E1v2 (post-task evolution on)" not in run_pro
 
 
 def test_swe_pro_e1v2_curve_rows(tmp_path):
@@ -273,6 +303,402 @@ def test_swe_pro_e1v2_curve_rows(tmp_path):
 
     assert rows[-1]["e0_window_rate"] == 0.5
     assert rows[-1]["e1v2_window_rate"] == 0.5
+
+
+def test_gaia_adapter_wires_settings_and_solver(tmp_path):
+    import types
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+    from devtools.benchmarks.gaia.inspect_solver import ouroboros_solver
+
+    base_settings_path = REPO_ROOT / "devtools" / "benchmarks" / "gaia" / "settings_base.json"
+    settings_path = run_gaia._render_run_settings(base_settings_path, "openai/gpt-5.5", tmp_path)
+    env = run_gaia._settings_env(settings_path, "google/gemini-2.5-pro", tmp_path)
+    assert env["OUROBOROS_SETTINGS_PATH"] == str(settings_path)
+    assert env["OUROBOROS_DATA_DIR"].startswith(str(tmp_path))
+    assert env["OUROBOROS_MODEL"] == "google/gemini-2.5-pro"
+    assert json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_MODEL"] == "openai/gpt-5.5"
+    assert env["OUROBOROS_SCOPE_REVIEW_MODELS"] == "google/gemini-2.5-pro"
+    assert env["OUROBOROS_TASK_REVIEW_MODE"] == "required"
+    assert env.get("CLAUDE_CODE_MODEL") != "google/gemini-2.5-pro"
+    assert env["GAIA_OUROBOROS_URL"].startswith("http://127.0.0.1:")
+    for key in run_gaia._GAIA_PINNED_MODEL_KEYS:
+        if key.startswith("OUROBOROS_EFFORT_"):
+            continue
+        assert env[key]
+    assert env.get("OUROBOROS_WEBSEARCH_MODEL") != "google/gemini-2.5-pro"
+
+    argv = run_gaia.build_inspect_argv(
+        types.SimpleNamespace(split="validation", level=1, limit=1),
+        tmp_path,
+    )
+    assert any("ouroboros_solver.py@ouroboros_solver" in part for part in argv)
+    assert "inspect_evals/gaia" in argv
+    assert "subset=2023_level1" in argv
+    assert "--log-format" in argv and "json" in argv
+    assert callable(ouroboros_solver.ouroboros_solver())
+    args = types.SimpleNamespace(split="validation", level=1, limit=3, solve_model="google/gemini-2.5-pro")
+    run_gaia._write_manifest(tmp_path, args, argv, settings_path)
+    manifest = json.loads((tmp_path / "run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["official_command"] == argv
+    assert manifest["requested_count"] == 3
+    assert manifest["model_slots"]["OUROBOROS_MODEL"] == "google/gemini-2.5-pro"
+    assert "web_search" in open(REPO_ROOT / "devtools" / "benchmarks" / "gaia" / "inspect_solver" / "ouroboros_solver.py", encoding="utf-8").read()
+    assert "claude_code_edit" in open(REPO_ROOT / "devtools" / "benchmarks" / "gaia" / "inspect_solver" / "ouroboros_solver.py", encoding="utf-8").read()
+
+
+def test_gaia_profile_defaults_are_not_silent_web_off():
+    import argparse
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    args = argparse.Namespace(
+        profile="strict_ddgs", disable_tools=None, websearch_backend="",
+        main_web_search="off", main_web_search_engine="auto", max_workers=1,
+    )
+    run_gaia._apply_profile_defaults(args)
+    assert args.disable_tools == "claude_code_edit"
+    assert args.websearch_backend == "ddgs"
+
+    quality = argparse.Namespace(
+        profile="quality_openrouter_web", disable_tools=None, websearch_backend="",
+        main_web_search="off", main_web_search_engine="auto", max_workers=1,
+    )
+    run_gaia._apply_profile_defaults(quality)
+    assert quality.disable_tools == "web_search,claude_code_edit"
+    assert quality.main_web_search == "openrouter"
+    assert quality.max_workers == 5
+
+
+def test_gaia_sanitized_env_keeps_only_needed_provider_key(monkeypatch):
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic")
+    monkeypatch.setenv("GITHUB_TOKEN", "github")
+    monkeypatch.setenv("OUROBOROS_MODEL", "host/model")
+    monkeypatch.setenv("USE_LOCAL_MAIN", "true")
+
+    env = run_gaia._sanitized_host_env("google/gemini-2.5-pro")
+
+    assert env["OPENROUTER_API_KEY"] == "router"
+    assert "OPENAI_API_KEY" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "OUROBOROS_MODEL" not in env
+    assert "USE_LOCAL_MAIN" not in env
+
+
+def test_gaia_sanitized_env_preserves_keys_for_all_model_knobs(monkeypatch):
+    # Config A: anthropic main + gpt-4o vision -> BOTH provider keys must survive,
+    # else the vision route cannot authenticate.
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    monkeypatch.setenv("OPENAI_API_KEY", "openai")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router")
+
+    env = run_gaia._sanitized_host_env("anthropic::claude-sonnet-4.5", "openai::gpt-4o", "")
+    assert env["ANTHROPIC_API_KEY"] == "anthropic"  # solve model
+    assert env["OPENAI_API_KEY"] == "openai"  # vision model — preserved (the fix)
+
+
+def test_gaia_credential_keys_tolerate_leading_whitespace():
+    # A "a, b"-split review-model list leaves leading spaces; the provider match must
+    # still resolve the right credential keys (not silently fall through to OpenRouter).
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    assert "ANTHROPIC_API_KEY" in run_gaia._credential_keys_for_model(" anthropic::claude-sonnet-4.5")
+    assert "OPENAI_API_KEY" in run_gaia._credential_keys_for_model("openai::gpt-4o ")
+
+
+def test_gaia_sanitized_env_preserves_pinned_websearch_backend_key(monkeypatch):
+    # Config C: opus solve (anthropic key) + 'openai' web_search backend -> the OpenAI key
+    # is unrelated to any model but must survive, else web_search cannot authenticate.
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    monkeypatch.setenv("OPENAI_API_KEY", "openai")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router")
+
+    env = run_gaia._sanitized_host_env("anthropic::claude-opus-4.8", websearch_backend="openai")
+    assert env["ANTHROPIC_API_KEY"] == "anthropic"  # solve model
+    assert env["OPENAI_API_KEY"] == "openai"  # pinned web_search backend — preserved
+
+    # ddgs pin needs no provider key (pure retrieval).
+    env_ddgs = run_gaia._sanitized_host_env("anthropic::claude-opus-4.8", websearch_backend="ddgs")
+    assert "OPENAI_API_KEY" not in env_ddgs
+
+
+def test_gaia_openai_websearch_pin_drops_base_url(monkeypatch):
+    # Official OpenAI web_search is disabled when OPENAI_BASE_URL is set, so an 'openai'
+    # web pin must drop it EVEN when an openai:: model would otherwise carry it.
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    monkeypatch.setenv("OPENAI_API_KEY", "openai")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://compat.example/v1")
+
+    env = run_gaia._sanitized_host_env("openai::gpt-5.5", websearch_backend="openai")
+    assert env["OPENAI_API_KEY"] == "openai"
+    assert "OPENAI_BASE_URL" not in env  # dropped so official web_search stays enabled
+
+
+def test_gaia_render_injects_keys_and_free_host_service_port(tmp_path, monkeypatch):
+    # Out-of-the-box coexistence with a running desktop app: the rendered settings must
+    # carry a FREE Host-Service port (not the default 8767) and the REAL provider key for
+    # the configured model (empty placeholders would be popped by apply_settings_to_env,
+    # erasing the env keys -> "No supported provider configured").
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")  # resolved first, before data/settings.json
+    base = REPO_ROOT / "devtools" / "benchmarks" / "gaia" / "settings_base.json"
+
+    hsp = run_gaia._free_port()
+    assert hsp not in (8765, 8767) and 1024 < hsp < 65536  # a usable free port, not the app's
+
+    # Pin ddgs so only the model's provider (OpenRouter, for the slash-format gemini) is
+    # needed — 'auto' would deliberately pull every available key for the web cascade.
+    out = run_gaia._render_run_settings(
+        base, "google/gemini-2.5-pro", tmp_path, websearch_backend="ddgs", host_service_port=hsp,
+    )
+    s = json.loads(out.read_text(encoding="utf-8"))
+    assert s["OPENROUTER_API_KEY"] == "test-or-key"  # injected (gemini slash -> OpenRouter route)
+    assert s["OUROBOROS_HOST_SERVICE_PORT"] == hsp  # free port, avoids the live desktop app
+    # Only the NEEDED provider is injected — an unused provider's placeholder stays empty.
+    assert not str(s.get("ANTHROPIC_API_KEY", "")).strip()
+    assert s["OUROBOROS_MAIN_WEB_SEARCH"] == "off"
+
+
+def test_gaia_render_records_main_web_settings(tmp_path, monkeypatch):
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "router")
+    base = REPO_ROOT / "devtools" / "benchmarks" / "gaia" / "settings_base.json"
+    out = run_gaia._render_run_settings(
+        base, "openai/gpt-5.5", tmp_path,
+        main_web_search="openrouter", main_web_search_engine="auto",
+        main_web_search_max_total_results=7,
+    )
+    settings = json.loads(out.read_text(encoding="utf-8"))
+    assert settings["OUROBOROS_MAIN_WEB_SEARCH"] == "openrouter"
+    assert settings["OUROBOROS_MAIN_WEB_SEARCH_ENGINE"] == "auto"
+    assert settings["OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS"] == 7
+
+
+def test_gaia_settings_env_filters_custom_settings_secrets(tmp_path):
+    import devtools.benchmarks.gaia.run_gaia as run_gaia
+
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({
+        "OPENROUTER_API_KEY": "from-settings",
+        "GITHUB_TOKEN": "gh",
+        "ANTHROPIC_API_KEY": "anthropic",
+        "OUROBOROS_MODEL": "host/model",
+    }), encoding="utf-8")
+
+    env = run_gaia._settings_env(settings, "google/gemini-2.5-pro", tmp_path)
+
+    assert "OPENROUTER_API_KEY" not in env
+    assert "GITHUB_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["OUROBOROS_MODEL"] == "google/gemini-2.5-pro"
+
+
+def test_gaia_score_parses_inspect_json_logs(tmp_path):
+    from devtools.benchmarks.gaia.score_gaia import summarize
+
+    log_dir = tmp_path / "inspect_logs"
+    log_dir.mkdir()
+    (log_dir / "sample.json").write_text(json.dumps({
+        "samples": [
+            {
+                "output": {"completion": " FINAL ANSWER: 42 "},
+                "scores": {"gaia_scorer": {"value": True}},
+            },
+            {
+                "output": {"completion": "wrong"},
+                "scores": {"gaia_scorer": {"value": False}},
+            },
+            {
+                "output": {"completion": "string correct"},
+                "scores": {"gaia_scorer": {"value": "C"}},
+            },
+            {
+                "output": {"completion": "string incorrect"},
+                "scores": {"gaia_scorer": {"value": "I"}},
+            },
+        ]
+    }), encoding="utf-8")
+
+    summary = summarize(tmp_path)
+    assert summary["official_scored"] == 4
+    assert summary["official_correct"] == 2
+    assert summary["official_accuracy"] == 0.5
+
+
+def test_gaia_score_prefers_official_eval_rows_when_result_json_exists(monkeypatch, tmp_path):
+    import devtools.benchmarks.gaia.score_gaia as score_gaia
+
+    sample_dir = tmp_path / "samples" / "s1"
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "result.json").write_text(json.dumps({"final_answer": "local only"}), encoding="utf-8")
+    monkeypatch.setattr(score_gaia, "_rows_from_eval_logs", lambda _root: [{
+        "path": "official.eval",
+        "raw_answer": "official",
+        "local_normalized": "official",
+        "official_score": True,
+    }])
+
+    summary = score_gaia.summarize(tmp_path)
+
+    assert summary["official_scored"] == 1
+    assert summary["official_correct"] == 1
+
+
+def test_gaia_solver_disable_tools_before_prompt(monkeypatch, tmp_path):
+    from ouroboros import cli
+    from devtools.benchmarks.gaia.inspect_solver import ouroboros_solver
+
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        result_path = tmp_path / "samples" / "sample" / "result.json"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps({"final_answer": "ok"}), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("GAIA_OUROBOROS_RUN_ROOT", str(tmp_path))
+    monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path / "ouroboros_data"))
+    monkeypatch.setattr(ouroboros_solver.subprocess, "run", fake_run)
+    result = ouroboros_solver.run_ouroboros("question", sample_id="sample")
+    assert result["final_answer"] == "ok"
+    parser = cli.build_parser()
+    ns = parser.parse_args(seen["cmd"][3:])
+    assert ns.disable_tools == ["web_search,claude_code_edit"]
+    assert ns.result_json_out
+    # The prompt is the question plus the official GAIA "FINAL ANSWER:" protocol suffix.
+    assert ns.prompt and ns.prompt[0].startswith("question")
+    assert "FINAL ANSWER:" in ns.prompt[0]
+
+
+def test_gaia_solver_retries_transient_supervisor_startup(monkeypatch, tmp_path):
+    from devtools.benchmarks.gaia.inspect_solver import ouroboros_solver
+
+    calls = {"count": 0}
+
+    def fake_run(cmd, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return SimpleNamespace(returncode=2, stdout="", stderr="error: HTTP 503: supervisor is still starting")
+        result_path = tmp_path / "samples" / "sample" / "result.json"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps({"final_answer": "ok"}), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setenv("GAIA_OUROBOROS_RUN_ROOT", str(tmp_path))
+    monkeypatch.setattr(ouroboros_solver.subprocess, "run", fake_run)
+    monkeypatch.setattr(ouroboros_solver.time, "sleep", lambda _seconds: None)
+
+    result = ouroboros_solver.run_ouroboros("question", sample_id="sample")
+
+    assert calls["count"] == 2
+    assert result["final_answer"] == "ok"
+
+
+def test_gaia_solver_returns_real_host_paths_and_denies_secrets(monkeypatch, tmp_path):
+    # v6.52.0 (P1): the solver no longer copies into sample_dir/attachments/ nor
+    # parses phantom /shared_files paths out of the prompt. It returns the REAL host
+    # file paths (the core stage_task_attachments stages them); secret sources are
+    # still denied as defense-in-depth.
+    from devtools.benchmarks.gaia.inspect_solver import ouroboros_solver
+
+    image = tmp_path / "chart.png"
+    image.write_bytes(b"png")
+    secret_dir = tmp_path / ".ssh"
+    secret_dir.mkdir()
+    secret = secret_dir / "id_rsa"
+    secret.write_text("secret", encoding="utf-8")
+    state = SimpleNamespace(metadata={"attachments": [str(secret), str(image)]})
+
+    attachments = ouroboros_solver._attachment_paths_from_state(state)
+
+    assert len(attachments) == 1
+    # Real host path is returned as-is (no copy / no rename).
+    assert attachments[0] == image.resolve()
+    assert attachments[0].read_bytes() == b"png"
+
+
+def test_gaia_attachment_reads_files_dict_keys(monkeypatch, tmp_path):
+    # GAIA's TaskState.files maps a SANDBOX path (key) -> host path (value); on this
+    # inspect version the real host file is the KEY. Staging must read keys too.
+    from devtools.benchmarks.gaia.inspect_solver import ouroboros_solver
+
+    host = tmp_path / "data.csv"
+    host.write_text("a,b\n1,2\n", encoding="utf-8")
+    sample_dir = tmp_path / "run" / "samples" / "s1"
+    state = SimpleNamespace(files={str(host): "/sandbox/data.csv"})  # host path is the KEY
+
+    attachments = ouroboros_solver._attachment_paths_from_state(state, sample_dir, "")
+    assert len(attachments) == 1
+    assert attachments[0].read_text(encoding="utf-8") == "a,b\n1,2\n"
+
+
+def test_gaia_attachment_copy_avoids_duplicate_basenames(tmp_path):
+    from types import SimpleNamespace
+    from devtools.benchmarks.gaia.inspect_solver import ouroboros_solver
+
+    src1 = tmp_path / "one" / "same.txt"
+    src2 = tmp_path / "two" / "same.txt"
+    src1.parent.mkdir()
+    src2.parent.mkdir()
+    src1.write_text("one", encoding="utf-8")
+    src2.write_text("two", encoding="utf-8")
+
+    attachments = ouroboros_solver._attachment_paths_from_state(
+        SimpleNamespace(files={str(src1): str(src1), str(src2): str(src2)}),
+        sample_dir=tmp_path / "sample",
+        prompt="",
+    )
+    assert [p.name for p in attachments] == ["same.txt", "same_2.txt"]
+    assert attachments[0].read_text(encoding="utf-8") == "one"
+    assert attachments[1].read_text(encoding="utf-8") == "two"
+
+
+def test_gaia_attachment_falls_back_to_shared_files_root_and_rewrites_prompt(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from devtools.benchmarks.gaia.inspect_solver import ouroboros_solver
+
+    shared = tmp_path / "shared"
+    nested = shared / "2023" / "validation"
+    nested.mkdir(parents=True)
+    attached = nested / "doc.pdf"
+    attached.write_bytes(b"%PDF")
+    monkeypatch.setenv("GAIA_SHARED_FILES_ROOT", str(shared))
+    prompt = "Please inspect /shared_files/doc.pdf and answer."
+    attachments = ouroboros_solver._attachment_paths_from_state(SimpleNamespace(files={}), prompt=prompt)
+    assert attachments == [attached.resolve()]
+    rewritten = ouroboros_solver._rewrite_shared_file_prompt(prompt, attachments)
+    assert "/shared_files/doc.pdf" not in rewritten
+    assert "[ATTACHMENTS]" in rewritten
+    assert "doc.pdf" in rewritten
+
+
+def test_gaia_solver_isolates_generic_subprocess_error(monkeypatch, tmp_path):
+    # Crash isolation: a non-timeout spawn/OS failure must become a terminal per-sample
+    # result, never propagate and abort the whole eval.
+    from devtools.benchmarks.gaia.inspect_solver import ouroboros_solver
+
+    def boom(cmd, **kwargs):
+        raise OSError("posix_spawn failed")
+
+    monkeypatch.setenv("GAIA_OUROBOROS_RUN_ROOT", str(tmp_path))
+    monkeypatch.setattr(ouroboros_solver.subprocess, "run", boom)
+
+    result = ouroboros_solver.run_ouroboros("question", sample_id="sample")
+    assert result["returncode"] == -1
+    assert result["final_answer"] == ""
+    assert "SUBPROCESS ERROR" in result["stderr_tail"]
 
 
 def test_programbench_task_body_sets_executor_and_protected_policy(tmp_path):
@@ -558,7 +984,7 @@ def test_osworld_shell_action_does_not_fabricate_bash_history():
     assert ".bash_history'" not in src  # the f.write to the history path is gone
 
 
-def test_terminal_bench_metadata_declares_all_assisting_models():
+def test_terminal_bench_metadata_declares_all_assisting_models(monkeypatch):
     """NW-6: with task_review_mode=required the review triad (incl. a frontier
     model) assists the measured run; metadata.yaml must declare every assisting
     model, not only the measured one."""
@@ -566,17 +992,12 @@ def test_terminal_bench_metadata_declares_all_assisting_models():
     spec = importlib.util.spec_from_file_location(
         "tb_run_for_meta", REPO_ROOT / "devtools" / "benchmarks" / "terminal_bench" / "run_tb.py")
     module = importlib.util.module_from_spec(spec)
-    _sys.modules[spec.name] = module  # dataclass field resolution needs this
+    monkeypatch.setitem(_sys.modules, spec.name, module)  # dataclass field resolution needs this
     spec.loader.exec_module(module)
-    import os as _os
-    prev = _os.environ.pop("OUROBOROS_REVIEW_MODELS", None)
-    try:
-        meta = module.leaderboard_metadata(
-            agent_name="Ouroboros", org_name="Ouroboros",
-            model="openai/gpt-5.5", light_model="google/gemini-3.5-flash")
-    finally:
-        if prev is not None:
-            _os.environ["OUROBOROS_REVIEW_MODELS"] = prev
+    monkeypatch.delenv("OUROBOROS_REVIEW_MODELS", raising=False)
+    meta = module.leaderboard_metadata(
+        agent_name="Ouroboros", org_name="Ouroboros",
+        model="openai/gpt-5.5", light_model="google/gemini-3.5-flash")
     # The default review triad includes a frontier helper that must be visible.
     assert "anthropic/claude-opus-4.8" in meta
     assert "commit_review_triad" in meta
@@ -600,7 +1021,9 @@ def test_terminal_bench_adapter_defaults_to_required_acceptance_review(tmp_path)
     env = agent._container_env()
     assert env["OUROBOROS_TASK_REVIEW_MODE"] == "auto"
     assert env["OUROBOROS_MODEL"] == "openai/gpt-5.5"
-    assert env["OUROBOROS_MODEL_CODE"] == "openai/gpt-5.5"
+    # v6.39 slot rename: the bulk lane is OUROBOROS_MODEL_HEAVY (legacy _CODE retired);
+    # the container HEAVY lane reads os.environ["OUROBOROS_MODEL_HEAVY"], not _CODE.
+    assert env["OUROBOROS_MODEL_HEAVY"] == "openai/gpt-5.5"
     assert env["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
 
 
@@ -724,6 +1147,35 @@ def test_terminal_bench_openrouter_credit_preflight_blocks_low_credit(tmp_path, 
     assert payload["remaining_usd"] == 0.25
 
 
+def test_run_ouroboros_task_terminal_nonzero_exit_is_not_interruption(tmp_path):
+    """The in-container runner exits 2 to SIGNAL a terminal infra_failed result; that is a real
+    terminal task outcome (status completed/failed), NOT a Harbor wall-clock interruption.
+    _run_ouroboros_task must RETURN such a summary (so run() sets reached_terminal_result=True and
+    the captured summary is not mislabeled captured_after_cancellation). A nonzero exit with NO
+    terminal summary (a genuine runner crash) still raises."""
+    import asyncio
+    from types import SimpleNamespace
+    import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
+
+    agent = tb_agent.OuroborosTerminalBenchAgent(logs_dir=tmp_path)
+
+    class _Env:
+        def __init__(self, return_code, stdout):
+            self._rc, self._out = return_code, stdout
+
+        async def exec(self, *, command, timeout_sec=None, env=None, cwd=None):
+            return SimpleNamespace(return_code=self._rc, stdout=self._out, stderr="")
+
+    terminal = json.dumps(
+        {"status": "failed", "reason_code": "provider_unavailable", "infra_failed": True, "return_code": 2}
+    )
+    out = asyncio.run(agent._run_ouroboros_task(_Env(2, terminal), {}))
+    assert out["status"] == "failed" and out["reason_code"] == "provider_unavailable"
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(agent._run_ouroboros_task(_Env(2, "Traceback: boom\nnot-json"), {}))
+
+
 def test_terminal_bench_openrouter_credit_preflight_skips_when_unconfigured(tmp_path, monkeypatch):
     import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
 
@@ -780,6 +1232,8 @@ def test_terminal_bench_adapter_forwards_gigachat_and_preflights_direct_provider
     import devtools.benchmarks.terminal_bench.harbor_installed_agent as tb_agent
 
     monkeypatch.setenv("OUROBOROS_BENCH_ALLOW_CONTAINER_SECRETS", "1")
+    for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("GIGACHAT_CREDENTIALS", "gigachat-test-credentials")
     monkeypatch.setenv("GIGACHAT_BASE_URL", "https://gigachat.example.invalid/api/v1")
 
@@ -858,12 +1312,53 @@ def test_swe_pro_capture_keeps_untracked_text_and_drops_binary(tmp_path):
     assert "new_file.py" in patch
     assert "pyproject.toml" in patch
     assert "setup.py" in patch
-    assert "package-lock.json" in patch
+    assert "package-lock.json" not in patch
     assert "poetry.lock" in patch
     assert "app.py" in patch
     assert "binary.bin" not in patch
     assert "build/out.txt" not in patch
     assert "dist/out.txt" not in patch
+
+
+@pytest.mark.skipif(not _BASH_CAPTURE_AVAILABLE, reason="capture_patch.sh is a POSIX shell helper; Python wrappers are covered separately")
+def test_swe_pro_capture_excludes_base_untracked_snapshot(tmp_path):
+    repo = tmp_path / "repo"
+    base = _git_repo(repo)
+    (repo / "auth.yaml").write_text("pre-existing secret-ish fixture\n", encoding="utf-8")
+    (repo / "new_agent_file.py").write_text("print('agent-created')\n", encoding="utf-8")
+    snapshot = tmp_path / "base_untracked.snapshot"
+    snapshot.write_bytes(b"auth.yaml\0")
+    capture = REPO_ROOT / "devtools" / "benchmarks" / "swe_bench_pro" / "capture_patch.sh"
+    out = tmp_path / "patch.diff"
+
+    subprocess.run(
+        ["bash", str(capture), str(repo), base, str(out), str(snapshot)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    patch = out.read_text(encoding="utf-8")
+    post_status = (tmp_path / "patch.status.post.txt").read_text(encoding="utf-8")
+
+    assert "auth.yaml" not in patch
+    assert "new_agent_file.py" in patch
+    assert "auth.yaml" not in post_status
+    assert "new_agent_file.py" in post_status
+
+
+@pytest.mark.skipif(not _BASH_CAPTURE_AVAILABLE, reason="capture_patch.sh is a POSIX shell helper; Python wrappers are covered separately")
+def test_swe_pro_capture_preserves_pure_lockfile_patch(tmp_path):
+    repo = tmp_path / "repo"
+    base = _git_repo(repo)
+    (repo / "package-lock.json").write_text('{"lockfileVersion": 3}\n', encoding="utf-8")
+    capture = REPO_ROOT / "devtools" / "benchmarks" / "swe_bench_pro" / "capture_patch.sh"
+    out = tmp_path / "patch.diff"
+
+    subprocess.run(["bash", str(capture), str(repo), base, str(out)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    patch = out.read_text(encoding="utf-8")
+
+    assert "package-lock.json" in patch
 
 
 @pytest.mark.skipif(not _BASH_CAPTURE_AVAILABLE, reason="capture_patch.sh is a POSIX shell helper; Python wrappers are covered separately")
@@ -1808,7 +2303,7 @@ def test_terminal_bench_adapter_quotes_hostile_workspace_dir(tmp_path):
     assert f'"workspace_root": {json.dumps(hostile)}' in runner
     assert '"service_teardown": "keep"' in runner
     assert 'task_body["timeout_sec"] = task_timeout' in runner
-    assert "task_timeout = 900" in runner
+    assert "task_timeout = 870" in runner
     compile(runner, "run_ouroboros_task.py", "exec")
 
 
@@ -1847,9 +2342,14 @@ def test_terminal_bench_run_tb_builds_required_agent_kwargs(tmp_path):
     assert "--include-task-name" in cmd
     assert "pypi-server" in cmd
     assert "--force-build" in cmd
-    # 6a: methodology-allowed setup/build multipliers (task multiplier stays 1.0).
-    assert "--agent-setup-timeout-multiplier" in cmd
-    assert "--environment-build-timeout-multiplier" in cmd
+    # 6a: leaderboard-faithful default — Harbor static_validation REJECTS the
+    # setup/build timeout multipliers (static_validation.py
+    # _trial_timeout_override_fields rejects agent_setup_timeout_multiplier +
+    # environment_build_timeout_multiplier), so harbor_command omits them by default;
+    # they appear only under the local --allow-setup-build-multipliers opt-in (covered
+    # in test_run_tb_methodology.py). Task/verifier timeout multipliers stay 1.0 too.
+    assert "--agent-setup-timeout-multiplier" not in cmd
+    assert "--environment-build-timeout-multiplier" not in cmd
     assert "--agent-timeout-multiplier" not in cmd
 
 
@@ -1934,3 +2434,28 @@ def test_harbor_agent_defaults_max_workers_two_and_probes_context_timeout(tmp_pa
         task_timeout_sec=300,
     )
     assert agent_explicit.task_timeout_sec == 300
+
+
+def test_gaia_requested_task_ids_honors_sample_id_and_argv_lockstep():
+    # The manifest denominator must match what build_inspect_argv actually runs:
+    # --sample-id records those exact ids; otherwise the limit-derived level list.
+    from devtools.benchmarks.gaia import run_gaia
+
+    sel = SimpleNamespace(sample_id="A, B ,C", split="validation", level=2, limit=99)
+    assert run_gaia._requested_task_ids(sel) == ["A", "B", "C"]
+    # argv path mirrors it (uses --sample-id, NOT --limit)
+    argv_sel = run_gaia.build_inspect_argv(
+        SimpleNamespace(sample_id="A,B,C", split="validation", level=2, limit=99,
+                        max_samples=1, max_sandboxes=1, epochs=1),
+        Path("/tmp/gaia-run"),
+    )
+    assert "--sample-id" in argv_sel and "--limit" not in argv_sel
+
+    nolist = SimpleNamespace(sample_id="", split="validation", level=1, limit=2)
+    assert run_gaia._requested_task_ids(nolist) == ["validation:level1:1", "validation:level1:2"]
+    argv_lim = run_gaia.build_inspect_argv(
+        SimpleNamespace(sample_id="", split="validation", level=1, limit=2,
+                        max_samples=1, max_sandboxes=1, epochs=1),
+        Path("/tmp/gaia-run"),
+    )
+    assert "--limit" in argv_lim and "--sample-id" not in argv_lim

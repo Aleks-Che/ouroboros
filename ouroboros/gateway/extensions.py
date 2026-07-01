@@ -52,6 +52,7 @@ _CHILD_DISPATCH_HEADER_DENYLIST = {
     "x-auth-token",
 }
 _CHILD_DISPATCH_BODY_CAP = 512 * 1024
+_OFFICIAL_HUB_VERIFIED_HINT_CACHE: dict[tuple[str, str], bool] = {}
 
 
 async def _read_child_dispatch_body(request: Request) -> bytes:
@@ -70,14 +71,68 @@ async def _read_child_dispatch_body(request: Request) -> bytes:
     return bytes(chunks)
 
 
-def _review_fields(loaded: Any, *, stale: bool | None = None, gate: dict[str, Any] | None = None) -> dict[str, Any]:
+def _review_fields(
+    loaded: Any, *, stale: bool | None = None, gate: dict[str, Any] | None = None,
+    github_token_configured: bool | None = None,
+) -> dict[str, Any]:
     stale = loaded.review.is_stale_for(loaded.content_hash) if stale is None else stale
     gate = skill_review_gate(loaded.review.status, stale=stale) if gate is None else gate
+    source = str(getattr(loaded, "source", "") or "")
+    official_hub_verified = False
+    if source == "ouroboroshub":
+        try:
+            key = (str(getattr(loaded, "name", "") or ""), str(getattr(loaded, "content_hash", "") or ""))
+            if key[0] and key[1] and key in _OFFICIAL_HUB_VERIFIED_HINT_CACHE:
+                official_hub_verified = _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key]
+            else:
+                from ouroboros.skill_review import is_official_hub_payload_verified
+
+                official_hub_verified = bool(is_official_hub_payload_verified(loaded))
+                if key[0] and key[1]:
+                    _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key] = official_hub_verified
+        except Exception:
+            official_hub_verified = False
+    owner_attestable = (
+        (source == "ouroboroshub" and official_hub_verified)
+        or (source not in {"native", "clawhub", "ouroboroshub"} and (
+            source == "external" or bool(getattr(loaded, "is_self_authored", False))
+        ))
+    )
+    # FR1: the host computes the single Submit-to-Hub eligibility verdict so the card
+    # renders it instead of recomputing a divergent clean-only rule (the SSOT shared with
+    # the backend gate). The github-token check is request-INVARIANT, so the index builder
+    # resolves it ONCE and threads it in; a single-skill caller (None) resolves it lazily
+    # and only when the source is publishable — never a per-skill settings.json read on a
+    # native-heavy GET /api/extensions.
+    from ouroboros.skill_publish_eligibility import PUBLISHABLE_SOURCES, submit_hub_eligibility
+
+    if source.lower() not in PUBLISHABLE_SOURCES:
+        submit_hub = {"visible": False, "disabled": True, "reason": ""}
+    else:
+        if github_token_configured is None:
+            from ouroboros.tools.github import github_token_from_env_or_settings
+
+            github_token_configured = bool(github_token_from_env_or_settings())
+        submit_hub = submit_hub_eligibility(
+            source=source,
+            review_status=loaded.review.status,
+            review_profile=getattr(loaded.review, "review_profile", "") or "",
+            review_stale=stale,
+            github_token_configured=github_token_configured,
+        )
     return {
         "review_status": loaded.review.status,
         "review_stale": stale,
         "review_gate": gate,
         "executable_review": gate["executable_review"],
+        # Surfaced so the UI can mark an owner-attested skill (LLM review skipped) distinctly
+        # from a normal LLM-clean verdict, and hide the "Skip review" action once attested.
+        "review_profile": getattr(loaded.review, "review_profile", ""),
+        # UI hint only: the owner-attestation endpoint repeats the authoritative checks.
+        "official_hub_verified": official_hub_verified,
+        "owner_attestable": owner_attestable,
+        # FR1: SSOT publish-eligibility verdict {visible, disabled, reason}.
+        "submit_hub": submit_hub,
     }
 
 
@@ -234,6 +289,11 @@ def _build_extensions_index(drive_root, repo_path):
         return datetime.fromtimestamp(min(stamps), tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
     from ouroboros.extension_health import read_extension_health
+    from ouroboros.tools.github import github_token_from_env_or_settings
+
+    # Request-invariant: resolve the github-token state ONCE for the whole index, not
+    # once per skill (FR1 — avoids N settings.json reads per GET /api/extensions).
+    _gh_token_configured = bool(github_token_from_env_or_settings())
 
     for s in skills:
         payload_root = ""
@@ -250,7 +310,7 @@ def _build_extensions_index(drive_root, repo_path):
             "version": s.manifest.version,
             "description": s.manifest.description,
             "enabled": s.enabled,
-            **_review_fields(s),
+            **_review_fields(s, github_token_configured=_gh_token_configured),
             "permissions": list(s.manifest.permissions or []),
             "load_error": runtime_states.get(s.name, {}).get("load_error", s.load_error),
             "desired_live": runtime_states.get(s.name, {}).get("desired_live", False),
@@ -757,6 +817,49 @@ async def api_skill_review(request: Request) -> JSONResponse:
         source="skills",
         review_impl=_review_skill_impl,
     )
+    return JSONResponse(payload)
+
+
+async def api_owner_skill_attest_review(request: Request) -> JSONResponse:
+    """POST /api/owner/skills/{skill}/attest-review — OWNER-ONLY (C1, v6.39): skip the
+    EXPENSIVE LLM review for the owner's own external/self-authored skill or for a freshly
+    hash-verified official OuroborosHub payload. The DETERMINISTIC preflight floor still runs
+    (409 if it fails); only the costly LLM phase is skipped. Loudly audited. The agent can
+    never reach this — the owner_attestation marker is an agent-write-protected owner-state
+    file, so this is owner-issued only."""
+    skill_name = str(request.path_params.get("skill") or "").strip()
+    if not skill_name:
+        return json_error("missing skill name", 400)
+    drive_root = _request_drive_root(request)
+    repo_dir = _request_repo_dir(request)
+    ctx = _ApiReviewCtx(drive_root, repo_dir)
+    from ouroboros.skill_review_runner import run_skill_review_lifecycle
+    from ouroboros.skill_owner_attestation import review_skill_owner_attest
+
+    # Route through the SAME lifecycle as api_skill_review so a clean attestation gets the
+    # post-pass deps/extension reconcile + schedule resync (otherwise an attested skill with
+    # isolated dependencies stays blocked by skill_readiness). The lifecycle just calls our
+    # attest impl instead of the LLM review.
+    payload = await run_skill_review_lifecycle(
+        ctx, skill_name, source="skills", review_impl=review_skill_owner_attest,
+    )
+    status = str(payload.get("status") or "")
+    try:
+        append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(),
+            "type": "owner_api_action",
+            "action": "skill_owner_attest",
+            "client_host": str(getattr(getattr(request, "client", None), "host", "") or ""),
+            "skill": skill_name,
+            "status": status,
+            "content_hash": str(payload.get("content_hash") or ""),
+        })
+    except Exception:
+        log.debug("Failed to write owner attestation audit event", exc_info=True)
+    if status != "clean":
+        # Deterministic preflight floor failed, the skill is not owner-own, or it could not
+        # be loaded/hashed: 409 — not attestable (existing review state is left untouched).
+        return JSONResponse(payload, status_code=409)
     return JSONResponse(payload)
 
 

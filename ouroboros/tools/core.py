@@ -22,22 +22,25 @@ from ouroboros.tool_access import (
     decide_tool_access,
     active_tool_profile,
     normalize_root,
+    normalize_root_relative,
     resolve_user_file_path,
     resolve_resource_path,
     resource_root_path,
     user_files_path_block_reason,
 )
-from ouroboros.utils import atomic_write_json, read_text, safe_relpath, utc_now_iso
+from ouroboros.utils import atomic_write_json, read_text, safe_relpath, utc_now_iso, write_text_atomic
 from ouroboros.contracts.task_constraint import normalize_task_constraint, resolve_payload_path
 from ouroboros.contracts.skill_payload_policy import (
     SKILL_PAYLOAD_ALL_BUCKETS,
     SKILL_OWNER_STATE_FILENAMES,
     SkillPayloadPathError,
+    SkillPayloadTarget,
     cross_skill_redirect_error,
     decide_payload_short_form,
     is_skill_control_plane_path as _policy_is_skill_control_plane_path,
     is_skill_owner_state_alias,
     is_skill_owner_state_target as _policy_is_skill_owner_state_target,
+    is_skill_create_typo,
     resolve_skill_payload_target,
 )
 
@@ -108,11 +111,19 @@ def _native_payload_without_seed(target: pathlib.Path, data_root: pathlib.Path) 
     return bucket == "native" and not (payload_root / ".seed-origin").is_file()
 
 
-def _data_skill_path(path: str, drive_root: pathlib.Path) -> pathlib.Path | None:
+def _data_skill_target(path: str, drive_root: pathlib.Path) -> SkillPayloadTarget | None:
+    """Single resolver for an explicit data-plane skills/<bucket>/<skill>/... write target (None when
+    the path is not inside a skill payload). SSOT for both _data_skill_path and the _data_write
+    manifest-first typo guard, so the payload resolution is never duplicated."""
     try:
-        return resolve_skill_payload_target(pathlib.Path(drive_root), path).target_path
+        return resolve_skill_payload_target(pathlib.Path(drive_root), path)
     except SkillPayloadPathError:
         return None
+
+
+def _data_skill_path(path: str, drive_root: pathlib.Path) -> pathlib.Path | None:
+    target = _data_skill_target(path, drive_root)
+    return target.target_path if target is not None else None
 
 
 def _looks_like_serialized_tool_result(content: Any) -> bool:
@@ -151,6 +162,13 @@ def _is_workspace_executor_control_state_path(target: pathlib.Path, data_root: p
 
 def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]:
     target = (root / safe_relpath(rel)).resolve()
+    # CONFINE to the root before any iterdir: a resolved target that escapes (e.g. an
+    # in-tree symlink pointing outside — common in untrusted child-created project /
+    # deliverable trees behind the new read-only roots) is rejected, never listed.
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return [f"⚠️ Path escapes root: {rel}"]
     if not target.exists():
         return [f"⚠️ Directory not found: {rel}"]
     if not target.is_dir():
@@ -395,7 +413,13 @@ def _repo_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
             ensure_ascii=False,
             indent=2,
         )
-    items = _list_dir(repo_root, dir, max_entries)
+    # ctx.repo_path already normalized absolute/redundant-prefix dirs; pass the
+    # resulting root-relative form so _list_dir doesn't re-nest the raw input.
+    try:
+        listed_rel = target.relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        listed_rel = dir
+    items = _list_dir(repo_root, listed_rel, max_entries)
     if is_restricted_subagent_profile(ctx):
         items = _filter_subagent_secret_repo_listing(items, repo_root)
     return json.dumps(items, ensure_ascii=False, indent=2)
@@ -535,6 +559,65 @@ def _data_list(ctx: ToolContext, dir: str = ".", max_entries: int = 500) -> str:
     return json.dumps(items, ensure_ascii=False, indent=2)
 
 
+def _str_match_replace(
+    text: str, old_str: str, new_str: str, display_path: str, error_tag: str
+):
+    """Shared exact, byte-level, single-occurrence replacement for both str-replace
+    editors — the repo editor (``git._str_replace_editor``) and the data-plane editor
+    (``_edit_text``) — so they give IDENTICAL match feedback (deferral 4). Returns
+    ``(new_text, None)`` on a unique match, else ``(None, error_message)`` with the
+    count==0 file preview / count>1 positional hints. ``error_tag`` is the caller's
+    error prefix (e.g. ``STR_REPLACE_ERROR`` / ``EDIT_TEXT_ERROR``)."""
+    count = text.count(old_str)
+    if count == 0:
+        preview = text[:2000]
+        return None, (
+            f"⚠️ {error_tag}: old_str not found in {display_path}.\n"
+            f"File preview (first 2000 chars):\n{preview}"
+        )
+    if count > 1:
+        positions = []
+        start = 0
+        for _ in range(min(count, 5)):
+            idx = text.index(old_str, start)
+            positions.append(f"line {text[:idx].count(chr(10)) + 1}")
+            start = idx + 1
+        return None, (
+            f"⚠️ {error_tag}: old_str found {count} times in {display_path} "
+            f"(must be unique). Occurrences at: {', '.join(positions)}. "
+            f"Include more surrounding context in old_str to make it unique."
+        )
+    return text.replace(old_str, new_str, 1), None
+
+
+def _check_data_shrink_guard(
+    target: pathlib.Path, new_content: str, force: bool = False
+) -> "str | None":
+    """Block likely accidental truncation of an EXISTING data-plane file on OVERWRITE,
+    unless force=True (deferral 5). Mirrors the repo shrink-guard
+    (``git._check_shrink_guard``) but WITHOUT the ``git ls-files`` tracking check — the
+    data plane is not a git tree. Skips a non-existent target (a fresh create is any
+    size) and appends (the caller only invokes this on overwrite). Never raises."""
+    if force:
+        return None
+    try:
+        if not target.exists():
+            return None
+        old_len = len(target.read_text(encoding="utf-8"))
+        new_len = len(new_content)
+        if old_len > 0 and new_len < old_len * 0.7:
+            pct = round(new_len / old_len * 100)
+            return (
+                f"⚠️ WRITE_BLOCKED: new content for '{target.name}' is {pct}% of original "
+                f"({old_len} -> {new_len} chars). This looks like accidental truncation. "
+                f"Use edit_text for surgical edits, or pass force=true to confirm an "
+                f"intentional rewrite."
+            )
+    except Exception:
+        return None
+    return None
+
+
 def _data_write(
     ctx: ToolContext,
     path: str,
@@ -543,6 +626,7 @@ def _data_write(
     bucket: str = "",
     skill_name: str = "",
     display_root: str = "runtime_data",
+    force: bool = False,
 ) -> str:
     if (b := _project_store_access_block(_normalize_data_read_path(ctx, path))):
         return b
@@ -567,13 +651,21 @@ def _data_write(
     else:
         task_constraint = synth or existing_tc
     write_path = _normalize_data_read_path(ctx, path)
+    # Resolved skills payload target (None unless this is an explicit skills/<bucket>/<skill> path).
+    # The manifest-first typo guard runs LATER, AFTER the owner-state/control-plane/content blocks, so
+    # those security blocks take precedence over a missing-payload typo.
+    _skill_target = None
     if task_constraint and task_constraint.mode == "skill_repair" and task_constraint.payload_root:
         try:
             p = resolve_payload_path(pathlib.Path(ctx.drive_root), task_constraint, path)
         except ValueError as e:
             return f"⚠️ DATA_WRITE_ERROR: {e}"
     else:
-        explicit_skill_target = _data_skill_path(path, pathlib.Path(ctx.drive_root))
+        # Resolve the skills target on the NORMALIZED write_path (the exact path the write uses below)
+        # so the manifest-first typo guard can never be skipped by a redundant drive-root / .tmp-data-*
+        # prefix that _normalize_data_read_path would later strip into a real skills/<bucket>/<skill>.
+        _skill_target = _data_skill_target(write_path, pathlib.Path(ctx.drive_root))
+        explicit_skill_target = _skill_target.target_path if _skill_target is not None else None
         p = explicit_skill_target if explicit_skill_target is not None else ctx.drive_path(write_path)
     # Defense-in-depth: settings.json is owner-only. Use inode-aware matching
     # for symlinks/hardlinks/case-insensitive APFS/NTFS, with a fallback for
@@ -655,26 +747,51 @@ def _data_write(
             "owner-only values, stop the agent, edit ~/Ouroboros/data/settings.json "
             "directly, then restart."
         )
+    # Manifest-first typo guard (SSOT with the bucket/skill_name short-form via is_skill_create_typo),
+    # applied AFTER the owner-state / control-plane / content DATA_WRITE_BLOCKED guards above so those
+    # take precedence: an explicit runtime_data write into a NON-existent skills/<bucket>/<skill>
+    # payload is a typo unless it is the root manifest of a NEW external skill — never silently mkdir a
+    # bogus payload from a misspelled name (resolution ran on the normalized write_path).
+    if _skill_target is not None and is_skill_create_typo(
+        payload_root=_skill_target.payload_root,
+        bucket=_skill_target.bucket,
+        rel_within_payload=_skill_target.rel_path,
+    ):
+        return (
+            f"⚠️ DATA_WRITE_ERROR: skill payload not found: "
+            f"skills/{_skill_target.bucket}/{_skill_target.skill}. Use an existing skill; for a "
+            "NEW skill write its manifest (SKILL.md/skill.json) at the payload root under "
+            "bucket=external; this path looks like a typo into a missing payload."
+        )
     marker_payload = _skill_payload_parts(lexical_target, data_root) or _skill_payload_parts(target_path, data_root)
     should_mark_self_authored = False
     marker_path: pathlib.Path | None = None
     if (
         mode == "overwrite"
-        and not (task_constraint and task_constraint.mode == "skill_repair")
+        # A genuine NEW external skill is self-authored even when reached via the bucket+skill_name
+        # short-form (which synthesizes a skill_repair constraint, so the old `not skill_repair`
+        # guard wrongly suppressed provenance on create). Require BOTH the manifest AND the payload
+        # directory to be new (`not marker_payload[2].exists()`, evaluated before the mkdir below) so
+        # writing a SKILL.md into an ALREADY-EXISTING external skill is never mis-marked self-authored.
         and marker_payload is not None
         and marker_payload[0] == "external"
         and pathlib.PurePosixPath(str(path or "")).name.lower() in {"skill.md", "skill.json"}
         and not target_path.exists()
+        and not marker_payload[2].exists()
     ):
         marker_path = marker_payload[2] / _SELF_AUTHORED_MARKER
         should_mark_self_authored = not marker_path.exists()
 
     p.parent.mkdir(parents=True, exist_ok=True)
     if mode == "overwrite":
-        p.write_text(content, encoding="utf-8")
+        # Deferral 5: block likely-accidental truncation of an existing data-plane file
+        # (e.g. settings.json, skill state) unless force=true. Append is exempt.
+        if (shrink := _check_data_shrink_guard(p, content, force)):
+            return shrink
+        write_text_atomic(p, content)  # crash-safe full overwrite (G)
     else:
         with p.open("a", encoding="utf-8") as f:
-            f.write(content)
+            f.write(content)  # append is intentionally NOT atomized
     if should_mark_self_authored and marker_path is not None:
         from ouroboros.skill_loader import compute_content_hash
 
@@ -801,6 +918,37 @@ def _protected_artifact_list_block(
     return ""
 
 
+def _annotate_reread(ctx: ToolContext, target: Any, start_line: int, max_lines: int, result: str) -> str:
+    """Append an advisory hint when the SAME file slice is re-read unchanged.
+
+    Per-task, key on (resolved path, slice); the change signal is (size, mtime).
+    A repeat read of an unchanged slice is usually wasted budget — nudge the model
+    to act on what it has. Advisory only (never blocks; different slices and
+    changed files are not flagged)."""
+    try:
+        resolved = pathlib.Path(target).resolve(strict=False)
+        st = resolved.stat()
+    except (OSError, TypeError, ValueError):
+        return result
+    if not isinstance(result, str) or result.startswith("⚠️"):
+        return result
+    key = f"{resolved}|{int(start_line)}|{int(max_lines)}"
+    sig = (st.st_size, st.st_mtime_ns)
+    seen = getattr(ctx, "_read_file_seen", None)
+    if not isinstance(seen, dict):
+        seen = {}
+        ctx._read_file_seen = seen
+    prev = seen.get(key)
+    seen[key] = sig
+    if prev is not None and prev == sig:
+        return (
+            result
+            + "\n\nℹ️ This exact view is unchanged since you already read it this task — "
+            "re-reading is usually wasted budget; act on what you have."
+        )
+    return result
+
+
 def _read_file(
     ctx: ToolContext,
     path: str,
@@ -818,13 +966,13 @@ def _read_file(
         protected_block = block_reason_for_path(ctx, target, "read_bytes")
         if protected_block:
             return protected_block
-        return _repo_read(
+        return _annotate_reread(ctx, target, start_line, max_lines, _repo_read(
             ctx,
             path,
             max_lines=max_lines,
             start_line=start_line,
             display_path=_root_display_path(normalized, path),
-        )
+        ))
     if normalized == "runtime_data":
         try:
             target = resolve_resource_path(ctx, root=normalized, path=path)
@@ -833,13 +981,13 @@ def _read_file(
                 return protected_block
         except Exception:
             pass
-        return _data_read(
+        return _annotate_reread(ctx, locals().get("target"), start_line, max_lines, _data_read(
             ctx,
             path,
             max_lines=max_lines,
             start_line=start_line,
             display_path=_root_display_path(normalized, path),
-        )
+        ))
     task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     if normalized == "skill_payload" and not bucket and not skill_name and task_constraint and task_constraint.mode == "skill_repair":
         try:
@@ -849,7 +997,7 @@ def _read_file(
                 return protected_block
         except Exception:
             pass
-        return _data_read(ctx, path, max_lines=max_lines, start_line=start_line, display_path=_root_display_path(normalized, path))
+        return _annotate_reread(ctx, locals().get("target"), start_line, max_lines, _data_read(ctx, path, max_lines=max_lines, start_line=start_line, display_path=_root_display_path(normalized, path)))
     try:
         base = resource_root_path(ctx, normalized, bucket=bucket, skill_name=skill_name)
         target = resolve_resource_path(ctx, root=normalized, path=path, bucket=bucket, skill_name=skill_name)
@@ -860,7 +1008,7 @@ def _read_file(
         if block_msg:
             return block_msg
         content = read_text(target)
-        return _render_line_slice(_root_display_path(normalized, path), content, max_lines=max_lines, start_line=start_line)
+        return _annotate_reread(ctx, target, start_line, max_lines, _render_line_slice(_root_display_path(normalized, path), content, max_lines=max_lines, start_line=start_line))
     except FileNotFoundError:
         return f"⚠️ NOT_FOUND: {_root_display_path(normalized, path)}"
     except Exception as exc:
@@ -894,7 +1042,11 @@ def _list_files(
             target = resolve_user_file_path(ctx, path, allow_protected_descendants=True)
             items = _list_user_files_dir(ctx, base, target, max_entries)
             return json.dumps(items, ensure_ascii=False, indent=2)
-        items = _list_dir(base, path, max_entries)
+        # Normalize a redundant-prefix/absolute path only for the repo roots; the
+        # protected-artifact list guard above (_protected_artifact_list_block) reads
+        # the RAW path, so normalizing a non-repo root here would desync them.
+        list_path = normalize_root_relative(base, path) if normalized in ("active_workspace", "system_repo") else path
+        items = _list_dir(base, list_path, max_entries)
         if is_restricted_subagent_profile(ctx):
             if normalized == "system_repo":
                 items = _filter_subagent_secret_repo_listing(items, base)
@@ -959,9 +1111,10 @@ def _write_file(
                     str(item.get("content") or ""),
                     mode=mode,
                     display_root=normalized,
+                    force=force,
                 ))
             return _join_write_results(results)
-        return _data_write(ctx, path=path, content=content, mode=mode, display_root=normalized)
+        return _data_write(ctx, path=path, content=content, mode=mode, display_root=normalized, force=force)
     if normalized == "skill_payload":
         if files:
             results = []
@@ -976,9 +1129,10 @@ def _write_file(
                     bucket=bucket,
                     skill_name=skill_name,
                     display_root=normalized,
+                    force=force,
                 ))
             return _join_write_results(results)
-        return _data_write(ctx, path=path, content=content, mode=mode, bucket=bucket, skill_name=skill_name, display_root=normalized)
+        return _data_write(ctx, path=path, content=content, mode=mode, bucket=bucket, skill_name=skill_name, display_root=normalized, force=force)
     try:
         if files:
             results = []
@@ -993,7 +1147,12 @@ def _write_file(
                         results.append(f"⚠️ WRITE_FILE_BLOCKED: artifact_store path blocked: {block_reason}")
                         continue
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(str(item.get("content") or ""), encoding="utf-8")
+                # Deferral 5: batch items overwrite too — shrink-guard each (parity with the
+                # single-file path), force=true bypasses.
+                if (shrink := _check_data_shrink_guard(target, str(item.get("content") or ""), force)):
+                    results.append(shrink)
+                    continue
+                write_text_atomic(target, str(item.get("content") or ""))  # crash-safe (G)
                 result = f"OK: wrote {_root_display_path(normalized, rel_path)} ({len(str(item.get('content') or ''))} chars)"
                 if normalized == "user_files":
                     record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
@@ -1009,9 +1168,13 @@ def _write_file(
         target.parent.mkdir(parents=True, exist_ok=True)
         if mode == "append":
             with target.open("a", encoding="utf-8") as fh:
-                fh.write(content)
+                fh.write(content)  # append is intentionally NOT atomized
         else:
-            target.write_text(content, encoding="utf-8")
+            # Deferral 5: shrink-guard the full overwrite (e.g. active_workspace rewrites)
+            # — force=true bypasses, matching the tool-schema `force` description.
+            if (shrink := _check_data_shrink_guard(target, content, force)):
+                return shrink
+            write_text_atomic(target, content)  # crash-safe full overwrite (G)
         result = f"OK: wrote {_root_display_path(normalized, path)} ({len(content)} chars)"
         if normalized == "user_files":
             record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
@@ -1030,6 +1193,7 @@ def _edit_text(
     root: str = "active_workspace",
     bucket: str = "",
     skill_name: str = "",
+    force: bool = False,
 ) -> str:
     normalized, block = _access_or_block(ctx, root, "edit")
     if block:
@@ -1071,6 +1235,23 @@ def _edit_text(
     if normalized == "skill_payload":
         from ouroboros.tools.git import _str_replace_editor
 
+        # Deferral 5: skill payloads live under data/skills/ (not the repo git), so
+        # git._str_replace_editor's git-ls-files shrink check never fires for them. Apply
+        # the data-plane shrink guard here (pre-checking the prospective replacement with
+        # the shared matcher) before delegating, so a payload edit can't silently truncate.
+        try:
+            _sp_target = resolve_resource_path(ctx, root=normalized, path=path, bucket=bucket, skill_name=skill_name)
+            if _sp_target.exists():
+                _sp_new, _sp_err = _str_match_replace(
+                    _sp_target.read_text(encoding="utf-8"), old_str, new_str,
+                    _root_display_path(normalized, path), "EDIT_TEXT_ERROR",
+                )
+                if _sp_err:
+                    return _sp_err
+                if (shrink := _check_data_shrink_guard(_sp_target, _sp_new, force)):
+                    return shrink
+        except Exception:
+            log.debug("skill_payload shrink pre-check skipped", exc_info=True)
         return _str_replace_editor(
             ctx,
             path=path,
@@ -1097,10 +1278,17 @@ def _edit_text(
             if block_reason:
                 return f"⚠️ EDIT_TEXT_BLOCKED: artifact_store path blocked: {block_reason}"
         text = target.read_text(encoding="utf-8")
-        count = text.count(old_str)
-        if count != 1:
-            return f"⚠️ EDIT_TEXT_ERROR: old_str matched {count} times; expected exactly 1."
-        target.write_text(text.replace(old_str, new_str, 1), encoding="utf-8")
+        new_text, _match_err = _str_match_replace(
+            text, old_str, new_str, _root_display_path(normalized, path), "EDIT_TEXT_ERROR"
+        )
+        if _match_err:
+            return _match_err  # count==0 preview / count>1 positional hints (deferral 4)
+        # Deferral 5: an exact replace that shrinks an existing data-plane file >30% is
+        # likely accidental truncation — block unless force=true (matches the overwrite
+        # paths; force lets a deliberate large surgical deletion through).
+        if (shrink := _check_data_shrink_guard(target, new_text, force)):
+            return shrink
+        write_text_atomic(target, new_text)  # crash-safe edit (G)
         result = f"OK: edited {_root_display_path(normalized, path)}"
         if normalized == "user_files":
             record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
@@ -1162,9 +1350,15 @@ def _send_photo(ctx: ToolContext, file_path: str = "", image_base64: str = "",
     if not actual_b64 or len(actual_b64) < 100:
         return "⚠️ Image data is empty or too short."
 
+    _photo_meta = getattr(ctx, "task_metadata", {})
+    _photo_meta = _photo_meta if isinstance(_photo_meta, dict) else {}
     ctx.pending_events.append({
         "type": "send_photo",
         "chat_id": ctx.current_chat_id, "task_id": str(getattr(ctx, "task_id", "") or ""),  # task_id -> bound-task project-panel routing
+        # Lineage so a SUBAGENT's photo routes to its root's project thread (C4.4) —
+        # only the root is bound; the child carries parent/root on its task metadata.
+        "parent_task_id": str(_photo_meta.get("parent_task_id") or ""),
+        "root_task_id": str(_photo_meta.get("root_task_id") or ""),
         "image_base64": actual_b64,
         "mime": mime,
         "caption": caption or "",
@@ -1208,9 +1402,14 @@ def _send_video(ctx: ToolContext, file_path: str = "", caption: str = "") -> str
     except Exception as e:
         return f"⚠️ Failed to read video file: {e}"
 
+    _video_meta = getattr(ctx, "task_metadata", {})
+    _video_meta = _video_meta if isinstance(_video_meta, dict) else {}
     ctx.pending_events.append({
         "type": "send_video",
         "chat_id": chat_id, "task_id": str(getattr(ctx, "task_id", "") or ""),  # task_id -> bound-task project-panel routing
+        # Lineage so a SUBAGENT's video routes to its root's project thread (C4.4).
+        "parent_task_id": str(_video_meta.get("parent_task_id") or ""),
+        "root_task_id": str(_video_meta.get("root_task_id") or ""),
         "video_base64": actual_b64,
         "mime": mime,
         "caption": caption or "",
@@ -1222,6 +1421,7 @@ _MAX_SEARCH_RESULTS = 200
 # module SSOT); imported with the historical private names used by call sites.
 from ouroboros.code_search_rg import (  # noqa: E402
     MAX_SEARCH_FILES_SCANNED as _MAX_SEARCH_FILES_SCANNED,
+    _search_wall_clock_sec,
     is_search_skippable as _is_search_skippable,
 )
 
@@ -1244,6 +1444,15 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         root_path = resource_root_path(ctx, normalized, bucket=bucket, skill_name=skill_name)
     except Exception as exc:
         return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
+    if normalized in ("active_workspace", "system_repo"):
+        # Accept absolute/redundant-prefix paths inside the repo root (e.g. '/app/x'
+        # or 'app/x' under a root at /app); confinement stays via safe_relpath below.
+        # ONLY the repo roots: the runtime_data project-store guard above matches the
+        # RAW path (via _normalize_data_read_path, which does not strip a bare
+        # basename), so normalizing a non-repo root here would let
+        # search_code(root='runtime_data', path='<drive_basename>/projects/...') slip
+        # the guard and then search the normalized 'projects/...' store.
+        path = normalize_root_relative(root_path, path)
     display_search_path = _root_display_path(normalized, path)
     try:
         search_root = (
@@ -1255,6 +1464,14 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
         return f"⚠️ SEARCH_ERROR: {type(exc).__name__}: {exc}"
     if not search_root.exists():
         return f"⚠️ SEARCH_ERROR: path not found: {display_search_path}"
+    if normalized != "user_files":
+        # Reject a search ROOT that escapes its resource root (e.g. the requested path is an
+        # in-tree symlink pointing outside — untrusted child project/deliverable trees) BEFORE
+        # any rg/os.walk. Parity with _list_dir + the per-file _path_allowed_for_rg guard.
+        try:
+            search_root.relative_to(root_path.resolve(strict=False))
+        except ValueError:
+            return f"⚠️ SEARCH_ERROR: path escapes root: {display_search_path}"
     protected_root_block = block_reason_for_path(ctx, search_root, "static_introspection")
     if protected_root_block:
         return protected_root_block
@@ -1287,6 +1504,22 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             or _is_search_skippable(fp)
         )
 
+    # Validate a regex query UP FRONT so the invalid-regex contract holds for BOTH the
+    # ripgrep path and the Python fallback. ripgrep accepts some malformed patterns
+    # permissively (e.g. an unterminated '[' yields "no matches" instead of erroring),
+    # so without this the rg path would silently swallow an invalid regex while only the
+    # fallback rejected it. Non-regex queries are matched literally and need no check.
+    # (Checked before the wall-clock budget below: an invalid regex returns immediately,
+    # so there is no point starting the timer for it.)
+    if regex:
+        try:
+            re.compile(query)
+        except re.error as e:
+            return f"⚠️ SEARCH_ERROR: invalid regex: {e}"
+
+    import time as _time
+    _search_t0 = _time.monotonic()  # start the wall-clock budget BEFORE rg, so a
+    # subsequent fallback degradation shares ONE budget (not a fresh 2nd one).
     try:
         from ouroboros.code_search_rg import format_search_result, search_with_rg
 
@@ -1319,7 +1552,22 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
     protected_omitted = 0
     truncated = False
     files_capped = False
-    for dirpath, dirnames, filenames in os.walk(str(search_root)):
+    deadline_hit = False
+    # search_code on a single FILE: os.walk yields nothing for a file path, which
+    # would make the search a silent no-op. Feed the scanner a one-file "walk".
+    if search_root.is_file():
+        _walker = [(str(search_root.parent), [], [search_root.name])]
+    else:
+        _walker = os.walk(str(search_root))
+    # Bound TOTAL (rg attempt + this fallback walk) to one budget, but always grant
+    # the fallback a small floor so an rg that ate the budget still makes some progress.
+    _search_deadline = max(_search_t0 + _search_wall_clock_sec(), _time.monotonic() + 5.0)
+    for dirpath, dirnames, filenames in _walker:
+        # Wall-clock cap: the file-count cap bounds memory but a walk over a very
+        # large root (user_files == / under a bench HOME) can traverse for minutes.
+        if _time.monotonic() > _search_deadline:
+            deadline_hit = True  # ran out of TIME (distinct from the file-count cap)
+            break
         # Prune skipped dirs in-place. For runtime_data, also prune the top-level
         # per-project store (reachable only via the scoped knowledge tools).
         from ouroboros.code_intelligence import SKIP_DIRS
@@ -1355,6 +1603,14 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
             if _is_search_skippable(fp):
                 continue
 
+            # CONFINE to the root before reading (parity with the rg path's _path_allowed_for_rg
+            # and _list_dir): a resolved file escaping the root — e.g. an in-tree symlink in an
+            # untrusted child project/deliverable tree — must never have its target read out.
+            try:
+                fp.resolve(strict=False).relative_to(root_resolved)
+            except (OSError, ValueError):
+                continue
+
             if files_searched >= _MAX_SEARCH_FILES_SCANNED:
                 files_capped = True
                 break
@@ -1375,55 +1631,32 @@ def _code_search(ctx: ToolContext, query: str, path: str = ".",
                         break
             if truncated:
                 break
-        if truncated or files_capped:
+        if truncated or files_capped or deadline_hit:
             break
 
+    # A deadline cutoff means even a "no matches" may be INCOMPLETE (parity with the rg
+    # path's deadline signal) — never let a timed-out fallback read as authoritative empty.
+    deadline_note = (
+        " Search stopped at the time budget before the whole tree was scanned — results "
+        "may be incomplete; narrow the path or glob, or raise OUROBOROS_SEARCH_CODE_WALL_SEC."
+        if deadline_hit else ""
+    )
     if not matches:
         suffix = f" {protected_omitted} protected artifact file(s) omitted." if protected_omitted else ""
         cap_note = f" Scan stopped after {_MAX_SEARCH_FILES_SCANNED} files — narrow the path or glob." if files_capped else ""
-        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{cap_note}"
+        return f"No matches found for {'regex' if regex else 'literal'} `{query}` in {display_search_path} ({files_searched} files searched).{suffix}{cap_note}{deadline_note}"
 
     header = f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} in {display_search_path} ({files_searched} files searched)"
     if files_capped:
         header += f" — scan stopped at {_MAX_SEARCH_FILES_SCANNED} files (narrow the path or glob)"
     if truncated:
         header += f" — truncated at {max_results} results"
+    if deadline_hit:
+        header += " — stopped at the time budget (results may be incomplete)"
     if protected_omitted:
         header += f" — {protected_omitted} protected artifact file(s) omitted"
     return header + "\n\n" + "\n".join(matches)
 
-
-def _codebase_digest(ctx: ToolContext) -> str:
-    """Generate a compact file/symbol digest for the codebase."""
-    from ouroboros.code_intelligence import build_code_inventory, render_codebase_digest
-    from ouroboros.protected_artifacts import block_reason_for_path, protected_artifact_paths
-
-    repo_root = active_repo_dir_for(ctx)
-    protected_paths = protected_artifact_paths(ctx)
-    inventory = build_code_inventory(
-        repo_root,
-        drive_root=pathlib.Path(ctx.drive_root),
-        persist=not is_restricted_subagent_profile(ctx) and not protected_paths,
-        exclude_paths=protected_paths,
-    )
-    if protected_paths:
-        inventory.files = [
-            file for file in inventory.files
-            if not (
-                block_reason_for_path(ctx, repo_root / file.path, "hash")
-                or block_reason_for_path(ctx, repo_root / file.path, "static_introspection")
-            )
-        ]
-        coverage: dict[str, int] = {}
-        for file in inventory.files:
-            coverage[file.disposition] = coverage.get(file.disposition, 0) + 1
-        inventory.coverage = coverage
-    if is_restricted_subagent_profile(ctx):
-        inventory.files = [
-            file for file in inventory.files
-            if not _is_subagent_secret_repo_target(repo_root / file.path, repo_root)
-        ]
-    return render_codebase_digest(inventory)
 
 def _forward_to_worker(ctx: ToolContext, task_id: str, message: str) -> str:
     """Forward a message to a running worker task's mailbox."""
@@ -1466,11 +1699,13 @@ def get_tools() -> List[ToolEntry]:
                 "Read a UTF-8 text file from a declared resource root. "
                 "Default root=active_workspace (the user's workspace or the Ouroboros repo in self-modification tasks). "
                 "Use max_lines (default 2000) and start_line (default 1) to read large files in chunks. "
-                "The result header shows root:path and 'lines X\u2013Y of Z' so you know where and how much you read."
+                "The result header shows root:path and 'lines X\u2013Y of Z' so you know where and how much you read. "
+                "Prefer this over cat/head/sed-as-reader in run_command; to locate code first use query_code "
+                "(symbols/definitions/callers) or search_code (text/regex), then read_file the hit."
             ),
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "default": "active_workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "default": "active_workspace"},
                 "max_lines": {"type": "integer", "default": 2000,
                               "description": "Maximum number of lines to return (default 2000)."},
                 "start_line": {"type": "integer", "default": 1,
@@ -1484,7 +1719,7 @@ def get_tools() -> List[ToolEntry]:
             "description": "List files under a resource root directory.",
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string", "default": "."},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "default": "active_workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "default": "active_workspace"},
                 "max_entries": {"type": "integer", "default": 500},
                 "bucket": {"type": "string", "description": "Required only for root=skill_payload."},
                 "skill_name": {"type": "string", "description": "Required only for root=skill_payload."},
@@ -1498,7 +1733,7 @@ def get_tools() -> List[ToolEntry]:
                 "OK messages show root:path. "
                 "Use mode='append' to write a large file in chunks across multiple calls "
                 "(useful when the full content exceeds a single LLM output budget). "
-                "For root=skill_payload, supply bucket and skill_name."
+                "Set bucket/skill_name ONLY for root=skill_payload (skill authoring); leave empty for normal file edits."
             ),
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
@@ -1508,15 +1743,14 @@ def get_tools() -> List[ToolEntry]:
                 }, "required": ["path", "content"]}},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "default": "active_workspace"},
                 "mode": {"type": "string", "enum": ["overwrite", "append"], "default": "overwrite"},
-                "force": {"type": "boolean", "default": False, "description": "Bypass shrink guard for intentional active_workspace full rewrites."},
+                "force": {"type": "boolean", "default": False, "description": "Bypass the shrink guard for an intentional full rewrite on any root where it applies (active_workspace via the repo guard; runtime_data/task_drive/skill_payload/artifact_store/user_files via the data-plane guard)."},
                 "bucket": {
                     "type": "string",
-                    "enum": ["external", "clawhub", "ouroboroshub"],
-                    "description": "Skill payload bucket. Required for root=skill_payload.",
+                    "description": "Skill payload bucket — set ONLY when root=skill_payload (skill authoring); leave empty for normal file edits.",
                 },
                 "skill_name": {
                     "type": "string",
-                    "description": "Skill slug. Required for root=skill_payload.",
+                    "description": "Skill slug — set ONLY when root=skill_payload; leave empty otherwise.",
                 },
             }, "required": []},
         }, _write_file, is_code_tool=True),
@@ -1525,15 +1759,16 @@ def get_tools() -> List[ToolEntry]:
             "description": (
                 "Replace exactly one occurrence of old_str with new_str in a file. "
                 "Default root=active_workspace. Result messages show root:path. "
-                "For root=skill_payload, supply bucket and skill_name."
+                "Set bucket/skill_name ONLY for root=skill_payload (skill authoring); leave empty for normal edits."
             ),
             "parameters": {"type": "object", "properties": {
                 "path": {"type": "string"},
                 "old_str": {"type": "string"},
                 "new_str": {"type": "string"},
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "default": "active_workspace"},
-                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub"]},
-                "skill_name": {"type": "string"},
+                "bucket": {"type": "string", "description": "Skill payload bucket — set ONLY when root=skill_payload; leave empty otherwise."},
+                "skill_name": {"type": "string", "description": "Skill slug — set ONLY when root=skill_payload; leave empty otherwise."},
+                "force": {"type": "boolean", "default": False, "description": "Bypass the shrink guard for a deliberate large data-plane deletion (>30% smaller)."},
             }, "required": ["path", "old_str", "new_str"]},
         }, _edit_text, is_code_tool=True),
         ToolEntry("send_photo", {
@@ -1565,12 +1800,14 @@ def get_tools() -> List[ToolEntry]:
                 "Literal search by default; set regex=True for regular expressions. "
                 "Scoped to path (default: entire active workspace). "
                 "Skips binaries, caches, vendor dirs, and files >1MB. "
-                "Returns up to max_results matches (default 200) with root:file:line context."
+                "Returns up to max_results matches (default 200) with root:file:line context. "
+                "Use this for plain-text/regex matches (prefer it over grep/find-as-search in run_command); "
+                "for symbol-aware lookups (definitions, callers, references, impact) prefer query_code."
             ),
             "parameters": {"type": "object", "properties": {
                 "query": {"type": "string", "description": "Search pattern (literal or regex)"},
                 "path": {"type": "string", "default": ".", "description": "Subdirectory to search (relative to repo root)"},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files"], "default": "active_workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "skill_payload", "artifact_store", "user_files", "subagent_projects", "deliverables"], "default": "active_workspace"},
                 "bucket": {"type": "string", "description": "Required only for root=skill_payload."},
                 "skill_name": {"type": "string", "description": "Required only for root=skill_payload."},
                 "regex": {"type": "boolean", "default": False, "description": "Treat query as a regular expression"},
@@ -1578,11 +1815,6 @@ def get_tools() -> List[ToolEntry]:
                 "include": {"type": "string", "default": "", "description": "Filter by glob pattern (e.g. '*.py')"},
             }, "required": ["query"]},
         }, _code_search),
-        ToolEntry("codebase_digest", {
-            "name": "codebase_digest",
-            "description": "Get a compact digest of the entire codebase: files, sizes, classes, functions. One call instead of many read_file calls.",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        }, _codebase_digest),
         ToolEntry("forward_to_worker", {
             "name": "forward_to_worker",
             "description": (

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List
 
 from ouroboros.pricing import estimate_cost
@@ -241,30 +242,51 @@ def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
         raise RuntimeError(f"Anthropic web search failed ({type(exc).__name__}): {detail}") from exc
 
 
-def _web_search_ddgs(query: str) -> str:
-    try:
-        from ddgs import DDGS
+def _web_search_ddgs(query: str, *, _max_attempts: int = 3) -> str:
+    # ddgs is an unofficial scraper with no SLA: it raises a RatelimitException
+    # under sustained load. Retry a few times with backoff on transient rate-limit/
+    # timeout errors so a full benchmark run (many sequential searches) survives.
+    last_exc: Exception | None = None
+    for attempt in range(max(1, _max_attempts)):
+        try:
+            from ddgs import DDGS
 
-        with DDGS() as ddgs_client:
-            results = list(ddgs_client.text(query, max_results=10))
-        sources = [{
-            "url": sanitize_tool_result_for_log(str(item.get("href") or item.get("url") or "")),
-            "title": sanitize_tool_result_for_log(str(item.get("title") or "")),
-            "snippet": sanitize_tool_result_for_log(str(item.get("body") or item.get("snippet") or "")),
-        } for item in results]
-        answer = "\n".join(
-            f"- {item['title']}: {item['snippet']} ({item['url']})"
-            for item in sources
-            if item["url"] or item["snippet"]
-        )
-        return json.dumps({
-            "answer": answer or "(no answer)",
-            "sources": sources,
-            "backend": "ddgs",
-        }, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        detail = sanitize_tool_result_for_log(str(exc))[:500]
-        raise RuntimeError(f"DDGS web search failed ({type(exc).__name__}): {detail}") from exc
+            with DDGS() as ddgs_client:
+                results = list(ddgs_client.text(query, max_results=10))
+            sources = [{
+                "url": sanitize_tool_result_for_log(str(item.get("href") or item.get("url") or "")),
+                "title": sanitize_tool_result_for_log(str(item.get("title") or "")),
+                "snippet": sanitize_tool_result_for_log(str(item.get("body") or item.get("snippet") or "")),
+            } for item in results]
+            answer = "\n".join(
+                f"- {item['title']}: {item['snippet']} ({item['url']})"
+                for item in sources
+                if item["url"] or item["snippet"]
+            )
+            return json.dumps({
+                "answer": answer or "(no answer)",
+                "sources": sources,
+                "backend": "ddgs",
+            }, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            last_exc = exc
+            name = type(exc).__name__.casefold()
+            msg = str(exc).casefold()
+            transient = ("ratelimit" in name or "ratelimit" in msg or "429" in msg
+                         or "202" in msg or "timeout" in name)
+            if transient and attempt + 1 < _max_attempts:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
+    detail = sanitize_tool_result_for_log(str(last_exc))[:500]
+    raise RuntimeError(f"DDGS web search failed ({type(last_exc).__name__}): {detail}") from last_exc
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    """Heuristic-free timeout classifier: real timeout exception types only."""
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timeout" in type(exc).__name__.casefold()
 
 
 def _web_search(
@@ -273,9 +295,40 @@ def _web_search(
     model: str = "",
     search_context_size: str = "",
     reasoning_effort: str = "",
+    _attempt: int = 0,
 ) -> str:
+    # Backend pin: force ONE backend regardless of which provider keys are present.
+    # A fixed-model run pins 'ddgs' so web_search is pure-retrieval (no second LLM
+    # contaminating the "single fixed model" claim). 'openai' pins the OpenAI leg only
+    # (no cascade — see _fallbacks). 'auto'/'' keep the default OpenAI-first cascade
+    # below. This is a config gate on TRANSPORT, not on agent behaviour (P5-safe).
+    pinned = (os.environ.get("OUROBOROS_WEBSEARCH_BACKEND") or "").strip().lower()
+    if pinned in ("ddgs", "openrouter", "anthropic"):
+        try:
+            if pinned == "ddgs":
+                return _web_search_ddgs(query)
+            if pinned == "openrouter":
+                return _web_search_openrouter(ctx, query, model=model, search_context_size=search_context_size)
+            return _web_search_anthropic(ctx, query, model=model)
+        except Exception as exc:
+            detail = sanitize_tool_result_for_log(str(exc))[:500]
+            return json.dumps(
+                {"error": f"pinned web_search backend '{pinned}' failed: {detail}", "backend": pinned},
+                ensure_ascii=False, indent=2,
+            )
+
     def _fallbacks(previous_errors: list[str] | None = None) -> str:
         errors = list(previous_errors or [])
+        if pinned == "openai":
+            # 'openai' is a TRUE pin: hard-fail rather than cascading to other backends,
+            # so a fixed/repro run cannot silently fall back to a different transport.
+            detail = "; ".join(errors) if errors else (
+                "no official OPENAI_API_KEY (without OPENAI_BASE_URL) configured"
+            )
+            return json.dumps(
+                {"error": f"pinned web_search backend 'openai' unavailable: {detail}", "backend": "openai"},
+                ensure_ascii=False, indent=2,
+            )
         for backend in (
             lambda: _web_search_openrouter(ctx, query, model=model, search_context_size=search_context_size),
             lambda: _web_search_anthropic(ctx, query, model=model),
@@ -409,6 +462,14 @@ def _web_search(
         return json.dumps({"answer": text or "(no answer)", "sources": sources, "backend": "openai_responses"}, ensure_ascii=False, indent=2)
     except Exception as e:
         detail = sanitize_tool_result_for_log(str(e))[:500]
+        # One retry on a genuine timeout before cascading: web search timeouts are
+        # frequently transient, and the provider cascade is slower/less precise.
+        if _attempt == 0 and _is_timeout_error(e):
+            log.debug("web_search OpenAI timeout; retrying once")
+            return _web_search(
+                ctx, query, model=model, search_context_size=search_context_size,
+                reasoning_effort=reasoning_effort, _attempt=1,
+            )
         return _fallbacks([f"OpenAI web search failed ({type(e).__name__}): {detail}"])
 
 
@@ -424,10 +485,13 @@ def get_tools() -> List[ToolEntry]:
                 "Anthropic server tool, optional ddgs. "
                 f"Defaults: model={DEFAULT_SEARCH_MODEL}, search_context_size={DEFAULT_SEARCH_CONTEXT_SIZE}, "
                 f"reasoning_effort={DEFAULT_REASONING_EFFORT}. "
-                "Override any parameter per-call if needed (LLM-first: you decide)."
+                "Override any parameter per-call if needed (LLM-first: you decide). "
+                "For a COMPOUND question (several distinct facts/entities/time ranges in one ask), "
+                "issue one focused web_search per sub-question instead of one broad query — "
+                "narrow queries return sharper sources. These read-only searches run in parallel."
             ),
             "parameters": {"type": "object", "properties": {
-                "query": {"type": "string", "description": "Search query"},
+                "query": {"type": "string", "description": "A single focused search query (split compound asks into separate calls)."},
                 "model": {"type": "string", "description": f"OpenAI model (default: {DEFAULT_SEARCH_MODEL})"},
                 "search_context_size": {"type": "string", "enum": ["low", "medium", "high"],
                                         "description": f"How much context to fetch (default: {DEFAULT_SEARCH_CONTEXT_SIZE})"},

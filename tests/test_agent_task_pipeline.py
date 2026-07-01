@@ -9,9 +9,9 @@ def test_task_summary_prefers_direct_model_when_openrouter_missing(tmp_path, mon
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
     monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "openai::gpt-5.5-mini")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACK", "openai::gpt-5.5-mini")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "openai::gpt-5.5-mini")
     monkeypatch.setenv("OUROBOROS_MODEL", "openai::gpt-5.5")
-    monkeypatch.setenv("OUROBOROS_MODEL_CODE", "openai::gpt-5.5")
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "openai::gpt-5.5")
 
     captured = {}
 
@@ -89,9 +89,9 @@ def test_task_summary_accepts_openai_compatible_when_legacy_base_url_is_present(
     monkeypatch.setenv("OPENAI_API_KEY", "legacy-openai-key")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://example.invalid/v1")
     monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "anthropic/claude-opus-4.6")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACK", "openai-compatible::custom-model")
+    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "openai-compatible::custom-model")
     monkeypatch.setenv("OUROBOROS_MODEL", "anthropic/claude-opus-4.6")
-    monkeypatch.setenv("OUROBOROS_MODEL_CODE", "anthropic/claude-opus-4.6")
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "anthropic/claude-opus-4.6")
 
     assert (
         pipeline._resolve_task_summary_model("anthropic/claude-sonnet-4.6")
@@ -153,6 +153,41 @@ def test_emit_task_results_queues_restart_after_final_events(tmp_path, monkeypat
     )
     assert [evt["type"] for evt in pending_events] == ["send_message", "task_metrics", "task_done"]
     assert memory_calls == []
+
+
+def test_emit_task_results_ephemeral_turn_skips_all_durable_memory(tmp_path, monkeypatch):
+    """WS10 idempotency contract (claudexor B5): an ephemeral same-route turn must
+    write NO durable memory — not chat/scratchpad consolidation, not reflection/
+    evolution — while still delivering its reply."""
+    store_calls = []
+    monkeypatch.setattr(pipeline, "_store_task_result", lambda *args, **kwargs: store_calls.append(1))
+    memory_calls = []
+    monkeypatch.setattr(pipeline, "_run_chat_consolidation", lambda *args, **kwargs: memory_calls.append("chat"))
+    monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *args, **kwargs: memory_calls.append("scratchpad"))
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *args, **kwargs: memory_calls.append("post_task"))
+
+    pending_events = []
+    drive_logs = tmp_path / "logs2"
+    drive_logs.mkdir(parents=True)
+    pipeline.emit_task_results(
+        env=SimpleNamespace(drive_root=tmp_path),
+        memory=object(),
+        llm=object(),
+        pending_events=pending_events,
+        task={"id": "eph-1", "type": "task", "chat_id": 1, "text": "2+2?", "_is_direct_chat": True, "_ephemeral_turn": True},
+        text="4",
+        usage={"rounds": 1, "cost": 0.01},
+        llm_trace={"tool_calls": [], "reasoning_notes": []},
+        start_time=0.0,
+        drive_logs=drive_logs,
+        ctx=SimpleNamespace(pending_restart_reason=""),
+    )
+    assert "send_message" in [evt["type"] for evt in pending_events]  # reply still delivered
+    assert memory_calls == []  # NO durable memory writes for an ephemeral turn
+    assert store_calls == []  # CW3: no durable task_result for a transient decision turn
+    # CW3: task_done carries _ephemeral so the supervisor handler skips the missing-result fallback.
+    done = next(evt for evt in pending_events if evt["type"] == "task_done")
+    assert done.get("_ephemeral") is True
 
 
 def test_project_scoped_post_task_processing_feeds_global_backlog_but_project_memory(tmp_path, monkeypatch):
@@ -509,6 +544,7 @@ def test_store_task_result_allows_recovered_tool_failure_success(tmp_path):
                     "result": "OK: wrote user_files:Desktop/report.html\nARTIFACT_OUTPUTS: registered user file -> artifact_store:report.html",
                     "is_error": False,
                     "status": "ok",
+                    "artifact_registered": True,
                 },
             ],
             "reasoning_notes": [],
@@ -730,3 +766,46 @@ def test_truncate_with_notice_uses_utils_ssot():
 
     # Handles None gracefully
     assert pipeline._truncate_with_notice(None, 10) == ""
+
+
+def test_emit_task_results_surfaces_receipt_absent_flag_in_event_stream(tmp_path, monkeypatch):
+    # Regression: the receipt_absent / expected_output_ungrounded objective-axis flag must reach
+    # the task_eval (events.jsonl) and task_metrics (pending_events) monitoring streams — where the
+    # day-1 kill-switch metric reads it — not only the stored task_result.json. Previously the flag
+    # was applied inside _store_task_result, AFTER the events were already emitted from an un-flagged
+    # outcome, so the event stream never saw it.
+    captured = {}
+    monkeypatch.setattr(pipeline, "_store_task_result", lambda *a, **k: captured.update(k))
+    monkeypatch.setattr(pipeline, "_run_chat_consolidation", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *a, **k: None)
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *a, **k: None)
+
+    pending_events = []
+    env = SimpleNamespace(drive_root=tmp_path)
+    drive_logs = tmp_path / "logs"
+    drive_logs.mkdir(parents=True)
+
+    # reviewable effects (commit_reviewed) + empty receipt store -> receipt_absent
+    pipeline.emit_task_results(
+        env=env, memory=object(), llm=object(),
+        pending_events=pending_events,
+        task={"id": "flagme", "type": "task", "chat_id": 1, "text": "do it"},
+        text="All done",
+        usage={"rounds": 2, "cost": 0.2},
+        llm_trace={"tool_calls": [{"tool": "commit_reviewed", "status": "ok"}], "reasoning_notes": []},
+        start_time=0.0,
+        drive_logs=drive_logs,
+        ctx=SimpleNamespace(pending_restart_reason=""),
+    )
+
+    # task_metrics event (pending_events) carries the flag
+    metrics = next(e for e in pending_events if e["type"] == "task_metrics")
+    assert metrics["outcome_axes"]["objective"].get("warning") == "receipt_absent"
+
+    # task_eval event (events.jsonl) carries the flag
+    events = [json.loads(line) for line in (drive_logs / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    task_eval = next(e for e in events if e.get("type") == "task_eval")
+    assert task_eval["outcome_axes"]["objective"].get("warning") == "receipt_absent"
+
+    # single source: the SAME flagged loop_outcome is threaded to _store_task_result (not re-derived)
+    assert captured["loop_outcome"]["outcome_axes"]["objective"].get("warning") == "receipt_absent"

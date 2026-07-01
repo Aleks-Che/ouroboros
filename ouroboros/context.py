@@ -50,31 +50,106 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     if metadata.get("force_plan"):
         source = str(metadata.get("force_plan_source") or "operator").strip() or "operator"
         plan_notice = (
-            "[CONSILIUM_FORCE_PLAN]\n"
+            "[SWARM_INITIATIVE]\n"
             f"Source: {source}.\n"
-            "Before answering or editing, call plan_task with an explicit context_level "
-            "appropriate to this task. Treat this as a planning requirement for this "
-            "task, not as user-authored content.\n"
-            "[/CONSILIUM_FORCE_PLAN]\n\n"
+            "First call plan_task with an explicit context_level appropriate to this task to think "
+            "deeply about the approach. THEN, when the work decomposes into parts that can progress "
+            "in parallel, fan out subagents with schedule_subagent (acting/mutative where the work "
+            "needs changes and the owner toggle permits it) within the configured child/worker caps, "
+            "and reconcile their results; publish the shared frame to the task-tree ledger first if "
+            "their outputs must integrate. If the task is genuinely atomic, a deep plan alone is fine. "
+            "Treat this as a planning+delegation initiative for this task, not as user-authored content.\n"
+            "[/SWARM_INITIATIVE]\n\n"
         )
         text = plan_notice + str(text or "")
     image_b64 = task.get("image_base64")
+    attachment_image_blocks = _build_attachment_image_blocks(task)
 
-    if not image_b64:
+    if not image_b64 and not attachment_image_blocks:
         return text or "(empty message)"
 
-    image_caption = task.get("image_caption", "")
-    combined_text = "\n".join(part for part in (image_caption, text if text != image_caption else "") if part) or "Analyze the screenshot"
-    return [
-        {"type": "text", "text": combined_text},
-        {
+    if image_b64:
+        # Backward-compat: the legacy single-image path (screenshots, desktop chat
+        # before staging) still folds its caption into the lead text block.
+        image_caption = task.get("image_caption", "")
+        combined_text = "\n".join(part for part in (image_caption, text if text != image_caption else "") if part) or "Analyze the screenshot"
+        content: List[Dict[str, Any]] = [
+            {"type": "text", "text": combined_text},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{task.get('image_mime', 'image/jpeg')};base64,{image_b64}"},
+                # Eviction metadata (stripped before provider calls): the K-newest
+                # image policy replaces older blocks with this caption.
+                "_caption": str(image_caption or "")[:200],
+            },
+        ]
+    else:
+        content = [{"type": "text", "text": text or "(empty message)"}]
+    content.extend(attachment_image_blocks)
+    return content
+
+
+def _build_attachment_image_blocks(task: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Native image blocks for staged attachment images (v6.52.0, P1).
+
+    Each entry in ``task['attachment_images']`` is a staged manifest record
+    ({root, relpath, mime, is_image, label}); resolve its relpath under the task
+    artifact store, base64-encode it, and emit a text+image_url pair in the SAME
+    shape ``_view_image`` uses. At most MAX_LIVE_IMAGE_BLOCKS images are injected
+    live; the rest stay manifest-readable via read_file(root='artifact_store', ...).
+    Never raises — a per-file error skips just that image."""
+    entries = task.get("attachment_images")
+    if not isinstance(entries, list) or not entries:
+        return []
+    drive_root = task.get("drive_root")
+    task_id = task.get("id")
+    if not drive_root or not task_id:
+        return []
+    import base64 as _b64
+
+    from ouroboros.artifacts import task_artifact_dir_path
+    from ouroboros.context_budget import MAX_LIVE_IMAGE_BLOCKS
+
+    try:
+        artifact_dir = task_artifact_dir_path(drive_root, str(task_id), create=False)
+    except Exception:
+        log.debug("attachment image blocks: bad task artifact dir", exc_info=True)
+        return []
+    blocks: List[Dict[str, Any]] = []
+    injected = 0
+    for entry in entries:
+        if injected >= MAX_LIVE_IMAGE_BLOCKS:
+            break  # remaining images stay manifest-readable, not amputated
+        if not isinstance(entry, dict) or not entry.get("is_image"):
+            continue
+        relpath = str(entry.get("relpath") or "").strip()
+        if not relpath:
+            continue
+        try:
+            img_path = (artifact_dir / relpath).resolve(strict=False)
+            if not img_path.is_file():
+                continue
+            # Skip NATIVE injection of an oversized image so a large attachment can't blow the
+            # context / provider request with a huge data URL (parity with ws._MAX_NATIVE_IMAGE_BYTES
+            # = 8 MB). It stays manifest-readable via read_file / view_image (which downscales).
+            if img_path.stat().st_size > 8 * 1024 * 1024:
+                continue
+            mime = str(entry.get("mime") or "image/png").strip() or "image/png"
+            b64 = _b64.b64encode(img_path.read_bytes()).decode("ascii")
+        except Exception:
+            log.debug("attachment image blocks: skipped %s on error", relpath, exc_info=True)
+            continue
+        label = str(entry.get("label") or img_path.name).strip() or img_path.name
+        caption = f"[image: {label}]"
+        blocks.append({"type": "text", "text": caption})
+        blocks.append({
             "type": "image_url",
-            "image_url": {"url": f"data:{task.get('image_mime', 'image/jpeg')};base64,{image_b64}"},
-            # Eviction metadata (stripped before provider calls): the K-newest
-            # image policy replaces older blocks with this caption.
-            "_caption": str(image_caption or "")[:200],
-        },
-    ]
+            "image_url": {"url": f"data:{mime};base64,{b64}"},
+            "_caption": caption,
+            "_source_path": str(img_path),
+        })
+        injected += 1
+    return blocks
 
 
 def _task_requires_development_context(task: Dict[str, Any]) -> bool:
@@ -165,7 +240,7 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     return out
 
 
-def build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
+def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
     except Exception:
@@ -214,6 +289,12 @@ def build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
     }
     if isinstance(task.get("task_contract"), dict):
         runtime_data["task_contract"] = task.get("task_contract")
+    runtime_data["operational_reality_rule"] = (
+        "This live runtime context is authoritative over stale paths, tool lists, "
+        "or capability assumptions embedded in the task text. Use the visible "
+        "task_contract, [ATTACHMENTS], disabled_tools, filesystem roots, and queue "
+        "capacity here when they conflict with older prompt wording."
+    )
     if str(task.get("workspace_root") or "").strip():
         runtime_data["active_workspace"] = {
             "workspace_root": str(task.get("workspace_root") or ""),
@@ -232,13 +313,122 @@ def build_runtime_section(env: Any, task: Dict[str, Any]) -> str:
             "skill_payload only for explicit scoped skill-payload work/repair, not generic "
             "artifact transport; do not use runtime_data/uploads as artifact transport"
         )
+    # Capability SSOT (honesty): surface the SAME live gate the runtime enforces so
+    # the agent reasons FORWARD from real state instead of backward from a half-remembered
+    # rule. Structural facts only — the model still chooses by judgment (BIBLE P5); this is
+    # not a string gate, it is the truth the gate is derived from.
+    try:
+        from ouroboros.config import get_allow_mutative_subagents
+        from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
+
+        runtime_data["capabilities"] = {
+            "allow_mutative_subagents": bool(get_allow_mutative_subagents()),
+            "write_surfaces": sorted(VALID_WRITE_SURFACES),
+            "web_search_backend": os.environ.get("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
+            "main_web_search": {
+                "mode": os.environ.get("OUROBOROS_MAIN_WEB_SEARCH", "off"),
+                "engine": os.environ.get("OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "auto"),
+            },
+            "note": (
+                "allow_mutative_subagents is the MASTER gate (the owner toggle overrides the "
+                "runtime-mode default; runtime mode only sets the default when the toggle is "
+                "empty). light blocks ONLY Ouroboros self-repo/control-plane mutation "
+                "(write_surface=self_worktree), NOT user/task/project deliverables: acting "
+                "subagents with write_surface=external_workspace or genesis remain valid in "
+                "light. Read THIS value before declaring you cannot spawn acting subagents."
+            ),
+        }
+        if ctx is not None:
+            from ouroboros.tool_access import filesystem_affordance_map
+
+            runtime_data["capabilities"]["filesystem"] = filesystem_affordance_map(
+                ctx,
+                runtime_mode=str(runtime_mode or ""),
+            )
+    except Exception:
+        log.debug("Failed to build capability digest for context", exc_info=True)
+    # Live worker/queue load (honesty): derive resource facts from the real snapshot,
+    # never guess "starved"/"saturated".
+    try:
+        from ouroboros.config import DATA_DIR, get_max_active_subagents_per_root, get_max_workers
+        from ouroboros.task_status import _load_queue_snapshot
+
+        # The supervisor persists the snapshot at the canonical data root, NOT a forked
+        # child drive — so read it from budget_drive_root (the main root for a subagent)
+        # or DATA_DIR. Reading env.drive_root would leave subagents (the actors most likely
+        # to mis-reason about "starved" siblings) with no live-queue honesty signal.
+        _snap_root = str(task.get("budget_drive_root") or "").strip() or str(DATA_DIR)
+        _snap = _load_queue_snapshot(_snap_root)
+        if not (_snap.get("_snapshot_missing") or _snap.get("_snapshot_invalid")):
+            _running = [r for r in (_snap.get("running") or []) if isinstance(r, dict)]
+            _pending = [r for r in (_snap.get("pending") or []) if isinstance(r, dict)]
+            _maxw = int(get_max_workers())
+            _reaping = int(_snap.get("reaping_count") or 0)
+            # Prefer the ACTUAL assignable-idle worker count persisted from the live pool
+            # (the real pool can be smaller than the configured max, and a mid-reap slot is
+            # unavailable); fall back to a derived estimate for older snapshots.
+            _assignable = _snap.get("assignable_idle_workers")
+            if _assignable is not None:
+                _free = max(0, int(_assignable))
+            else:
+                _free = max(0, _maxw - len(_running) - _reaping)
+            runtime_data["queue"] = {
+                "running_count": len(_running),
+                "pending_count": len(_pending),
+                "reaping_count": _reaping,
+                "max_workers": _maxw,
+                "worker_total": int(_snap.get("worker_total") or _maxw),
+                "free_worker_slots": _free,
+                "max_active_subagents_per_root": int(get_max_active_subagents_per_root()),
+                "note": (
+                    "live worker/queue load. Read THIS before claiming children are 'starved' "
+                    "or the queue is 'saturated' — derive resource facts from here, not guesses."
+                ),
+            }
+    except Exception:
+        log.debug("Failed to build queue digest for context", exc_info=True)
     if budget_info:
         runtime_data["budget"] = budget_info
     schedule_digest = _scheduled_tasks_digest(env)
     if schedule_digest:
         runtime_data["scheduled_tasks"] = schedule_digest
+    # WS1: surface the tasks already RUNNING in this chat so a busy-chat decision
+    # turn can steer_task the right one instead of spawning a duplicate. Structural
+    # fact only — the agent chooses the target by judgment (BIBLE P5), code never
+    # auto-routes. (Also gives a project-room message its "you are in project X"
+    # default scene, closing the re-ask case.)
+    _meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
+    if _current_chat and _current_chat.get("running_tasks"):
+        runtime_data["current_chat"] = _current_chat
+        runtime_data["current_chat_rule"] = (
+            "running_tasks are tasks already running in THIS chat. If a new message continues or "
+            "redirects one of them, steer_task(task_id, message) it rather than spawning a duplicate; "
+            "your judgment picks the target (or none -> answer inline / promote_chat_to_task). A "
+            "message in a project room defaults to that project unless it clearly says otherwise."
+        )
     runtime_ctx = json.dumps(runtime_data, ensure_ascii=False, indent=2)
-    return "## Runtime context\n\n" + runtime_ctx
+    out = "## Runtime context\n\n" + runtime_ctx
+    # Shared task-tree coordination ledger (swarm blackboard): inject the tail so EVERY
+    # member of the tree reads the shared frame / sibling beacons forward, instead of
+    # re-deriving or duplicating work (domain-agnostic; tree_note/tree_read).
+    try:
+        from ouroboros.task_tree_ledger import tree_ledger_tail_digest
+
+        _root_id = str(task.get("root_task_id") or task.get("id") or "")
+        _tree_digest = tree_ledger_tail_digest(_root_id, limit=40) if _root_id else ""
+        if _tree_digest:
+            out += (
+                "\n\n## Task-tree coordination ledger (shared swarm blackboard)\n\n"
+                "Shared across this task tree via tree_note/tree_read. Before fanning out "
+                "INTERDEPENDENT children, publish the shared frame (contract/decision/fact); "
+                "children build against it and raise blocker/question/interface_contract beacons "
+                "for attention (interface_contract when the shared seam/contract must change).\n\n"
+                + _tree_digest
+            )
+    except Exception:
+        log.debug("Failed to inject task-tree ledger digest", exc_info=True)
+    return out
 
 
 def build_knowledge_sections(
@@ -907,12 +1097,46 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
     return "\n".join(lines)
 
 
+def effective_context_mode(task: Dict[str, Any]) -> str:
+    """CW2 (v6.34.0): the context mode actually USABLE for THIS turn's reference-doc
+    layout — the owner OUROBOROS_CONTEXT_MODE, downgraded to 'low' at point-of-use when
+    max is selected but the active route does not carry confirmed >=1M Capability
+    Evidence (read-only, no network). Without this, the FIRST context build laid out the
+    full max-mode reference docs before loop.py's later per-round gate could fail closed,
+    so an unconfirmed/sub-1M route could still be sent a max-mode horizon (BIBLE P1).
+
+    H (v6.39): this EARLY gate (it runs at context assembly, before run_llm_loop) now
+    also drives the LAZY probe-on-first-use for a root/non-subagent task, so a genuine
+    >=1M route is confirmed BEFORE the first prompt is laid out — not just by the loop's
+    later gate. Single-flight: only the root task fetches (subagents stay read-only and
+    share the parent's warm global Capability-Evidence store); the loop's later call
+    then hits the TTL cache with no second fetch. Still fail-closed on any error."""
+    mode = get_context_mode()
+    if mode != "max":
+        return mode
+    try:
+        model = str(task.get("model") or "").strip()
+        if task.get("use_local_model") is not None:
+            use_local = bool(task.get("use_local_model"))
+        else:
+            use_local = os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1")
+        _meta = task.get("task_metadata") if isinstance(task.get("task_metadata"), dict) else {}
+        is_subagent = str(
+            task.get("delegation_role") or _meta.get("delegation_role") or ""
+        ).strip().lower() == "subagent"
+        from ouroboros.loop import _maybe_downgrade_max_unconfirmed  # lazy: loop imports context
+        return _maybe_downgrade_max_unconfirmed(mode, use_local, model, allow_fetch=not is_subagent)
+    except Exception:
+        return "low"  # fail-closed (BIBLE P1)
+
+
 def build_llm_messages(
     env: Any,
     memory: Memory,
     task: Dict[str, Any],
     review_context_builder: Optional[Any] = None,
     soft_cap_tokens: int = CONTEXT_SOFT_CAP_TOKENS,
+    ctx: Any = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     base_prompt = safe_read(
         env.repo_path("prompts/SYSTEM.md"),
@@ -927,7 +1151,7 @@ def build_llm_messages(
     # owned by context_layout per the low/max doc matrix. SYSTEM + BIBLE are
     # tier-0 and always full.
     static_parts = [base_prompt, "## BIBLE.md\n\n" + bible_md]
-    context_mode = get_context_mode()
+    context_mode = effective_context_mode(task)  # CW2: gate max on the active route's confirmed >=1M
     docs_context_mode = context_mode
     docs_need_development = _task_requires_development_context(task)
     if _task_uses_external_context(task) and not _task_requires_self_body_docs(task):
@@ -987,7 +1211,7 @@ def build_llm_messages(
         dynamic_parts.append(installed_skills)
     dynamic_parts.extend([
         "## Drive state\n\n" + state_json,
-        build_runtime_section(env, task),
+        build_runtime_section(env, task, ctx=ctx),
         (
             "## Task Contract Discipline\n\n"
             "For non-trivial work, state your success criteria early in your plan or reasoning, "

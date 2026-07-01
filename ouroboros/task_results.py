@@ -96,19 +96,28 @@ def validate_task_id(task_id: Any) -> str:
     return text
 
 
-def task_results_dir(drive_root: Any) -> pathlib.Path:
+def task_results_dir(drive_root: Any, *, create: bool = True) -> pathlib.Path:
+    """Resolve ``<drive_root>/task_results``.
+
+    ``create`` controls the mkdir side effect: WRITE callers leave it True so the
+    directory exists before the write; READ/LIST callers pass ``create=False`` so a
+    scan of a never-provisioned (or stubbed) root returns nothing instead of
+    MATERIALISING the directory. The latter previously let an unguarded scan with a
+    MagicMock-derived root create a stray ``MagicMock/.../task_results`` tree in cwd.
+    """
     path = pathlib.Path(drive_root) / "task_results"
-    path.mkdir(parents=True, exist_ok=True)
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def task_result_path(drive_root: Any, task_id: str) -> pathlib.Path:
-    return task_results_dir(drive_root) / f"{validate_task_id(task_id)}.json"
+def task_result_path(drive_root: Any, task_id: str, *, create: bool = True) -> pathlib.Path:
+    return task_results_dir(drive_root, create=create) / f"{validate_task_id(task_id)}.json"
 
 
 def load_task_result(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
     try:
-        path = task_result_path(drive_root, task_id)
+        path = task_result_path(drive_root, task_id, create=False)
     except ValueError:
         return None
     return read_json_dict(path)
@@ -121,7 +130,7 @@ def list_task_results(
 ) -> List[Dict[str, Any]]:
     wanted = {str(item) for item in list(statuses or []) if str(item).strip()}
     results: List[Dict[str, Any]] = []
-    for path in sorted(task_results_dir(drive_root).glob("*.json")):
+    for path in sorted(task_results_dir(drive_root, create=False).glob("*.json")):
         data = read_json_dict(path)
         if data is None:
             continue
@@ -181,3 +190,29 @@ def write_task_result(
             return existing
         atomic_write_json(path, merged)
         return merged
+
+
+def fail_tasks(results_drive_root: Any, tasks: Any, *, reason_code: str, result: str) -> int:
+    """Terminally FAIL a batch of queued tasks (e.g. on budget exhaustion) so their
+    waiters get an observable result instead of hanging. Returns the count written."""
+    written = 0
+    for task in tasks or []:
+        tid = str((task or {}).get("id") or "")
+        if not tid:
+            continue
+        # Write to the task's CANONICAL status root: forked/workspace/subagent children
+        # use budget_drive_root, so the waiter reading THAT root sees the result (a child
+        # outside results_drive_root would otherwise keep hanging — the bug this fixes).
+        root = (task or {}).get("budget_drive_root") or results_drive_root
+        try:
+            # Honor a pending cancel request: terminalize as CANCELLED (the right reason),
+            # not as budget_exhausted — the budget drain must not relabel a cancellation.
+            existing = load_task_result(root, tid) or {}
+            if str(existing.get("status") or "") == STATUS_CANCEL_REQUESTED:
+                write_task_result(root, tid, STATUS_CANCELLED, result="Cancelled before start.")
+            else:
+                write_task_result(root, tid, STATUS_FAILED, reason_code=reason_code, result=result)
+            written += 1
+        except Exception:
+            log.debug("fail_tasks: could not fail %s", tid, exc_info=True)
+    return written

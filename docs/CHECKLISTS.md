@@ -119,6 +119,7 @@ or Intent/Scope checklists are.
 | 15 | Changing `supervisor/git_ops.py`, `launcher.py`, `server.py`, `ouroboros/tools/review_helpers.py`, `ouroboros/tools/git.py`, tests, or evolution scheduling/checkpoint code? | Prove two invariants before review spend: (1) pytest/preflight cannot mutate the live repo or live `data/` (`OUROBOROS_DATA_DIR` / `OUROBOROS_SETTINGS_PATH` must be isolated, and `OUROBOROS_MANAGED_BY_LAUNCHER` must not leak into test subprocesses); (2) autonomous restart/reset cannot erase active evolution work — it must either land a reviewed local commit or preserve a rescue/transaction recovery pointer and pause/stop the campaign. |
 | 16 | Changing `devtools/benchmarks/`? | Confirm it preserves official benchmark boundaries: no replacement scoring, no benchmark-specific prompt/routing hacks, no generated benchmark outputs under `repo/`, no secrets printed or committed, and no runtime-core imports from `devtools/`. Touched `devtools` files are reviewable executable operator code, even though unrelated `devtools` files use Atlas `excluded_dir` coverage-manifest entries and stay compact in broad packs. |
 | 17 | Diff spawns OS processes (`subprocess.Popen` / `mp.Process` without a bounded wait)? | Route it through `ouroboros.process_custody.spawn_supervised` (or `record_process` write-through) with an explicit `scope` (`task`/`session`/`daemon`) so the orphan reaper can find it; `tests/test_process_custody.py` enforces the allowlist. |
+| 18 | New/changed **test** spawns a real OS process, binds a real port, or mutates a module-level global/registry? | CI runs the suite under `pytest -n auto` (parallel). Mark such a test `@pytest.mark.serial` (or add its file to `_SERIAL_TEST_FILES` in `tests/conftest.py`) — otherwise it flakes on kill/port-reclaim timing, or crashes a worker and fails that worker's whole co-located batch as spurious failures in unrelated files. Every other test must stay parallel-safe: `tmp_path` (not fixed `/tmp/...` paths), `monkeypatch.setenv`/`setattr` (not bare `os.environ[...] =`), no execution-order assumptions, reset any mutated module global. See `docs/DEVELOPMENT.md` "Parallel CI and the `serial` marker". |
 
 Rule: read before write. Never reconstruct `VERSION`, `pyproject.toml`
 `version`, or the README badge from memory — one stale reconstruction creates
@@ -165,6 +166,7 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
 | 18 | subagent_isolation | If the diff changes `schedule_subagent`, child-task queueing, task constraints, tool discovery/execution, data reads, or memory handoff, does it preserve the accepted live-subagent contract: strict `objective` + `expected_output` schema, inferred lineage/workspace/contract/deadline/resource inheritance, `local_readonly_subagent` schema and execute-time allowlist, subagent-scoped secret/control-file denial for data tools, nested readonly delegation only within configured depth/cap limits with depth>1 coerced to light, no local writes/commits/review/runtime/tool-expansion/skills-lifecycle/shell, enabled external tools allowed only by owner policy and inherited resources, the subagent browser boundary (external HTTP(S) + `file://` scoped to `workspace_root` + loopback EXCEPT Ouroboros control-plane ports; private/link-local/reserved/DNS-rebind still blocked; `evaluate` JS unavailable; `vlm_query`/`analyze_screenshot` available), full task-result handoff, new/changed wait/timeout paths for cognitive work using progress-aware/re-decidable waiting rather than a fixed cutoff that discards in-flight work (P5), and tests for both allowed and blocked paths? | critical |
 | 19 | evolution_durability | If the diff touches `supervisor/git_ops.py`, `launcher.py`, `server.py`, `ouroboros/preflight_runner.py`, `ouroboros/tools/review_helpers.py`, `ouroboros/tools/git.py`, tests, review gates, or evolution code, does it preserve hermetic preflight, live repo/data mutation fuses, remote-optional local commit success, and transaction/rescue evidence for interrupted self-modification? | critical |
 | 20 | context_budget_ssot | If the diff changes context-size budgets/constants (`ouroboros/context_budget.py`), the context layout/manifest, a section's tier/policy, or compaction thresholds: does it keep the low/max context split coherent (single SSOT + both profiles + docs + drift-guard tests in sync), preserve the tier-0 always-full core (BIBLE/SYSTEM/identity/scratchpad/knowledge-index/recent-dialogue) in EVERY mode, use a visible on-demand pointer instead of silent truncation (P1), and leave the blocking scope-reviewer >=1M floor untouched? (PASS with "Not applicable" if no context-budget/layout change.) | critical |
+| 21 | capability_regression | Does the diff REMOVE or NARROW a previously-supported user-facing behavior or capability — a tool/flag/mode/path that worked before now errors or is gated tighter (e.g. a new `is_dir`/existence guard that blocks a legitimate create, a tightened allowlist that drops a real path, a removed fallback)? If so, is it INTENTIONAL and disclosed as a breaking/capability change in the commit message + changelog? Accidental capability removal is the failure class this item names. Ask whether a golden "from zero" test would have caught it. Severity follows the `Critical surface whitelist` below — silently removing a documented capability or a safety/release contract is critical; a deliberate, disclosed narrowing or an internal-only refactor is advisory. | advisory |
 
 ### Severity rules
 
@@ -182,6 +184,10 @@ Used by `commit_reviewed` for all changes to the Ouroboros repository.
   drift, off-by-one test counts, and minor descriptive inaccuracies in the
   README changelog row MUST NOT be raised as critical under `self_consistency`
   or `changelog_and_badge`. They surface here and do not block.
+- Item 21 (`capability_regression`) is advisory by default but escalates to
+  critical under the `Critical surface whitelist` below: a SILENT removal/narrowing
+  of a documented capability or a safety/release contract is critical; a
+  deliberate, disclosed narrowing or an internal-only refactor stays advisory.
 
 ### Retry convergence for tests_affected
 
@@ -418,9 +424,22 @@ remains durably audited.
 
 Self-authored skills carry payload-local `.self_authored.json` and
 owner-state `data/state/skills/<skill>/self_authored.json` provenance,
-but they do not bypass review. `skill_review` routes them
+but they do not bypass review on the agent's own initiative. `skill_review` routes them
 through the same tri-model skill review as marketplace and user-managed
 skills; no deterministic PASS or enablement is written automatically.
+EXCEPTION (C1, v6.39; narrowed hub extension in v6.43 — owner attestation): the OWNER
+may explicitly skip the EXPENSIVE LLM review for their OWN skill (`source=external` or
+self-authored) or for a hash-verified official OuroborosHub payload (fresh sidecar +
+live-catalog hash match, no extra runtime-reachable files) via the owner-only
+`POST /api/owner/skills/<skill>/attest-review`. Native, ClawHub, and unverified
+OuroborosHub payloads are not attestable. The DETERMINISTIC preflight floor still runs
+(409 on failure); only the LLM phase is skipped. The result is a durable `clean` verdict
+with `review_profile=owner_attested`, `reviewer_models=[owner_attestation]`, bound to
+`content_hash` (a content edit stales it) and valid only while the owner-issued
+`owner_attestation.json` marker is present. The AGENT can NEVER trigger this — the
+marker is an owner-state file (agent-write-blocked) and the endpoint is blocked from
+agent self-call on shell/CLI/browser channels (`prompts/SAFETY.md` DANGEROUS rule).
+This is the only owner-issued review-bypass.
 `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS` is default-on as of v6.10.0 (the owner
 may disable it), in which case a fresh executable review grants only
 manifest-declared settings keys and host permissions for that exact content
@@ -664,19 +683,27 @@ Reviewers must structure their response in this order:
 | 7 | architecture_fit | Does the plan solve the class of problem or is it a narrow patch leaving the root cause unresolved? If the latter, describe what architectural change would address the root cause. | RISK (advisory) |
 | 8 | forgotten_docs | If the change affects behavior described in ARCHITECTURE.md, SYSTEM.md, README.md, DEVELOPMENT.md, or BIBLE.md, is that update included in the plan? Name the specific stale artifact. | FAIL if a concrete doc/prompt becomes stale and is not mentioned |
 
-### Aggregate signal levels (majority-vote)
+### Aggregate signal levels (adaptive quorum)
+
+The coordinator aggregates the configured reviewer slots (an arbitrary N,
+duplicates allowed) via `config.adaptive_quorum(N)` — the same reviewer-slot
+SSOT used by commit/scope/skill review: `2` for `N ≥ 3`, `N` for `N` in
+`{1, 2}` (i.e. `min(2, N)`).
 
 - **GREEN** — all reviewers PASS. Read every reviewer's `## PROPOSALS` section
   (they are the point of this call), then proceed with implementation.
-- **REVIEW_REQUIRED** — one or more of: (a) exactly one reviewer flagged
-  `REVISE_PLAN` among otherwise-clear signals (minority dissent); (b) one or
-  more RISK items were raised; (c) non-substantive degradation occurred (a
-  reviewer errored, timed out, or returned an unparseable response, so `GREEN`
-  cannot be confirmed). Read every reviewer's full response and all PROPOSALS
-  before deciding: a single dissenting reviewer often sees the structural issue
-  the others missed.
-- **REVISE_PLAN** — **≥2 reviewers flagged `REVISE_PLAN`**. Majority confirms a
-  structural problem with the plan. Redesign before writing code.
+- **REVIEW_REQUIRED** — one or more of: (a) a `REVISE_PLAN` count BELOW the
+  adaptive quorum (minority dissent — e.g. exactly one dissent in a 2+-slot
+  setup); (b) one or more RISK items were raised; (c) non-substantive
+  degradation occurred (a reviewer errored, timed out, or returned an
+  unparseable response, so `GREEN` cannot be confirmed). Read every reviewer's
+  full response and all PROPOSALS before deciding: a single dissenting reviewer
+  often sees the structural issue the others missed.
+- **REVISE_PLAN** — a `REVISE_PLAN` count **at or above `adaptive_quorum(N)`**
+  (2-of-N for 3+ slots, both in a 2-slot setup, and the lone reviewer in a
+  1-slot setup). Quorum confirms a structural problem with the plan. Redesign
+  before writing code. A single dissent in a multi-reviewer setup surfaces as
+  `REVIEW_REQUIRED`, not `REVISE_PLAN`.
 
 ### Rules for reviewers
 

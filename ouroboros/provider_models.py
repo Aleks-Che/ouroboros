@@ -12,7 +12,6 @@ import os
 PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
     ("openai::", "openai"),
     ("anthropic::", "anthropic"),
-    ("deepseek::", "deepseek"),
     ("cloudru::", "cloudru"),
     ("gigachat::", "gigachat"),
     ("openai-compatible::", "openai-compatible"),
@@ -23,7 +22,6 @@ PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
 PROVIDER_ENV_KEYS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
-    "deepseek": "DEEPSEEK_API_KEY",
     "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
@@ -66,46 +64,55 @@ def model_has_credentials(model: str) -> bool:
 def resolve_credentialed_model(default_model: str) -> str:
     """Return ``default_model`` if its provider is credentialed, else the first
     configured model slot whose provider has credentials (light → fallback →
-    main → code). Falls back to ``default_model`` when nothing is credentialed
+    main → heavy). Falls back to ``default_model`` when nothing is credentialed
     so callers surface the original provider error rather than a silent swap."""
     if model_has_credentials(default_model):
         return default_model
-    for env_name in (
-        "OUROBOROS_MODEL_LIGHT",
-        "OUROBOROS_MODEL_FALLBACK",
-        "OUROBOROS_MODEL",
-        "OUROBOROS_MODEL_CODE",
-    ):
-        candidate = str(os.environ.get(env_name, "") or "").strip()
-        if candidate and model_has_credentials(candidate):
+    # LIGHT/MAIN/HEAVY are single-model slots; FALLBACKS is a comma chain expanded via the
+    # shared SSOT parser (which also honors the legacy singular OUROBOROS_MODEL_FALLBACK)
+    # instead of testing the whole comma-string as one broken model id. Empty Heavy/Light
+    # (default -> Main) simply contribute nothing here. Lazy import: config imports this
+    # module, so importing config at module load would be circular.
+    from ouroboros.config import parse_fallback_chain
+    candidates: list[str] = []
+    light = str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip()
+    if light:
+        candidates.append(light)
+    candidates.extend(parse_fallback_chain())
+    for env_name in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY"):
+        raw = str(os.environ.get(env_name, "") or "").strip()
+        if raw:
+            candidates.append(raw)
+    for candidate in candidates:
+        if model_has_credentials(candidate):
             return candidate
     return default_model
 
 
 OPENAI_DIRECT_DEFAULTS = {
     "main": "openai::gpt-5.5",
-    "code": "openai::gpt-5.5",
+    "heavy": "openai::gpt-5.5",
     "light": "openai::gpt-5.5-mini",
     "fallback": "openai::gpt-5.5-mini",
 }
 
 CLOUDRU_DIRECT_DEFAULTS = {
     "main": "cloudru::zai-org/GLM-4.7",
-    "code": "cloudru::zai-org/GLM-4.7",
+    "heavy": "cloudru::zai-org/GLM-4.7",
     "light": "cloudru::zai-org/GLM-4.7",
     "fallback": "cloudru::zai-org/GLM-4.7",
 }
 
 GIGACHAT_DIRECT_DEFAULTS = {
     "main": "gigachat::GigaChat-3-Ultra",
-    "code": "gigachat::GigaChat-3-Ultra",
+    "heavy": "gigachat::GigaChat-3-Ultra",
     "light": "gigachat::GigaChat-3-Ultra",
     "fallback": "gigachat::GigaChat-3-Ultra",
 }
 
 ANTHROPIC_DIRECT_DEFAULTS = {
     "main": "anthropic::claude-opus-4-8",
-    "code": "anthropic::claude-opus-4-8",
+    "heavy": "anthropic::claude-opus-4-8",
     "light": "anthropic::claude-sonnet-4-6",
     "fallback": "anthropic::claude-sonnet-4-6",
 }
@@ -141,12 +148,6 @@ def migrate_model_value(provider: str, value: str) -> str:
             return f"anthropic::{normalize_anthropic_model_id(text[len('anthropic::'):])}"
         if text.startswith("anthropic/"):
             return f"anthropic::{normalize_anthropic_model_id(text[len('anthropic/'):])}"
-        return text
-    if provider == "deepseek":
-        if text.startswith("deepseek::"):
-            return text
-        if text.startswith("deepseek/"):
-            return f"deepseek::{text[len('deepseek/'):]}"
         return text
     if provider == "cloudru":
         if text.startswith("cloudru::"):
@@ -221,42 +222,12 @@ def supports_vision(model_id: str) -> bool:
     return normalized.startswith(_VISION_MODEL_PREFIXES)
 
 
-# Conservative static context-window knowledge (tokens) by normalized id/prefix.
-# Deliberately tight: only families with long-established public windows that
-# this deployment actually routes to. Unknown models return 0 and callers keep
-# their profile defaults — a wrong window here either wastes compaction (too
-# small) or overflows the provider (too large), so guessing is worse than 0.
-# First matching prefix wins (most specific first): a dated fable variant like
-# "anthropic/claude-fable-5-20260601" must hit the 1M family entry, not the
-# generic 200K anthropic bucket.
-_CONTEXT_WINDOW_PREFIXES: tuple[tuple[str, int], ...] = (
-    ("anthropic/claude-fable-5", 1_000_000),
-    ("anthropic/claude-", 200_000),
-    ("openai/gpt-5.5", 1_000_000),
-    ("google/gemini-3.", 1_000_000),
-    ("google/gemini-2.5", 1_000_000),
-    # GigaChat-3 family: Ultra 131K (verified 2026-06), Lightning 256K. One
-    # conservative family entry — both are far below the 1M scope floor and
-    # early compaction is the safe direction for the bigger sibling.
-    ("gigachat/", 131_072),
-)
-
-
-def context_window_tokens(model_id: str) -> int:
-    """Best-known context window (tokens) for a remote model id; 0 = unknown.
-
-    Local lanes are intentionally not covered: their window comes live from
-    ``LocalModelManager.get_context_length()`` and they already run the low
-    context profile.
-    """
-    raw = str(model_id or "").strip()
-    if not raw or raw.endswith(" (local)"):
-        return 0
-    normalized = normalize_model_identity(raw)
-    for prefix, window in _CONTEXT_WINDOW_PREFIXES:
-        if normalized.startswith(prefix):
-            return window
-    return 0
+# NOTE (v6.33.0): the static per-model context-window table was REMOVED. It
+# perpetually went stale (1M-beta models hard-coded to 200K, [1m] ignored). The
+# agent's OWN operating window is the owner low/max context MODE (the SSOT — see
+# context_budget.py / loop.py), and external-model windows are resolved by
+# Capability Evidence (ouroboros.capability_evidence: confirmed provider metadata
+# / local health, or route-fingerprinted owner-ack), fail-closed when unknown.
 
 
 def normalize_model_identity(model: str) -> str:
@@ -267,8 +238,6 @@ def normalize_model_identity(model: str) -> str:
         return f"openai/{text[len('openai::'):]}"
     if text.startswith("openai-compatible::"):
         return f"openai-compatible/{text[len('openai-compatible::'):]}"
-    if text.startswith("deepseek::"):
-        return f"deepseek/{text[len('deepseek::'):]}"
     if text.startswith("cloudru::"):
         return f"cloudru/{text[len('cloudru::'):]}"
     if text.startswith("gigachat::"):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import logging
 import os
 import pathlib
@@ -51,7 +52,7 @@ from ouroboros.tools.shell_guards import (
 from ouroboros.artifacts import task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.protected_artifacts import shell_block_reason as protected_artifact_shell_block_reason
 from ouroboros.git_shell_policy import run_shell_git_block_reason, workspace_git_safety_violation
-from ouroboros.tool_access import light_cognitive_or_root_redirect, normalize_root, resolve_shell_cwd, workspace_mode_block_reason
+from ouroboros.tool_access import is_external_workspace, light_cognitive_or_root_redirect, normalize_root, normalize_root_relative, resolve_shell_cwd, shell_cwd_block_message, workspace_mode_block_reason
 from ouroboros.utils import safe_relpath
 from ouroboros.contracts.task_constraint import TaskConstraint, VALID_WRITE_SURFACES, normalize_task_constraint
 from ouroboros.contracts.skill_payload_policy import (
@@ -126,8 +127,12 @@ def _detect_runtime_mode_elevation(text_lower: str) -> bool:
 
 
 _SUBAGENT_SHELL_SECRET_MARKERS = (
-    # Ouroboros owner secrets/control state.
-    "/data/settings.json", "ouroboros/data/settings", "file1.txt",
+    # Ouroboros owner secrets/control state. The relative form (no leading slash)
+    # closes the interpreter-string bypass (CW4, v6.34.0): the whole-command
+    # substring scan already catches "/data/settings.json" and "../../data/..",
+    # but a bare "data/settings.json" (e.g. python -c "open('data/settings.json')"
+    # from a workspace cwd) needs the slash-less marker too.
+    "/data/settings.json", "data/settings.json", "ouroboros/data/settings", "file1.txt",
     # Universal credential/secret/control files (relative or absolute).
     ".env", ".git/config", ".git/credentials", "credentials.json", "tokens.json",
     "/.ssh/", ".ssh/", "id_rsa", "id_ed25519", ".netrc", ".npmrc", ".pgpass", ".aws/",
@@ -138,6 +143,52 @@ def _subagent_shell_targets_secret(cmd_path_lower: str) -> bool:
     """Deterministic guard: a shell command referencing Ouroboros secrets/credentials
     or owner-control state (settings.json, ssh keys, token/credential files)."""
     return any(marker in cmd_path_lower for marker in _SUBAGENT_SHELL_SECRET_MARKERS)
+
+
+def _command_mentions_protected_root(cmd_path_lower: str, root_text: str) -> bool:
+    """Boundary-aware path containment for the workspace shell guard.
+
+    True only when ``root_text`` (a normalised, lower-cased protected root path)
+    appears in the command as a whole path or a parent prefix at a real path
+    boundary — NOT as an incidental substring of an unrelated path that merely
+    shares the prefix (e.g. protected ``/x/data`` must not match ``/x/database``).
+    Used as a coarse catch-all for runtime paths embedded in non-tokenised text
+    (e.g. inside a ``python -c`` string); the precise per-token containment loop
+    still does the authoritative active/protected classification.
+    """
+    if not root_text:
+        return False
+    norm = root_text.rstrip("/")
+    if not norm:
+        return False
+    span = len(norm)
+    limit = len(cmd_path_lower)
+    start = 0
+    while True:
+        idx = cmd_path_lower.find(norm, start)
+        if idx < 0:
+            return False
+        end = idx + span
+        nxt = cmd_path_lower[end] if end < limit else ""
+        # Boundary = end-of-string, a path separator (child path), or a shell
+        # token delimiter (the exact path). A trailing path char (letter/digit/
+        # ``.``/``-``/``_``) means a DIFFERENT sibling path → keep scanning.
+        if nxt == "" or nxt == "/" or nxt in " \t\"')(;:,&|<>":
+            return True
+        start = end
+
+
+def _stray_skill_payload_failsoft(root_arg: str, workspace_mode: bool, task_constraint: Any) -> bool:
+    """Whether stray bucket/skill_name on a write tool should be DROPPED rather than
+    surfaced as SKILL_PAYLOAD_ARG_ERROR. Fail-soft ONLY for a WORKSPACE edit that is
+    NOT skill-authoring: there bucket/skill_name are model noise (the B2 footgun —
+    reflexive bucket="external" on an /app edit). In light/advanced non-workspace
+    skill-authoring (or an explicit root=skill_payload / skill_repair) the specific
+    error is the intended helpful signal."""
+    skill_payload_intent = root_arg == "skill_payload" or bool(
+        task_constraint and getattr(task_constraint, "mode", "") == "skill_repair"
+    )
+    return bool(workspace_mode and not skill_payload_intent)
 
 
 def _detect_mutative_toggle_self_change(text_lower: str) -> bool:
@@ -151,6 +202,24 @@ def _detect_mutative_toggle_self_change(text_lower: str) -> bool:
         or "ouroboros.cli" in text_lower
     )
     return has_key and has_write
+
+
+def _managed_update_code_tool_block(ctx: Any, name: str) -> str:
+    """Block a repo-mutating code tool while a managed-update assisted merge is staged for
+    ANOTHER task (P2/SC2). Returns a block message, or "" when allowed (this is the authorized
+    resolution task, or no managed tx is active). A corrupt tx marker fails closed."""
+    try:
+        from supervisor.update_merge import managed_assisted_tx_for
+
+        if managed_assisted_tx_for(getattr(ctx, "task_id", ""))[1]:
+            return (
+                f"⚠️ MANAGED_UPDATE_IN_PROGRESS: {name!r} is blocked while a managed update merge "
+                "is being resolved (only its authorized resolution task may write the repo). "
+                "Retry after the update lands or is rolled back."
+            )
+    except Exception:
+        return ""
+    return ""
 
 
 def _detect_evolution_owner_control_self_change(text_lower: str) -> bool:
@@ -189,6 +258,42 @@ def _detect_context_mode_self_lowering(text_lower: str) -> bool:
         or mentions_owner_lowering_flag
         or (mentions_context_key and mentions_save)
     )
+
+
+def _detect_scope_review_floor_self_lowering(text_lower: str) -> bool:
+    """Detect shell/script attempts to weaken the owner-controlled scope-review floor
+    (CW1, v6.34.0). OUROBOROS_SCOPE_REVIEW_FLOOR gates the BIBLE P3 blocking scope
+    review; the agent must not lower it to ``advisory`` to slip its own changes past
+    the gate. Mirrors the context-mode self-lowering guard."""
+    mentions_floor_key = "ouroboros_scope_review_floor" in text_lower
+    mentions_owner_endpoint = "/api/owner/scope-review-floor" in text_lower
+    mentions_floor_endpoint = "scope-review-floor" in text_lower and "/api/owner" in text_lower
+    mentions_floor_cli = "scope-review-floor" in text_lower and (
+        "ouroboros settings" in text_lower
+        or "ouroboros.cli" in text_lower
+    )
+    mentions_save = "save_settings" in text_lower or "settings.json" in text_lower or "/api/settings" in text_lower
+    return (
+        mentions_owner_endpoint
+        or mentions_floor_endpoint
+        or mentions_floor_cli
+        or (mentions_floor_key and mentions_save)
+    )
+
+
+def _detect_owner_skill_attest_self_call(text_lower: str) -> bool:
+    """Detect agent attempts to loopback-call the OWNER-ONLY skill owner-attestation endpoint
+    (C1, v6.39). Owner-attestation skips the expensive LLM skill review; it MUST be
+    owner-issued, never agent self-callable — otherwise the agent could self-bypass the
+    immune system's review for its own skill. Mirrors the context-mode/scope-floor guards.
+
+    URL-DECODE first so a percent-encoded path (e.g. ``%61ttest-review`` / ``attest%2Dreview``)
+    — which Starlette decodes back to ``attest-review`` before routing — cannot slip past the
+    literal match (decode twice to catch double-encoding)."""
+    import urllib.parse
+    decoded = urllib.parse.unquote(urllib.parse.unquote(text_lower)).lower()
+    text = f"{text_lower} {decoded}"
+    return "/api/owner/skills/" in text and "attest-review" in text
 
 
 def _task_constraint_path_allowed(path_text: str, constraint: Optional[TaskConstraint], drive_root: pathlib.Path) -> bool:
@@ -323,9 +428,9 @@ _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "claude_code_edit",
     "search_code",
     "query_code",
-    "codebase_digest",
     "run_command",
     "run_script",
+    "verify_and_record",
     "start_service",
     "service_status",
     "service_logs",
@@ -340,6 +445,14 @@ _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "wait_task",
     "wait_tasks",
     "get_task_result",
+    # D#7 soft-join decision tools: a workspace parent that can schedule_subagent must
+    # also be able to inspect (peek_task), stop (cancel_task), and explicitly abandon
+    # (discard_child_result) its children — else the soft-join ledger is inert exactly
+    # where children are spawned. All three are bounded/tree-scoped (no shell/write).
+    "peek_task",
+    "cancel_task",
+    "discard_child_result",
+    "override_delegation_constraint",
     "knowledge_read",
     "knowledge_list",
     "knowledge_write",
@@ -353,16 +466,63 @@ _WORKSPACE_ALLOWED_TOOLS = frozenset({
     "journal_write",
     "workpad_read",
     "workpad_write",
+    # Task-tree coordination: a workspace parent must publish/read the shared frame and a
+    # workspace child must raise beacons (bounded, append-only local coordination).
+    "tree_note",
+    "tree_read",
     "web_search",
     "browse_page",
     "browser_action",
     "analyze_screenshot",
     "vlm_query",
+    "view_image",
+    "ocr_pdf",
+    "youtube_transcript",
     "list_available_tools",
     "enable_tools",
 })
 _PROCESS_COMMAND_TOOLS = frozenset({"run_command", "run_script", "start_service"})
-_WEB_TOOLS = frozenset({"web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query"})
+# verify_and_record runs the agent's declared `check` like a command, so it must clear the
+# same PRE-EXECUTION shell guards (subagent-secret read, protected-artifact read, sudo,
+# protected-root / workspace-state / light-mode writes) — that pre-exec filter is the
+# security boundary and blocks a forbidden mutation BEFORE the handler runs, so a guarded
+# check cannot mutate protected state and then leave a host-attested PASS receipt. It is
+# deliberately NOT in _PROCESS_COMMAND_TOOLS: those POST-execution checks (owner-file
+# restore, light-repo diff, git-ref tripwire) run AFTER the handler has already written the
+# receipt, so they would only annotate the returned text, not gate the durable receipt —
+# adding them would give false assurance while the pre-exec guards already do the gating.
+_SHELL_GUARDED_TOOLS = _PROCESS_COMMAND_TOOLS | {"verify_and_record"}
+# Path-bearing file tools whose active_workspace/system_repo path arg is normalized
+# ONCE at dispatch (execute) so the handler AND every guard (protected-path,
+# protected-artifact, shrink) resolve the identical target — no desync bypass.
+_PATH_NORMALIZED_TOOLS = frozenset({"read_file", "write_file", "edit_text", "list_files", "search_code", "query_code"})
+
+
+def _normalize_dispatch_path_args(ctx: Any, name: str, args: Dict[str, Any]) -> None:
+    """ROOT-FIX (v6.35.0): normalize an absolute / redundant-root-basename
+    active_workspace|system_repo path arg IN PLACE at the dispatch boundary, so
+    the handler AND every downstream guard (protected-path, protected-artifact,
+    accidental-truncation shrink guard) resolve the SAME target. One authoritative
+    normalization point is what makes a guard unable to desync from the operation."""
+    if name not in _PATH_NORMALIZED_TOOLS:
+        return
+    root_arg = str(args.get("root") or "active_workspace")
+    if root_arg not in ("active_workspace", "system_repo"):
+        return
+    try:
+        norm_root = active_repo_dir_for(ctx) if root_arg == "active_workspace" else system_repo_dir_for(ctx)
+        for _key in ("path", "dir"):
+            if isinstance(args.get(_key), str) and args[_key]:
+                args[_key] = normalize_root_relative(norm_root, args[_key])
+        if isinstance(args.get("files"), list):
+            for _f in args["files"]:
+                if isinstance(_f, dict) and isinstance(_f.get("path"), str) and _f["path"]:
+                    _f["path"] = normalize_root_relative(norm_root, _f["path"])
+    except Exception:
+        pass
+
+
+_WEB_TOOLS = frozenset({"web_search", "browse_page", "browser_action", "youtube_transcript"})
 _REPO_MUTATION_TOOLS = frozenset({
     "write_file",
     "claude_code_edit",
@@ -410,6 +570,134 @@ def _resource_allowed(ctx: Any, key: str) -> bool:
             if isinstance(value, bool) and not value:
                 return False
     return True
+
+
+def _disabled_tools(ctx: Any) -> frozenset:
+    """Tool names the task contract withholds (declarative tool policy).
+
+    Independent of ``allowed_resources``: a caller can disable specific tools
+    (e.g. the agent's web_search/browser/VLM tools for a faithful benchmark)
+    WITHOUT setting web/network=false — so shell network egress (git/pip) stays
+    available and the web<->network cross-implication in ``_resource_allowed``
+    never fires.
+    """
+    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+    contract = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
+    if not contract and isinstance(getattr(ctx, "task_contract", None), dict):
+        contract = getattr(ctx, "task_contract")
+    names: set = set()
+    for source in (metadata, contract):
+        raw = source.get("disabled_tools") if isinstance(source, dict) else None
+        if isinstance(raw, (list, tuple)):
+            names.update(str(n).strip() for n in raw if str(n).strip())
+    return frozenset(names)
+
+
+_GITHUB_TOKEN_TOOLS = frozenset({
+    "list_github_prs",
+    "get_github_pr",
+    "comment_on_pr",
+    "list_github_issues",
+    "get_github_issue",
+    "comment_on_issue",
+    "close_github_issue",
+    "create_github_issue",
+    "run_ci_tests",
+    "submit_skill_to_hub",
+    "generate_evolution_stats",
+})
+
+_TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
+    "*": {"max_entries": "max_results"},
+}
+_IGNORE_ROOT_ARG_TOOLS = frozenset({
+    "vcs_status",
+    "vcs_diff",
+    "vcs_pull_ff",
+    "vcs_restore",
+    "vcs_revert",
+    "commit_reviewed",
+    "vcs_commit_reviewed",
+})
+
+
+def _builtin_tool_availability(name: str, ctx: Any = None) -> tuple[bool, str, str]:
+    """Return ``(available, reason, detail)`` for built-in tool credential gates.
+
+    Predicates are lazy to avoid registry import cycles and discovery-time side effects.
+    """
+    # A bare registry (unit tests, static policy inventory, import-time introspection)
+    # is a structural surface, not a running task capability envelope.
+    if not str(getattr(ctx, "task_id", "") or "").strip():
+        metadata = getattr(ctx, "task_metadata", {}) if ctx is not None else {}
+        contract = getattr(ctx, "task_contract", {}) if ctx is not None else {}
+        if not metadata and not contract:
+            return True, "", ""
+    tool = str(name or "").strip()
+    if tool == "claude_code_edit" and not os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return False, "missing_credential", "ANTHROPIC_API_KEY"
+    if tool == "web_search":
+        try:
+            from ouroboros.tools.search import _available_web_search_backends
+
+            if not _available_web_search_backends():
+                return False, "missing_credential", "web_search_backend"
+        except ImportError:
+            return True, "", ""
+        except Exception:
+            return True, "", ""
+    if tool in _GITHUB_TOKEN_TOOLS and not os.environ.get("GITHUB_TOKEN", "").strip():
+        return False, "missing_credential", "GITHUB_TOKEN"
+    return True, "", ""
+
+
+def _handler_public_params(handler: Callable[..., Any]) -> list[str]:
+    try:
+        params = list(inspect.signature(handler).parameters)
+    except (TypeError, ValueError):
+        return []
+    return [name for name in params if name != "ctx"]
+
+
+def _entry_public_params(entry: "ToolEntry") -> list[str]:
+    try:
+        params = entry.schema.get("parameters") or {}
+        props = params.get("properties")
+        if isinstance(props, dict):
+            return [str(name) for name in props]
+    except Exception:
+        pass
+    return _handler_public_params(entry.handler)
+
+
+def _entry_has_public_param_schema(entry: "ToolEntry") -> bool:
+    try:
+        params = entry.schema.get("parameters") or {}
+        return isinstance(params.get("properties"), dict)
+    except Exception:
+        return False
+
+
+def _normalize_tool_call_args(entry: "ToolEntry", args: dict[str, Any]) -> None:
+    tool_name = entry.name
+    accepted = set(_entry_public_params(entry))
+    aliases: dict[str, str] = {}
+    aliases.update(_TOOL_ARG_ALIASES.get("*", {}))
+    aliases.update(_TOOL_ARG_ALIASES.get(tool_name, {}))
+    for alias, canonical in aliases.items():
+        if alias in args and canonical in accepted and alias not in accepted and canonical not in args:
+            args[canonical] = args.pop(alias)
+    if tool_name in _IGNORE_ROOT_ARG_TOOLS and "root" in args and "root" not in accepted:
+        args.pop("root", None)
+
+
+def _format_tool_arg_error(entry: "ToolEntry") -> str:
+    params = _entry_public_params(entry)
+    accepted = ", ".join(params) if params else "none"
+    return (
+        f"⚠️ TOOL_ARG_ERROR ({entry.name}): invalid arguments for {entry.name}. "
+        f"Accepted parameters: {accepted}."
+    )
 
 
 def _light_repo_snapshot(repo_dir: pathlib.Path) -> Optional[Dict[str, Any]]:
@@ -498,6 +786,35 @@ class BrowserState:
     last_screenshot_b64: Optional[str] = None
 
 
+# CW3 (v6.34.0): tools a SHORT-LIVED ephemeral same-route decision turn must NOT
+# call — durable cognitive memory, evolution/consciousness, model/timeout/settings
+# control, and the release/restart control-plane. The ephemeral turn may still
+# answer / steer_task / promote_chat_to_task / route_to_project and read freely;
+# An ephemeral decision turn DECIDES (answer / route / spawn / steer); it does NOT do
+# durable work — that is what the task it spawns is for. CW3 (v6.34.0) enforces this with
+# a DEFAULT-DENY ALLOWLIST, not a denylist: a denylist is whack-a-mole (it kept missing
+# review/skill/publish/control mutators — advisory_review, skill_review, submit_skill_to_hub,
+# skill_exec, toggle_skill, cancel_task, task_acceptance_review, ...). The decision turn may
+# only call the read-only INSPECTION tools (the LOCAL_READONLY_SUBAGENT_TOOL_NAMES SSOT —
+# read_file/query_code/search_code/web_search/vcs_diff/...) plus the route/spawn/steer/reply
+# tools below. Everything else — every repo/git/cognitive/control/review/skill/publish
+# mutator, run_command (shell is durable-capable), and all extension/MCP tools (blocked
+# separately) — is hidden from schemas()/get_schema_by_name() and fails closed in execute().
+# EXPLICIT curated allowlist (not derived from another set — deriving from
+# LOCAL_READONLY_SUBAGENT_TOOL_NAMES leaked subagent-only tools: schedule_subagent spawns
+# durable child tasks, wait_task/wait_tasks BLOCK a short turn, browser_action INTERACTS
+# with pages). A decision turn may only READ/INSPECT (no mutation, no spawning, no blocking
+# wait, no page interaction) and answer/route/spawn-owner-task/steer/reply.
+_EPHEMERAL_ALLOWED_TOOLS = frozenset({
+    # read / inspect
+    "read_file", "query_code", "search_code", "list_files", "web_search", "browse_page",
+    "chat_history", "recent_tasks", "get_task_result", "vcs_diff", "vcs_status",
+    "analyze_screenshot", "vlm_query",
+    # decide / route / spawn-owner-task / reply
+    "route_to_project", "promote_chat_to_task", "steer_task", "list_projects", "send_photo",
+})
+
+
 @dataclass
 class ToolContext:
     """Tool execution context passed from the agent."""
@@ -529,6 +846,9 @@ class ToolContext:
     active_use_local_override: Optional[bool] = None
     task_model_override: Optional[str] = None
     task_use_local_override: Optional[bool] = None
+    # CW2 (v6.34.0): the loop publishes the effective context mode each round so
+    # switch_model can refuse switching to a sub-1M route while the transcript is max-sized.
+    active_context_mode: str = ""
 
     # Per-task browser state.
     browser_state: BrowserState = field(default_factory=BrowserState)
@@ -549,6 +869,11 @@ class ToolContext:
 
     # True inside handle_chat_direct, not a queued worker task.
     is_direct_chat: bool = False
+    # CW3 (v6.34.0): a SHORT-LIVED same-route "decision" turn (run while the chat
+    # agent is busy). It may answer / route / spawn / steer, but is barred from
+    # durable cognitive-memory / evolution / settings / control-plane mutators
+    # (the WS10 ephemeral contract) — enforced in schemas()/execute().
+    is_ephemeral_turn: bool = False
 
     # Pre-commit review state.
     _review_advisory: List[Any] = field(default_factory=list)
@@ -569,19 +894,13 @@ class ToolContext:
 
     def repo_path(self, rel: str) -> pathlib.Path:
         root = self.active_repo_dir()
-        rel_str = str(rel)
-        # An absolute path that already points INSIDE the active root (e.g. an
-        # agent passing /app/out.txt for a workspace rooted at /app) must
-        # resolve to that file, not be re-nested as /app/app/out.txt. That
-        # double-prefix (safe_relpath strips the leading "/") silently wrote
-        # deliverables to the wrong place and pushed agents toward the blocked
-        # user_files root. Paths not under the root fall through to safe_relpath
-        # (kept inside the root); the boundary check below still guards escapes.
-        try:
-            if pathlib.PurePath(rel_str).is_absolute():
-                rel_str = str(pathlib.Path(rel_str).resolve().relative_to(root.resolve()))
-        except (ValueError, OSError):
-            pass
+        # Accept the paths an agent naturally writes against a workspace root:
+        # an absolute path already INSIDE the root (e.g. /app/out.txt under a
+        # workspace rooted at /app — otherwise re-nested as /app/app/out.txt) and
+        # a redundant root-basename prefix ('app/out.txt'). normalize_root_relative
+        # only ever returns a relative string; paths not under the root fall
+        # through to safe_relpath (kept inside) and the boundary check below.
+        rel_str = normalize_root_relative(root, str(rel))
         resolved = (root / safe_relpath(rel_str)).resolve()
         try:
             resolved.relative_to(root.resolve())
@@ -639,10 +958,10 @@ class ToolRegistry:
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
         "core", "evolution_stats", "git", "git_pr", "git_rollback", "github",
-        "health", "knowledge", "memory_tools", "plan_review", "project_journal",
+        "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",
-        "skill_preflight", "subagent_integration", "tool_discovery", "vision",
+        "skill_preflight", "subagent_integration", "task_tree", "tool_discovery", "verify", "vision",
     ]
 
     def _load_modules(self) -> None:
@@ -732,9 +1051,12 @@ class ToolRegistry:
         # mode; disable the workspace filter when acting.
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)()) and not acting_subagent
         local_readonly_subagent = self._is_local_readonly_subagent()
+        disabled = _disabled_tools(self._ctx)
         return [
             e.name
             for e in self._entries.values()
+            if e.name not in disabled  # declarative tool policy (task_contract.disabled_tools)
+            if _builtin_tool_availability(e.name, self._ctx)[0]
             if not workspace_mode or e.name in _WORKSPACE_ALLOWED_TOOLS
             if not local_readonly_subagent or e.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
             if not acting_subagent or e.name in ACTING_SUBAGENT_TOOL_NAMES
@@ -799,18 +1121,42 @@ class ToolRegistry:
         acting_grants = self._acting_tool_grants() if acting_subagent else set()
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)()) and not acting_subagent
         local_readonly_subagent = self._is_local_readonly_subagent()
+        ephemeral_turn = bool(getattr(self._ctx, "is_ephemeral_turn", False))
+        disabled_tools = _disabled_tools(self._ctx)
         self._capability_omissions = []
+        unavailable_tools = {
+            entry.name: detail
+            for entry in self._entries.values()
+            for available, reason, detail in [_builtin_tool_availability(entry.name, self._ctx)]
+            if not available and reason == "missing_credential" and entry.name not in disabled_tools
+        }
         built_in = [
             schema
             for entry in self._entries.values()
+            if entry.name not in disabled_tools  # declarative tool policy (task_contract.disabled_tools)
+            if entry.name not in unavailable_tools
             if not workspace_mode or entry.name in _WORKSPACE_ALLOWED_TOOLS
             if not local_readonly_subagent or entry.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
             if not acting_subagent or entry.name in ACTING_SUBAGENT_TOOL_NAMES
+            if not ephemeral_turn or entry.name in _EPHEMERAL_ALLOWED_TOOLS  # CW3: default-deny allowlist
             for schema in self._schemas_for_entry(entry)
         ]
+        if disabled_tools:
+            self._capability_omissions.append({"surface": "tools", "reason": "disabled_by_contract", "tools": sorted(disabled_tools)})
+        if unavailable_tools:
+            self._capability_omissions.append({
+                "surface": "tools",
+                "reason": "missing_credential",
+                "tools": sorted(unavailable_tools),
+                "details": {name: unavailable_tools[name] for name in sorted(unavailable_tools)},
+            })
         # Include live extension tool schemas in normal tool discovery.
         extension_schemas: List[Dict[str, Any]] = []
-        if not _resource_allowed(self._ctx, "network"):
+        if ephemeral_turn:
+            # CW3: a short decision turn answers/routes/spawns/steers only — it gets no
+            # extension surfaces, which can have durable/reviewed side effects.
+            self._capability_omissions.append({"surface": "extensions", "reason": "ephemeral_turn"})
+        elif not _resource_allowed(self._ctx, "network"):
             self._capability_omissions.append({"surface": "extensions", "reason": "resource_blocked", "resource": "network=false"})
         else:
             try:
@@ -840,32 +1186,59 @@ class ToolRegistry:
 
         if not core_only:
             mcp_schemas = []
-            if not _resource_allowed(self._ctx, "network"):
+            if ephemeral_turn:
+                # CW3: MCP tools can have durable side effects — not for a decision turn.
+                self._capability_omissions.append({"surface": "mcp", "reason": "ephemeral_turn"})
+            elif not _resource_allowed(self._ctx, "network"):
                 self._capability_omissions.append({"surface": "mcp", "reason": "resource_blocked", "resource": "network=false"})
             else:
                 try:
                     from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
                     _mcp_ensure_configured(refresh=True)
+                    _mgr = _mcp_get_manager()
                     mcp_schemas = [
                         {
                             "type": "function",
                             "function": {"name": tool["name"], "description": tool.get("description", ""), "parameters": tool.get("schema", {"type": "object", "properties": {}})},
                         }
-                        for tool in _mcp_get_manager().list_tools_for_registry()
+                        for tool in _mgr.list_tools_for_registry()
                         if not acting_subagent or tool["name"] in acting_grants
                     ]
+                    # D1: an enabled+configured server returning zero tools WITHOUT
+                    # raising (unreachable/slow/auth-failed) is otherwise silent. Make
+                    # the reason visible so the model/owner learns WHY an expected MCP
+                    # server produced no tools, instead of "the agent can't see MCP".
+                    # Checked unconditionally so a broken server is surfaced even when a
+                    # co-located healthy server contributed tools (does not mask it).
+                    _empty = _mgr.enabled_servers_without_tools()
+                    if _empty:
+                        self._capability_omissions.append({"surface": "mcp", "reason": "server_no_tools", "servers": _empty})
                 except Exception as exc:
                     self._capability_omissions.append({"surface": "mcp", "reason": "discovery_error", "error": f"{type(exc).__name__}: {exc}"})
-            return built_in + extension_schemas + mcp_schemas
+            combined = built_in + extension_schemas + mcp_schemas
+            if disabled_tools:
+                # Apply the declarative tool policy to dynamic extension/MCP schemas too, not just
+                # built-ins, so a disabled name can never surface from any discovery source.
+                combined = [
+                    s for s in combined
+                    if (s.get("function", {}) or {}).get("name") not in disabled_tools
+                ]
+            return combined
         # Core tools plus meta-tools for enabling extended tools.
         result = []
         for e in self._entries.values():
+            if e.name in disabled_tools:  # declarative tool policy (task_contract.disabled_tools)
+                continue
+            if e.name in unavailable_tools:
+                continue
             if workspace_mode and not e.name in _WORKSPACE_ALLOWED_TOOLS:
                 continue
             if local_readonly_subagent and e.name not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
                 continue
             if acting_subagent and e.name not in ACTING_SUBAGENT_TOOL_NAMES:
                 continue
+            if ephemeral_turn and e.name not in _EPHEMERAL_ALLOWED_TOOLS:
+                continue  # CW3: the core/initial envelope is allowlisted too, not just schemas(core_only=False)
             if (
                 (local_readonly_subagent and e.name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES)
                 or (acting_subagent and e.name in ACTING_SUBAGENT_TOOL_NAMES)
@@ -873,7 +1246,10 @@ class ToolRegistry:
                 or e.name in ("list_available_tools", "enable_tools")
             ):
                 result.extend(self._schemas_for_entry(e))
-        return result + extension_schemas
+        ext = extension_schemas
+        if disabled_tools:
+            ext = [s for s in ext if (s.get("function", {}) or {}).get("name") not in disabled_tools]
+        return result + ext
 
     def capability_omissions(self) -> List[Dict[str, Any]]:
         return [dict(item) for item in self._capability_omissions]
@@ -885,8 +1261,24 @@ class ToolRegistry:
         acting_grants = self._acting_tool_grants() if acting_subagent else set()
         workspace_mode = bool(getattr(self._ctx, "is_workspace_mode", lambda: False)()) and not acting_subagent
         local_readonly_subagent = self._is_local_readonly_subagent()
+        # Declarative tool policy applies across ALL discovery sources (built-in, extension, MCP),
+        # so enable_tools/discovery can never surface a disabled name — consistent with schemas()/execute().
+        if requested in _disabled_tools(self._ctx):
+            return None
         entry = self._entries.get(requested)
         if entry:
+            available, reason, detail = _builtin_tool_availability(requested, self._ctx)
+            if not available:
+                if reason == "missing_credential":
+                    self._capability_omissions.append({
+                        "surface": "tools",
+                        "reason": reason,
+                        "tools": [requested],
+                        "details": {requested: detail},
+                    })
+                return None
+            if getattr(self._ctx, "is_ephemeral_turn", False) and requested not in _EPHEMERAL_ALLOWED_TOOLS:
+                return None  # CW3: allowlist-consistent with schemas()/execute() (so enable_tools can't surface a denied tool)
             if workspace_mode and requested not in _WORKSPACE_ALLOWED_TOOLS:
                 return None
             if local_readonly_subagent and requested not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
@@ -1048,11 +1440,26 @@ class ToolRegistry:
     def _external_workspace_git_block(self, raw_cmd: Any, args: Dict[str, Any]) -> Optional[str]:
         from ouroboros.git_shell_policy import external_workspace_git_violation
 
+        # External-workspace git is no longer confined to the active workspace
+        # (host scratch is legitimate), so the Ouroboros runtime is protected by
+        # enumeration: the system repo + EVERY data drive the task touches (parent
+        # drive plus any child / budget drive in task_metadata). Missing a child
+        # drive here would let git escape into the control plane.
+        git_protected_roots = [
+            pathlib.Path(getattr(self._ctx, "system_repo_dir", None) or self._ctx.repo_dir),
+            pathlib.Path(self._ctx.repo_dir),
+            pathlib.Path(self._ctx.drive_root),
+        ]
+        _meta = getattr(self._ctx, "task_metadata", {})
+        if isinstance(_meta, dict):
+            for _k in ("drive_root", "child_drive_root", "headless_child_drive_root", "budget_drive_root"):
+                if _meta.get(_k):
+                    git_protected_roots.append(pathlib.Path(str(_meta.get(_k))))
         git_violation = external_workspace_git_violation(
             raw_cmd,
             active_root=active_repo_dir_for(self._ctx),
             cwd=str(args.get("cwd") or ""),
-            protected_roots=[pathlib.Path(self._ctx.repo_dir), pathlib.Path(self._ctx.drive_root)],
+            protected_roots=git_protected_roots,
             allow_network=_resource_allowed(self._ctx, "network"),
         )
         if not git_violation:
@@ -1060,6 +1467,151 @@ class ToolRegistry:
         if git_violation.startswith("task_contract.allowed_resources"):
             return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: {git_violation}."
         return f"⚠️ WORKSPACE_GIT_BLOCKED: {git_violation}."
+
+    def _external_runtime_protected_paths(self) -> tuple[list, list, list, list]:
+        """Ouroboros runtime roots that an EXTERNAL-workspace task must not touch via
+        shell (system repo + EVERY data drive incl child/budget + owner credential
+        locations) plus the task's own exempt task_drive/artifact_store roots. Returns
+        (protected_texts, allowed_texts, protected_paths, allowed_paths): the *_texts
+        feed the embedded-string boundary check; the *_paths feed token resolution
+        (relative->cwd, ~->home, symlink canonicalization) so relative/symlink bypasses
+        are closed. SSOT for the read + write guards."""
+        meta = getattr(self._ctx, "task_metadata", {}) if isinstance(getattr(self._ctx, "task_metadata", {}), dict) else {}
+        protected_values = [getattr(self._ctx, "system_repo_dir", None) or getattr(self._ctx, "repo_dir", None),
+                            getattr(self._ctx, "drive_root", None)]
+        try:
+            from ouroboros.config import DATA_DIR as _PARENT_DATA_DIR
+            protected_values.append(_PARENT_DATA_DIR)
+        except Exception:
+            pass
+        for _dk in ("drive_root", "child_drive_root", "headless_child_drive_root", "budget_drive_root"):
+            if meta.get(_dk):
+                protected_values.append(meta.get(_dk))
+        # Owner/runtime credential locations, as ABSOLUTE paths. Blocking by
+        # absolute containment (not a substring marker) means the OWNER's personal
+        # secrets (~/.ssh/id_rsa, ~/.aws, ~/file1.txt) are off-limits while a
+        # project-relative file merely NAMED like a credential (site/.ssh/config, a
+        # project .env) stays the task's own — and a non-path token like
+        # "os.environ" can never spuriously match.
+        try:
+            _home = pathlib.Path.home()
+            for _rel in (".ssh", ".aws", ".gnupg", ".netrc", ".pgpass", ".config/gcloud",
+                         ".docker/config.json", ".kube/config", ".npmrc", "file1.txt"):
+                protected_values.append(_home / _rel)
+        except Exception:
+            pass
+        def _text_forms(value: Any) -> list:
+            # Both the as-given and the symlink-resolved form, so a command using
+            # /var/... matches a root resolved to /private/var/... (macOS) and vice
+            # versa. In production ($HOME paths) the two coincide.
+            out = []
+            for variant in (value, None):
+                try:
+                    p = pathlib.Path(value)
+                    if variant is None:
+                        p = p.resolve(strict=False)
+                    t = str(p).replace("\\", "/").lower().rstrip("/")
+                    if t and t not in out:
+                        out.append(t)
+                except Exception:
+                    continue
+            return out
+
+        def _resolved(value: Any):
+            try:
+                return pathlib.Path(value).resolve(strict=False)
+            except Exception:
+                return None
+
+        protected_texts: list = []
+        protected_paths: list = []
+        for v in protected_values:
+            if not v:
+                continue
+            for t in _text_forms(v):
+                if t not in protected_texts:
+                    protected_texts.append(t)
+            rp = _resolved(v)
+            if rp is not None and rp not in protected_paths:
+                protected_paths.append(rp)
+        allowed_texts: list = []
+        allowed_paths: list = []
+        task_id = task_id_for_artifacts(self._ctx)
+        for data_root in (getattr(self._ctx, "drive_root", None), meta.get("drive_root"), meta.get("budget_drive_root")):
+            if not data_root:
+                continue
+            for rp_src in (pathlib.Path(data_root) / "task_drives" / task_id, task_artifact_dir_path(pathlib.Path(data_root), task_id, create=False)):
+                for t in _text_forms(rp_src):
+                    if t not in allowed_texts:
+                        allowed_texts.append(t)
+                rp = _resolved(rp_src)
+                if rp is not None and rp not in allowed_paths:
+                    allowed_paths.append(rp)
+        return protected_texts, allowed_texts, protected_paths, allowed_paths
+
+    def _external_shell_runtime_or_secret_block(self, raw_cmd: Any, cmd_path_lower: str, args: Dict[str, Any]) -> Optional[str]:
+        """External-workspace shell guard for READ and write commands alike: block any
+        command that targets the Ouroboros runtime (system repo / any data drive) or an
+        owner credential path. read_file/user_files already enforce this; raw shell
+        (cat, python -c open(...), etc.) would otherwise bypass it. Two layers, because
+        string matching alone is bypassable by relative paths and symlinks:
+          (1) embedded-string boundary match of ABSOLUTE protected roots (catches a path
+              literal inside e.g. python -c "open('/abs/data/settings.json')");
+          (2) path-token RESOLUTION — every path-like arg is expanduser'd, joined to the
+              command cwd when relative, and resolve()'d (canonicalizing symlinks + ..),
+              then containment-checked. This closes a relative path passed as its own
+              argv token (`cat ../../data/settings.json`) and a workspace-internal symlink
+              to the data drive (round-2 review).
+        Both layers are best-effort DEFENSE-IN-DEPTH, not the primary control: a relative
+        path hidden INSIDE an interpreter one-liner string (e.g. node -e
+        "readFileSync('../../data/settings.json')") is not a standalone token, so it is
+        not extracted here — and that residual is deliberately NOT chased with a regex
+        over code strings (an unwinnable arms race; BIBLE P5 / no-string-gate doctrine).
+        The PRIMARY control is the gated read_file/user_files path, which fully resolves
+        and containment-checks every read against the protected drives, plus the LLM
+        safety supervisor judging intent on each shell call."""
+        _BLOCK = (
+            "⚠️ WORKSPACE_SHELL_BLOCKED: shell command targets the Ouroboros runtime "
+            "(system repo / data drive) or an owner credential path. External-workspace "
+            "tasks may not read or write those; use the gated read_file tool for any "
+            "inspection you need."
+        )
+        protected_texts, allowed_texts, protected_paths, allowed_paths = self._external_runtime_protected_paths()
+        # (1) embedded-string boundary match (absolute roots only — no substring secret
+        # markers, which would false-block the task's own project files / "os.environ").
+        for pt in protected_texts:
+            if _command_mentions_protected_root(cmd_path_lower, pt) and not any(
+                _command_mentions_protected_root(cmd_path_lower, t) for t in allowed_texts
+            ):
+                return _BLOCK
+        # (2) path-token resolution (relative -> cwd, ~ -> home, symlinks canonicalized).
+        try:
+            work_dir, _r, _a = resolve_shell_cwd(self._ctx, str((args or {}).get("cwd") or ""))
+        except Exception as exc:
+            return shell_cwd_block_message(self._ctx, str((args or {}).get("cwd") or ""), operation="shell", error=exc)
+        work_dir = pathlib.Path(work_dir)
+
+        def _within(child: pathlib.Path, parent: pathlib.Path) -> bool:
+            try:
+                child.relative_to(parent)
+                return True
+            except ValueError:
+                return False
+
+        for tok in shell_argv_with_path_tokens(raw_cmd):
+            tok_text = str(tok or "").strip()
+            if not tok_text or tok_text.startswith("-") or tok_text in {"|", "&&", "||", ";", ">", ">>", "<", "<<", "&"}:
+                continue
+            try:
+                p = pathlib.Path(tok_text).expanduser()
+                resolved = p.resolve(strict=False) if p.is_absolute() else (work_dir / p).resolve(strict=False)
+            except Exception:
+                continue
+            if any(_within(resolved, ap) for ap in allowed_paths):
+                continue
+            if any(_within(resolved, pp) for pp in protected_paths):
+                return _BLOCK
+        return None
 
     def _run_shell_safety_check(self, args: Dict[str, Any], runtime_mode: str) -> Optional[str]:
         """Pre-execution run_command filter; returns a block message or ``None``."""
@@ -1108,8 +1660,8 @@ class ToolRegistry:
             active_root = active_root_declared.resolve(strict=False)
             try:
                 work_dir, _cwd_root, allowed_cwd_roots = resolve_shell_cwd(self._ctx, str(args.get("cwd") or ""))
-            except Exception:
-                work_dir, allowed_cwd_roots = active_root, [("active_workspace", active_root)]
+            except Exception as exc:
+                return shell_cwd_block_message(self._ctx, str(args.get("cwd") or ""), operation="shell", error=exc)
             active_roots = list(dict.fromkeys(pathlib.Path(root) for root in (active_root_declared, active_root_declared.absolute(), active_root)))
             allowed_relative_roots = list(active_roots)
             allowed_data_roots = []
@@ -1136,14 +1688,19 @@ class ToolRegistry:
             pro_workspace_passthrough = str(runtime_mode or "").strip().lower() == "pro" and not acting_subagent
             if not pro_workspace_passthrough and ("../" in cmd_path_lower or cmd_path_lower.startswith("..")):
                 return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell commands may not target paths outside the active workspace."
-            protected_roots = [getattr(self._ctx, "system_repo_dir", None) or getattr(self._ctx, "repo_dir", None)]
+            protected_roots = [getattr(self._ctx, "system_repo_dir", None) or getattr(self._ctx, "repo_dir", None),
+                               getattr(self._ctx, "drive_root", None)]
             try:
                 from ouroboros.config import DATA_DIR as _PARENT_DATA_DIR
                 protected_roots.append(_PARENT_DATA_DIR)
             except Exception:
                 pass
-            if meta.get("budget_drive_root"):
-                protected_roots.append(meta.get("budget_drive_root"))
+            # Every data drive the task touches is runtime/control — parent (above),
+            # plus any child / budget drive in task_metadata (the git guard already
+            # protects these; the shell write guard must match — claudexor B2).
+            for _dk in ("drive_root", "child_drive_root", "headless_child_drive_root", "budget_drive_root"):
+                if meta.get(_dk):
+                    protected_roots.append(meta.get(_dk))
             allowed_data_texts = [str(root).replace("\\", "/").lower() for root in allowed_data_roots]
             protected_paths = []
             for root_value in protected_roots:
@@ -1155,7 +1712,7 @@ class ToolRegistry:
                 if any(root_path.is_relative_to(candidate_root) for candidate_root in active_roots):
                     continue
                 root_text = str(root_path).replace("\\", "/").lower()
-                if root_text and root_text in cmd_path_lower and not any(text and text in cmd_path_lower for text in allowed_data_texts):
+                if _command_mentions_protected_root(cmd_path_lower, root_text) and not any(_command_mentions_protected_root(cmd_path_lower, t) for t in allowed_data_texts):
                     return "⚠️ WORKSPACE_SHELL_BLOCKED: write-like shell command mentions Ouroboros system/data paths."
             path_tokens = list(shell_argv_with_path_tokens(raw_cmd))
             path_tokens.extend(target_token for target_token in explicit_write_targets if target_token and target_token not in path_tokens)
@@ -1240,6 +1797,10 @@ class ToolRegistry:
             return "⚠️ ELEVATION_BLOCKED: shell command pattern looks like an OUROBOROS_RUNTIME_MODE elevation attempt (mentions ``save_settings`` together with ``OUROBOROS_RUNTIME_MODE``, or invokes ``ouroboros.config.save_settings`` directly). Runtime mode is owner-controlled — change it by stopping the agent and editing settings.json directly, then restart."
         if _detect_context_mode_self_lowering(cmd_lower):
             return "⚠️ CONTEXT_MODE_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to lower OUROBOROS_CONTEXT_MODE to low through settings.json or /api/owner/context-mode. Context mode is owner-controlled — ask the owner to change the Low/Max toggle or edit settings while the agent is stopped."
+        if _detect_scope_review_floor_self_lowering(cmd_lower):
+            return "⚠️ SCOPE_REVIEW_FLOOR_SELF_LOWERING_BLOCKED: shell command pattern looks like an attempt to weaken OUROBOROS_SCOPE_REVIEW_FLOOR (e.g. to ``advisory``) through settings.json, /api/settings, or /api/owner/scope-review-floor. The scope-review floor gates the BIBLE P3 blocking review — it is owner-controlled, and the agent must not lower it to slip its own changes past the gate. Ask the owner to change it, or stop the agent and edit settings.json directly."
+        if _detect_owner_skill_attest_self_call(cmd_lower):
+            return "⚠️ OWNER_SKILL_ATTESTATION_SELF_CALL_BLOCKED: shell command pattern looks like an attempt to loopback-POST /api/owner/skills/<skill>/attest-review. Owner-attestation skips the expensive LLM skill review and is OWNER-ONLY — the agent must not self-attest its own skill to bypass the immune system's review. Ask the owner to attest it from the Skills UI."
         if _detect_mutative_toggle_self_change(cmd_lower):
             return "⚠️ ELEVATION_BLOCKED: OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS is owner-controlled (it grants subagents write power against the live body). Change it by stopping the agent and editing settings.json directly, then restart — the agent must not self-enable mutative subagents."
         if _detect_evolution_owner_control_self_change(cmd_lower):
@@ -1284,8 +1845,8 @@ class ToolRegistry:
                         str(args.get("cwd") or ""),
                         operation=operation,
                     )
-                except Exception:
-                    work_dir = active_repo_dir_for(self._ctx)
+                except Exception as exc:
+                    return shell_cwd_block_message(self._ctx, str(args.get("cwd") or ""), operation=operation, error=exc)
                 runtime_data_targets = runtime_data_write_targets(
                     raw_cmd,
                     drive_root=pathlib.Path(self._ctx.drive_root),
@@ -1319,19 +1880,30 @@ class ToolRegistry:
         if "gh auth" in cmd_words:
             return "⚠️ SAFETY_VIOLATION: Modifying GitHub authentication is not permitted."
 
-        # Direct git policy via shell.
+        return self._shell_git_and_runtime_block(raw_cmd, args, cmd_path_lower, workspace_mode, acting_self_worktree)
+
+    def _shell_git_and_runtime_block(
+        self, raw_cmd: Any, args: Dict[str, Any], cmd_path_lower: str,
+        workspace_mode: bool, acting_self_worktree: bool,
+    ) -> Optional[str]:
+        """Direct-git-via-shell policy + the external-workspace runtime/secret read
+        guard. External workspaces get full task-local git (only the Ouroboros
+        runtime is protected) but raw non-git shell still cannot read the runtime/
+        secrets; self_worktree keeps the strict read-only git policy."""
         if workspace_mode and not acting_self_worktree:
-            # External workspace: full git is legitimate task work (clone,
-            # checkout, commit, push to task-local remotes). Deterministic
-            # protection only covers the Ouroboros runtime itself plus the
-            # network resource gate; the LLM safety layer keeps judging intent.
             if git_block := self._external_workspace_git_block(raw_cmd, args):
                 return git_block
+            # Even READ-only, non-git shell (cat/head/grep/python -c open(...)) must
+            # not reach the runtime or secrets — close the raw-shell bypass of the
+            # user_files path guard (scoped to top-level external tasks).
+            if is_external_workspace(self._ctx):
+                if ext_block := self._external_shell_runtime_or_secret_block(raw_cmd, cmd_path_lower, args):
+                    return ext_block
             return None
         if workspace_mode:
-            # Acting self_worktree: a checkout of the Ouroboros repo itself.
-            # The acting-child contract (no commits; patch-based integration)
-            # keeps the strict read-only git policy.
+            # Acting self_worktree: a checkout of the Ouroboros repo itself; the
+            # acting-child contract (no commits; patch integration) keeps the
+            # strict read-only git policy.
             git_violation = workspace_git_safety_violation(
                 raw_cmd,
                 active_root=active_repo_dir_for(self._ctx),
@@ -1538,9 +2110,72 @@ class ToolRegistry:
             )
         return None
 
+    def _ephemeral_block(self, name: str, ext_tool: Any = None, is_mcp: bool = False) -> str:
+        """CW3: a short ephemeral decision turn may call ONLY the allowlisted read/decision
+        tools (_EPHEMERAL_ALLOWED_TOOLS); every other built-in (durable/control/review/skill
+        mutator, run_command) AND all extension/MCP tools fail closed. Default-deny, so a new
+        mutator can never silently become reachable. It answers inline or promote_chat_to_task's
+        the durable work into a supervised task."""
+        if not getattr(self._ctx, "is_ephemeral_turn", False):
+            return ""
+        if ext_tool or is_mcp:
+            return (
+                f"⚠️ EPHEMERAL_TURN_RESTRICTED: external tool '{name}' can have durable side "
+                "effects, which a short same-route decision turn must not do. Answer inline, "
+                "or promote_chat_to_task to do that work in a supervised task."
+            )
+        if name not in _EPHEMERAL_ALLOWED_TOOLS:
+            return (
+                f"⚠️ EPHEMERAL_TURN_RESTRICTED: '{name}' is not in the decision-turn allowlist "
+                "(read/inspect + answer/route/spawn/steer only) — a short same-route turn must "
+                "not do durable/control/review/skill work or run shell. Answer inline, or "
+                "promote_chat_to_task to do it in a supervised task."
+            )
+        return ""
+
+    def _subagent_and_update_gate(
+        self, name, entry, ext_tool, is_mcp, local_readonly_subagent, acting_subagent, acting_tool_grants
+    ) -> str:
+        """Early dispatch gates that return a block message (or "" to allow): the read-only and
+        acting subagent tool-name allowlists, and the managed-update merge write-exclusivity
+        (P2/SC2 — only the authorized resolution task may run code tools while a merge is staged)."""
+        if local_readonly_subagent and entry is not None and name not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
+            return (
+                "⚠️ LOCAL_READONLY_SUBAGENT_BLOCKED: this subagent may inspect "
+                "local repo/data/history plus web/browser surfaces and enabled "
+                "external tools, but may not call first-party local tool "
+                f"{name!r}. Parent tasks must perform writes, commits, review "
+                "gates, tool expansion, runtime control, shell, and skills. "
+                "Nested readonly delegation is allowed only through schedule_subagent "
+                "within configured depth/cap limits."
+            )
+        if acting_subagent and entry is not None and name not in ACTING_SUBAGENT_TOOL_NAMES:
+            return (
+                "⚠️ ACTING_SUBAGENT_BLOCKED: this mutative subagent may read and "
+                "write inside its isolated write root and run shell/services "
+                f"there, but may not call first-party tool {name!r}. It cannot "
+                "commit the live body, run review/runtime/skills lifecycle, enable "
+                "tools, or write cognitive memory; the parent integrates the "
+                "returned patch and is the sole committer."
+            )
+        if acting_subagent and entry is None and (ext_tool or is_mcp) and name not in acting_tool_grants:
+            return (
+                "⚠️ ACTING_SUBAGENT_TOOL_NOT_GRANTED: extension/MCP tool "
+                f"{name!r} is not in this acting subagent's external_tool_grants. "
+                "The parent must grant dynamic tools explicitly per child."
+            )
+        # Cover the full repo-mutating surface explicitly (CODE_TOOLS ∪ _REPO_MUTATION_TOOLS):
+        # write_file/edit_text/claude_code_edit AND shell/process tools (run_command/run_script/
+        # start_service) are all is_code_tool=True, but gating on the union makes the
+        # "no OTHER task writes the repo while a merge is staged" contract robust to flag drift.
+        if entry is not None and (name in self.CODE_TOOLS or name in _REPO_MUTATION_TOOLS):
+            return _managed_update_code_tool_block(self._ctx, name)
+        return ""
+
     def execute(self, name: str, args: Dict[str, Any]) -> str:
         name = str(name or "").strip()
         args = dict(args or {})
+        _normalize_dispatch_path_args(self._ctx, name, args)
         task_constraint = normalize_task_constraint(getattr(self._ctx, "task_constraint", None))
         local_readonly_subagent = self._is_local_readonly_subagent()
         acting_subagent = self._is_acting_subagent()
@@ -1574,35 +2209,28 @@ class ToolRegistry:
             except Exception:
                 _mcp_is_name = None
         is_mcp = bool(_mcp_is_name and _mcp_is_name(name))
+        _eph = self._ephemeral_block(name, ext_tool, is_mcp)  # CW3: built-in deny set + extension/MCP
+        if _eph:
+            return _eph
+        if name in _disabled_tools(self._ctx):
+            return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.disabled_tools withholds {name!r} for this task."
+        available, unavailable_reason, unavailable_detail = _builtin_tool_availability(name, self._ctx)
+        if not available:
+            suffix = f" ({unavailable_detail})" if unavailable_detail else ""
+            return f"⚠️ CAPABILITY_UNAVAILABLE: {name!r} is unavailable: {unavailable_reason}{suffix}."
+        if name == "vlm_query" and str(args.get("image_url") or "").strip() and (
+            not _resource_allowed(self._ctx, "web") or not _resource_allowed(self._ctx, "network")
+        ):
+            return "⚠️ RESOURCE_CONSTRAINT_BLOCKED: remote image_url for vlm_query requires allowed_resources.web/network."
         if name in _WEB_TOOLS and not _resource_allowed(self._ctx, "web"):
             return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.web=false blocks {name!r}."
         if (is_mcp or ext_tool) and not _resource_allowed(self._ctx, "network"):
             return f"⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false blocks external tool {name!r}."
-        if local_readonly_subagent and entry is not None and name not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES:
-            return (
-                "⚠️ LOCAL_READONLY_SUBAGENT_BLOCKED: this subagent may inspect "
-                "local repo/data/history plus web/browser surfaces and enabled "
-                "external tools, but may not call first-party local tool "
-                f"{name!r}. Parent tasks must perform writes, commits, review "
-                "gates, tool expansion, runtime control, shell, and skills. "
-                "Nested readonly delegation is allowed only through schedule_subagent "
-                "within configured depth/cap limits."
-            )
-        if acting_subagent and entry is not None and name not in ACTING_SUBAGENT_TOOL_NAMES:
-            return (
-                "⚠️ ACTING_SUBAGENT_BLOCKED: this mutative subagent may read and "
-                "write inside its isolated write root and run shell/services "
-                f"there, but may not call first-party tool {name!r}. It cannot "
-                "commit the live body, run review/runtime/skills lifecycle, enable "
-                "tools, or write cognitive memory; the parent integrates the "
-                "returned patch and is the sole committer."
-            )
-        if acting_subagent and entry is None and (ext_tool or is_mcp) and name not in acting_tool_grants:
-            return (
-                "⚠️ ACTING_SUBAGENT_TOOL_NOT_GRANTED: extension/MCP tool "
-                f"{name!r} is not in this acting subagent's external_tool_grants. "
-                "The parent must grant dynamic tools explicitly per child."
-            )
+        _gate = self._subagent_and_update_gate(
+            name, entry, ext_tool, is_mcp, local_readonly_subagent, acting_subagent, acting_tool_grants
+        )
+        if _gate:
+            return _gate
 
         workspace_block_reason = ""
         try:
@@ -1669,7 +2297,14 @@ class ToolRegistry:
             drive_root=pathlib.Path(self._ctx.drive_root),
         )
         synth_constraint = short_form_decision.constraint
-        # Prefer specific skill payload arg errors over generic light-mode block.
+        # Prefer specific skill payload arg errors over generic light-mode block —
+        # but ONLY when the model genuinely targeted a skill payload. B2 footgun:
+        # in external/normal workspaces models reflexively fill bucket="external"
+        # (a real skill-bucket name) on an ordinary active_workspace edit; the
+        # short-form then errors and the edit was hard-blocked, forcing fallback
+        # to shell rewrites. Hard-block only for an explicit skill-payload intent
+        # (root=skill_payload or an active skill_repair task); otherwise the
+        # bucket/skill_name are noise — drop them and do the normal edit.
         if (
             (raw_bucket or raw_skill_name)
             and short_form_decision.error
@@ -1679,7 +2314,19 @@ class ToolRegistry:
                 "claude_code_edit",
             )
         ):
-            return f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {short_form_decision.error}"
+            _root_arg = str(args.get("root", "") or "").strip().lower()
+            if _stray_skill_payload_failsoft(_root_arg, workspace_mode, task_constraint):
+                log.info(
+                    "Ignoring stray bucket/skill_name on %s (workspace edit, root=%s): %s",
+                    name, _root_arg or "active_workspace", short_form_decision.error[:80],
+                )
+                args.pop("bucket", None)
+                args.pop("skill_name", None)
+                raw_bucket = ""
+                raw_skill_name = ""
+                synth_constraint = None
+            else:
+                return f"⚠️ SKILL_PAYLOAD_ARG_ERROR: {short_form_decision.error}"
         # Real skill_repair constraints beat synthesized short-form constraints.
         redirect_err = cross_skill_redirect_error(task_constraint, synth_constraint)
         if redirect_err and name in (
@@ -1749,7 +2396,7 @@ class ToolRegistry:
                     action=f"run tool {name!r} against",
                 )
 
-        if name in _PROCESS_COMMAND_TOOLS:
+        if name in _SHELL_GUARDED_TOOLS:
             if name == "start_service" and _runtime_mode == "light" and not workspace_mode:
                 try:
                     _, service_cwd_root, _ = resolve_shell_cwd(self._ctx, str(args.get("cwd") or ""), operation="service")
@@ -1790,9 +2437,18 @@ class ToolRegistry:
         )
         try:
             try:
+                if entry is not None:
+                    _normalize_tool_call_args(entry, args)
+                    public_params = set(_entry_public_params(entry))
+                    if _entry_has_public_param_schema(entry) and any(key not in public_params for key in args):
+                        return _format_tool_arg_error(entry)
+                try:
+                    inspect.signature(entry.handler).bind(self._ctx, **args)
+                except TypeError:
+                    return _format_tool_arg_error(entry)
                 result = entry.handler(self._ctx, **args)
             except TypeError as e:
-                return f"⚠️ TOOL_ARG_ERROR ({name}): {e}"
+                return f"⚠️ TOOL_ERROR ({name}): {e}"
             except Exception as e:
                 return f"⚠️ TOOL_ERROR ({name}): {e}"
         finally:

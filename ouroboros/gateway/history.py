@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import pathlib
 from typing import Any, Dict, Optional
@@ -26,11 +27,15 @@ _PROGRESS_META_FIELDS = (
     "accepted",
     "active_subagent_count",
     "max_active_subagents",
+    "queued_behind_active_cap",
+    "required_capabilities",
     "write_surface",
     "status",
     "cost_usd",
     "result",
+    "result_truncated",
     "trace_summary",
+    "trace_summary_truncated",
     "error",
     "artifact_status",
     "worker_saturation_warning",
@@ -166,27 +171,34 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
             project_chat_ids = registered_project_chat_ids(data_dir)
         except Exception:
             project_chat_ids = set()
-        bound_chat_cache: Dict[str, int] = {}
+        bound_chat_cache: Dict[tuple, int] = {}
 
-        def _bound_project_chat(task_id: str) -> int:
+        def _bound_project_chat(task_id: str, parent_task_id: str = "", root_task_id: str = "") -> int:
+            # Resolve by LINEAGE (own binding -> parent -> root) so a subagent's rows
+            # classify into its root's project thread (only the root is bound).
             tid = str(task_id or "").strip()
             if not tid:
                 return 0
-            if tid in bound_chat_cache:
-                return bound_chat_cache[tid]
+            key = (tid, str(parent_task_id or ""), str(root_task_id or ""))
+            if key in bound_chat_cache:
+                return bound_chat_cache[key]
             try:
-                from ouroboros.projects_registry import project_chat_for_task
+                from ouroboros.projects_registry import project_chat_for_task_tree
 
-                bound_chat_cache[tid] = int(project_chat_for_task(data_dir, tid) or 0)
+                bound_chat_cache[key] = int(project_chat_for_task_tree(data_dir, tid, parent_task_id, root_task_id) or 0)
             except Exception:
-                bound_chat_cache[tid] = 0
-            return bound_chat_cache[tid]
+                bound_chat_cache[key] = 0
+            return bound_chat_cache[key]
 
         def _row_matches_thread(entry_chat: int, entry: Optional[dict] = None) -> bool:
             # A post-hoc bound task keeps its original (main) chat_id on its rows
-            # but belongs to a project — classify by the durable binding too.
+            # but belongs to a project — classify by the durable LINEAGE binding too.
             bound_chat = (
-                _bound_project_chat(str(entry.get("task_id") or "")) if isinstance(entry, dict) else 0
+                _bound_project_chat(
+                    str(entry.get("task_id") or ""),
+                    str(entry.get("parent_task_id") or ""),
+                    str(entry.get("root_task_id") or ""),
+                ) if isinstance(entry, dict) else 0
             )
             if thread_id in project_chat_ids:
                 if bound_chat == thread_id:
@@ -206,7 +218,10 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
 
         chat_path = data_dir / "logs" / "chat.jsonl"
         try:
-            for entry in iter_jsonl_objects(chat_path):
+            # WS4: parse the jsonl off the event loop (file read + json decode) so a
+            # large history can't block the loop / delay WS broadcasts on reconnect.
+            _chat_entries = await asyncio.to_thread(lambda p=chat_path: list(iter_jsonl_objects(p)))
+            for entry in _chat_entries:
                 # Skip A2A virtual chat_ids so A2A task traffic does not appear in human chat history.
                 if is_a2a_chat_id(entry.get("chat_id", 1)):
                     continue
@@ -249,7 +264,8 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
 
         progress_path = data_dir / "logs" / "progress.jsonl"
         try:
-            for entry in iter_jsonl_objects(progress_path):
+            _progress_entries = await asyncio.to_thread(lambda p=progress_path: list(iter_jsonl_objects(p)))
+            for entry in _progress_entries:
                 # Skip A2A virtual chat_ids.
                 if is_a2a_chat_id(entry.get("chat_id", 1)):
                     continue
@@ -318,8 +334,18 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
                 for m in combined
                 if m.get("is_progress") and m.get("task_id")
             }
+            # Cluster B: a card can also be (re)built from a task_summary row (a finished
+            # task with no retained progress row), so include those task ids — else their
+            # suggested_name would be lost on reload despite the persisted-title contract.
+            summary_task_ids = {
+                str(m.get("task_id") or "")
+                for m in combined
+                if str(m.get("system_type") or "") == "task_summary" and m.get("task_id")
+            }
+            card_task_ids = progress_task_ids | summary_task_ids
             terminal_status_by_task: Dict[str, str] = {}
-            for tid in progress_task_ids:
+            suggested_name_by_task: Dict[str, str] = {}
+            for tid in card_task_ids:
                 try:
                     # Effective (not raw) status: applies the stale-orphan guard so a
                     # task whose worker was SIGKILLed (/panic, crash) and never wrote a
@@ -331,13 +357,24 @@ def make_chat_history_endpoint(data_dir: pathlib.Path):
                 status = str((res or {}).get("status") or "")
                 if status in FINAL_STATUSES:
                     terminal_status_by_task[tid] = status
-            if terminal_status_by_task:
+                # The proactively-coined project name (rendered as the card title), reusing
+                # the result we already loaded — no extra file read.
+                nm = str((res or {}).get("suggested_name") or "").strip()
+                if nm:
+                    suggested_name_by_task[tid] = nm
+            if terminal_status_by_task or suggested_name_by_task:
                 for m in combined:
-                    if not m.get("is_progress"):
+                    tid = str(m.get("task_id") or "")
+                    if not tid:
                         continue
-                    status = terminal_status_by_task.get(str(m.get("task_id") or ""))
-                    if status:
-                        m["task_terminal_status"] = status
+                    if m.get("is_progress"):
+                        status = terminal_status_by_task.get(tid)
+                        if status:
+                            m["task_terminal_status"] = status
+                    nm = suggested_name_by_task.get(tid)
+                    # Attach to progress AND task_summary rows (both can build a card).
+                    if nm and (m.get("is_progress") or str(m.get("system_type") or "") == "task_summary"):
+                        m["suggested_name"] = nm
         except Exception as exc:
             log.debug("Failed to annotate terminal task status in history: %s", exc)
 

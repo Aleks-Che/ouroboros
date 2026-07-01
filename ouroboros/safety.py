@@ -46,7 +46,6 @@ TOOL_POLICY: Dict[str, str] = {
     "journal_read": POLICY_SKIP,
     "workpad_read": POLICY_SKIP,
     "web_search": POLICY_SKIP,
-    "codebase_digest": POLICY_SKIP,
     "codebase_health": POLICY_SKIP,
     "search_code": POLICY_SKIP,
     "query_code": POLICY_SKIP,
@@ -54,6 +53,10 @@ TOOL_POLICY: Dict[str, str] = {
     "memory_map": POLICY_SKIP,
     "analyze_screenshot": POLICY_SKIP,
     "vlm_query": POLICY_SKIP,
+    "view_image": POLICY_SKIP,
+    "ocr_pdf": POLICY_SKIP,
+    "youtube_transcript": POLICY_SKIP,
+    "extract_video_frames": POLICY_SKIP,
     "browse_page": POLICY_SKIP,
     "browser_action": POLICY_SKIP,
     "list_github_prs": POLICY_SKIP,
@@ -64,8 +67,10 @@ TOOL_POLICY: Dict[str, str] = {
     "task_acceptance_review": POLICY_SKIP,
     "review_status": POLICY_SKIP,
     "get_task_result": POLICY_SKIP,
+    "peek_task": POLICY_SKIP,
     "wait_task": POLICY_SKIP,
     "wait_tasks": POLICY_SKIP,
+    "list_projects": POLICY_SKIP,
     "switch_model": POLICY_SKIP,
     "service_status": POLICY_SKIP,
     "service_logs": POLICY_SKIP,
@@ -78,7 +83,14 @@ TOOL_POLICY: Dict[str, str] = {
     "knowledge_write": POLICY_SKIP,
     "journal_write": POLICY_SKIP,
     "workpad_write": POLICY_SKIP,
+    # Bounded local task-tree coordination ledger (append-only, size-capped, tree-scoped):
+    # same trust class as journal/workpad — no external effect.
+    "tree_note": POLICY_SKIP,
+    "tree_read": POLICY_SKIP,
     "promote_chat_to_task": POLICY_SKIP,
+    "ensure_project_scope": POLICY_SKIP,
+    "route_to_project": POLICY_SKIP,
+    "steer_task": POLICY_SKIP,
     "update_scratchpad": POLICY_SKIP,
     "update_identity": POLICY_SKIP,
     "memory_update_registry": POLICY_SKIP,
@@ -90,6 +102,10 @@ TOOL_POLICY: Dict[str, str] = {
     # Control / messaging / internal side effects.
     "schedule_subagent": POLICY_SKIP,
     "cancel_task": POLICY_SKIP,
+    # Parent's explicit decision to abandon a child result: stamps parent_decision +
+    # records the reason on the tree ledger; tree-scoped, no external effect (like cancel_task).
+    "discard_child_result": POLICY_SKIP,
+    "override_delegation_constraint": POLICY_SKIP,
     "request_restart": POLICY_SKIP,
     "request_deep_self_review": POLICY_SKIP,
     "set_tool_timeout": POLICY_SKIP,
@@ -121,6 +137,9 @@ TOOL_POLICY: Dict[str, str] = {
     # Conditional: run_command safe-subject whitelist.
     "run_command": POLICY_CHECK_CONDITIONAL,
     "run_script": POLICY_CHECK_CONDITIONAL,
+    # verify_and_record runs the agent's declared `check` command like run_command,
+    # so it carries the same conditional safe-subject gate over that command (FR3).
+    "verify_and_record": POLICY_CHECK_CONDITIONAL,
 
     # Read-only best-of-N comparison of children's returned patches (applies nothing).
     "compare_subagent_patches": POLICY_SKIP,
@@ -444,7 +463,7 @@ _REMOTE_PROVIDER_KEYS = (
 
 _LOCAL_ROUTING_KEYS = (
     "USE_LOCAL_MAIN",
-    "USE_LOCAL_CODE",
+    "USE_LOCAL_HEAVY",
     "USE_LOCAL_LIGHT",
     "USE_LOCAL_CONSCIOUSNESS",
     "USE_LOCAL_FALLBACK",
@@ -499,6 +518,22 @@ def _light_model_has_reachable_provider(light_model: str) -> bool:
         if not base_url:
             return False
     return True
+
+
+def _safety_deadline_epoch(ctx: Optional[Any]) -> Optional[float]:
+    """Task deadline as epoch seconds from the live ToolContext metadata. ToolContext has no
+    ``deadline_ts`` field, so derive it the same way loop.py::_task_deadline_epoch does — this
+    bounds the model-concurrency slot wait by the REAL task deadline (else the 180s ceiling)."""
+    meta = getattr(ctx, "task_metadata", {}) if ctx is not None else {}
+    if not isinstance(meta, dict):
+        return None
+    try:
+        from ouroboros.deadline_utils import parse_deadline_ts
+
+        dl = parse_deadline_ts(meta.get("deadline_at"))
+        return dl.timestamp() if dl is not None else None
+    except Exception:
+        return None
 
 
 def _resolve_safety_routing() -> Tuple[bool, bool, Optional[str]]:
@@ -595,20 +630,28 @@ def _run_llm_check(
             update_budget_from_usage(usage_payload)
 
     try:
+        from ouroboros import model_concurrency
         from ouroboros.llm_observability import chat_observed
 
-        msg, usage = chat_observed(
-            client,
-            drive_root=pathlib.Path(getattr(ctx, "drive_root", "../data")) if ctx is not None else pathlib.Path("../data"),
-            task_id=str(getattr(ctx, "task_id", "") or "safety"),
-            call_type="safety_supervisor",
-            messages=[
-                {"role": "system", "content": _get_safety_prompt()},
-                {"role": "user", "content": prompt},
-            ],
-            model=light_model,
-            use_local=_use_local_light,
-        )
+        # The safety supervisor runs the LIGHT model per tool call on every in-process
+        # subagent thread — the highest-frequency LIGHT consumer. Share the v6.40 per-model
+        # self-DoS slot (like project_naming) so a burst of concurrent safety checks can't
+        # storm the same light route. Fail-soft + deadline-bounded; never blocks past it.
+        with model_concurrency.model_call_slot(
+            light_model, _use_local_light, _safety_deadline_epoch(ctx)
+        ):
+            msg, usage = chat_observed(
+                client,
+                drive_root=pathlib.Path(getattr(ctx, "drive_root", "../data")) if ctx is not None else pathlib.Path("../data"),
+                task_id=str(getattr(ctx, "task_id", "") or "safety"),
+                call_type="safety_supervisor",
+                messages=[
+                    {"role": "system", "content": _get_safety_prompt()},
+                    {"role": "user", "content": prompt},
+                ],
+                model=light_model,
+                use_local=_use_local_light,
+            )
     except Exception as e:
         from ouroboros.utils import sanitize_tool_result_for_log
 
@@ -651,18 +694,23 @@ def _run_llm_check(
                 "Original proposed tool call follows again.\n\n"
                 f"{prompt}"
             )
-            repair_msg, repair_usage = chat_observed(
-                client,
-                drive_root=pathlib.Path(getattr(ctx, "drive_root", "../data")) if ctx is not None else pathlib.Path("../data"),
-                task_id=str(getattr(ctx, "task_id", "") or "safety"),
-                call_type="safety_supervisor_repair",
-                messages=[
-                    {"role": "system", "content": _get_safety_prompt()},
-                    {"role": "user", "content": repair_prompt},
-                ],
-                model=light_model,
-                use_local=_use_local_light,
-            )
+            from ouroboros import model_concurrency
+
+            with model_concurrency.model_call_slot(
+                light_model, _use_local_light, _safety_deadline_epoch(ctx)
+            ):
+                repair_msg, repair_usage = chat_observed(
+                    client,
+                    drive_root=pathlib.Path(getattr(ctx, "drive_root", "../data")) if ctx is not None else pathlib.Path("../data"),
+                    task_id=str(getattr(ctx, "task_id", "") or "safety"),
+                    call_type="safety_supervisor_repair",
+                    messages=[
+                        {"role": "system", "content": _get_safety_prompt()},
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    model=light_model,
+                    use_local=_use_local_light,
+                )
             _emit_safety_usage(repair_usage)
             result = _parse_safety_response(repair_msg.get("content") or "")
         except Exception as exc:
@@ -715,6 +763,13 @@ def check_safety(
         raw_cmd = arguments.get("cmd", arguments.get("command", ""))
         if tool_name == "run_script":
             raw_cmd = arguments.get("script", raw_cmd)
+        elif tool_name == "verify_and_record":
+            # A LIST `check` is argv (no shell), so it is safe-subject eligible like
+            # run_command. A STRING `check` runs through `sh -c` (shell interpretation),
+            # so a safe-looking first word could hide a compound command (`cat x; rm -rf`)
+            # — force the full LLM review for string checks (no safe-subject bypass).
+            check = arguments.get("check")
+            raw_cmd = check if isinstance(check, (list, tuple)) else None
         if _normalize_safe_shell_subject(raw_cmd):
             return True, ""
         return _run_llm_check(tool_name, arguments, messages, ctx)

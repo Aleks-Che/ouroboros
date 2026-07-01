@@ -26,7 +26,7 @@ const VALUE_FIELDS = [
     ['s-effort-task', 'OUROBOROS_EFFORT_TASK', 'medium'], ['s-effort-evolution', 'OUROBOROS_EFFORT_EVOLUTION', 'high'], ['s-effort-review', 'OUROBOROS_EFFORT_REVIEW', 'medium'],
     ['s-effort-consciousness', 'OUROBOROS_EFFORT_CONSCIOUSNESS', 'high'], ['s-effort-scope-review', 'OUROBOROS_EFFORT_SCOPE_REVIEW', 'high'], ['s-effort-deep-self-review', 'OUROBOROS_EFFORT_DEEP_SELF_REVIEW', 'high'],
     ['s-review-enforcement', 'OUROBOROS_REVIEW_ENFORCEMENT', 'advisory'], ['s-task-review-mode', 'OUROBOROS_TASK_REVIEW_MODE', 'auto'], ['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced'],
-    ['s-context-mode', 'OUROBOROS_CONTEXT_MODE', 'max'],
+    ['s-context-mode', 'OUROBOROS_CONTEXT_MODE', 'max'], ['s-image-input-mode', 'OUROBOROS_IMAGE_INPUT_MODE', 'auto'],
 ];
 const NUMBER_FIELDS = [
     ['s-workers', 'OUROBOROS_MAX_WORKERS', 10], ['s-active-subagents', 'OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT', 3], ['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2], ['s-soft-timeout', 'OUROBOROS_SOFT_TIMEOUT_SEC', 600], ['s-hard-timeout', 'OUROBOROS_HARD_TIMEOUT_SEC', 1800],
@@ -472,7 +472,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
         setupModelSlots().forEach((slot) => {
             applyInputValue(slot.settingsInputId, s[slot.settingKey]);
-            applyCheckboxValue(slot.settingsToggleId, s[`USE_LOCAL_${slot.slot.toUpperCase()}`]);
+            if (slot.settingsToggleId) applyCheckboxValue(slot.settingsToggleId, s[`USE_LOCAL_${slot.slot.toUpperCase()}`]);
         });
         applyCheckboxValue('s-auto-grant-reviewed-skills', s.OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS);
         // Owner-facing mutative-subagents control is explicit On/Off. Legacy empty
@@ -624,7 +624,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         };
         setupModelSlots().forEach((slot) => {
             body[slot.settingKey] = fieldValue(slot.settingsInputId);
-            body[`USE_LOCAL_${slot.slot.toUpperCase()}`] = Boolean(byId(slot.settingsToggleId)?.checked);
+            if (slot.settingsToggleId) body[`USE_LOCAL_${slot.slot.toUpperCase()}`] = Boolean(byId(slot.settingsToggleId)?.checked);
         });
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => {
             const value = fieldValue(id).trim();
@@ -713,12 +713,42 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const next = input.value || 'max';
         const current = currentSettings?.OUROBOROS_CONTEXT_MODE || 'max';
         if (next === current) return null;
-        // Owner-only + hot-apply (next task, no restart); no confirm needed.
-        const result = await apiClient.ownerContextMode(next);
-        if (!result || result.ok !== true) {
-            throw new Error(result?.error || 'Context mode change failed.');
+        // Owner-only + hot-apply (next task, no restart). Max needs the active model's
+        // 1M-token window confirmed; on a 409 needs_ack, share the chat-toggle's ack flow
+        // (CW8) — confirm, POST the route-scoped capability-ack, retry — instead of a
+        // generic failure.
+        try {
+            const result = await apiClient.ownerContextMode(next);
+            if (!result || result.ok !== true) {
+                throw new Error(result?.error || 'Context mode change failed.');
+            }
+            return result;
+        } catch (e) {
+            const ack = (e && e.status === 409 && e.body && e.body.needs_ack) ? e.body.needs_ack : null;
+            if (!(next === 'max' && ack && ack.model)) {
+                throw e;
+            }
+            const confirmed = window.confirm(
+                `${(e.body && e.body.error) || 'Max context mode needs a confirmed 1M-token window.'}\n\n` +
+                `Confirm that this model supports a 1,000,000-token context window?\n` +
+                `  provider: ${ack.provider || '(default)'}\n  model: ${ack.model}\n` +
+                `  base_url: ${ack.base_url || '(default)'}\n\n` +
+                `This applies only to this exact model/provider and is removed if you change it.`
+            );
+            if (!confirmed) {
+                throw new Error('Max context mode was not confirmed.');
+            }
+            // Throws on a non-ok ack (surfaced by the save handler's catch).
+            await apiClient.ownerCapabilityAck({
+                provider: ack.provider, model: ack.model, base_url: ack.base_url,
+                window_tokens: 1000000, note: 'owner-confirmed via settings save',
+            });
+            const retry = await apiClient.ownerContextMode(next);
+            if (!retry || retry.ok !== true) {
+                throw new Error(retry?.error || 'Context mode change failed after confirmation.');
+            }
+            return retry;
         }
-        return result;
     }
 
     syncSettingsLoadState();
@@ -980,6 +1010,11 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             }
             if (data.warnings && data.warnings.length) {
                 statusMsg += ' ⚠️ ' + data.warnings.join(' | ');
+                statusType = 'warn';
+            }
+            if (data.context_mode_downgraded) {
+                // The new model can't sustain Max, so context mode auto-dropped to Low.
+                statusMsg = `${statusMsg} ${data.notice || 'Context mode switched to Low.'}`;
                 statusType = 'warn';
             }
             if (runtimeModeResult?.restart_required) {

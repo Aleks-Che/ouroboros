@@ -85,7 +85,8 @@ def test_redactor_records_key_and_value_rules_without_secret_leak():
 
 
 def test_persist_call_writes_private_full_and_redacted_refs(tmp_path):
-    payload = {"tool": "run_command", "args": {"token": "ghp_abcdefghijklmnopqrstuvwxyz123456"}}
+    # Built by concatenation so the staged source never contains a literal PAT pattern.
+    payload = {"tool": "run_command", "args": {"token": "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"}}
 
     refs = persist_call(
         tmp_path,
@@ -112,14 +113,35 @@ def test_persist_call_writes_private_full_and_redacted_refs(tmp_path):
     assert _read_gzip_json(redacted_path)["args"]["token"] == "***REDACTED***"
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # Default: the authoritative blob is REDACTED so no raw secret lands on disk;
+    # structure is preserved and the redaction is declared honestly.
+    assert manifest["full_payload_redacted"] is True
+    assert refs["full_payload_redacted"] is True
     full_path = manifest["full_payload_ref"]["path"]
     if posix_private_modes_supported():
         assert os.stat(full_path).st_mode & 0o777 == 0o600
-    assert _read_gzip_json(full_path)["args"]["token"].startswith("ghp_")
+    assert _read_gzip_json(full_path)["args"]["token"] == "***REDACTED***"
     assert manifest["call_type"] == "tool_call"
     assert manifest["redaction"]["redacted"] is True
     assert manifest["full_payload_ref"]["sha256"]
     assert refs["manifest_ref"]["sha256"] == __import__("hashlib").sha256(manifest_path.read_bytes()).hexdigest()
+
+
+def test_persist_call_keep_raw_env_persists_unredacted(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_OBSERVABILITY_KEEP_RAW", "1")
+    payload = {"tool": "run_command", "args": {"token": "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"}}
+    refs = persist_call(
+        tmp_path, task_id="task-1", call_id="call-1", call_type="tool_call",
+        payload=payload, manifest={"model": "test/model"},
+    )
+    manifest_path = tmp_path / "observability" / "calls" / "task-1" / "call-1.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # KEEP_RAW: authoritative blob holds the raw payload; the redacted projection is separate.
+    assert manifest["full_payload_redacted"] is False
+    assert refs["full_payload_redacted"] is False
+    assert _read_gzip_json(manifest["full_payload_ref"]["path"])["args"]["token"].startswith("ghp_")
+    assert _read_gzip_json(refs["redacted_projection_ref"]["path"])["args"]["token"] == "***REDACTED***"
+    assert manifest["full_payload_ref"]["path"] != refs["redacted_projection_ref"]["path"]
 
 
 def test_write_blob_accepts_concurrent_same_payload_publish(tmp_path):
@@ -181,6 +203,43 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
     assert tool_failure["failure"]["kind"] == "tool"
     assert tool_failure["failure"]["tool_errors"][0]["status"] == "artifact_output_error"
 
+    answer_with_tool_error = derive_loop_outcome(
+        "FINAL ANSWER: 42",
+        {"rounds": 2},
+        {"tool_calls": [{
+            "tool": "run_command",
+            "is_error": True,
+            "status": "tool_failure",
+            "result": "bad probe",
+        }]},
+    )
+    assert answer_with_tool_error["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
+    assert answer_with_tool_error["outcome_axes"]["execution"]["reason_code"] == "tool_failure"
+    assert answer_with_tool_error["reason_code"] == "final_message"
+    assert answer_with_tool_error["failure"] is None
+    assert answer_with_tool_error["final_answer"] == "42"
+
+    stale_latch = derive_loop_outcome(
+        "I kept working and hit a tool issue.",
+        {"rounds": 2},
+        {
+            "best_valid_final_answer": "draft",
+            "best_valid_final_answer_tools": 0,
+            "tool_calls": [{
+                "tool": "run_command",
+                "is_error": True,
+                "status": "tool_failure",
+                "result": "bad probe",
+            }],
+        },
+    )
+    assert stale_latch["final_answer"] == ""
+    assert stale_latch["reason_code"] == "tool_failure"
+
+    # A2 (v6.50.2): an access-policy block on a READ-ONLY exploratory tool is honest
+    # telemetry, not a degraded execution — the agent simply could not look there. It is
+    # routed to a fully-ignored bucket (recorded as ignored_tool_errors) and never sets
+    # tool_failure or a residual warning.
     for tool_name, status in (
         ("web_search", "resource_constraint_blocked"),
         ("read_file", "resource_policy_blocked"),
@@ -195,9 +254,26 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
                 "result": f"⚠️ {status.upper()}: blocked",
             }]},
         )
-        assert policy_block["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-        assert policy_block["reason_code"] == "tool_failure"
-        assert policy_block["failure"]["tool_errors"][0]["status"] == status
+        execution = policy_block["outcome_axes"]["execution"]
+        assert execution["status"] == EXECUTION_OK
+        assert policy_block["reason_code"] == "final_message"
+        assert policy_block["failure"] is None
+        assert execution["ignored_tool_errors"][0]["status"] == status
+
+    # Boundary: the SAME access-policy block on a NON-read-only effect tool (run_command)
+    # is a real degraded execution — the demotion is scoped to read-only exploratory tools.
+    write_block = derive_loop_outcome(
+        "Done.",
+        {"rounds": 1},
+        {"tool_calls": [{
+            "tool": "run_command",
+            "is_error": True,
+            "status": "resource_policy_blocked",
+            "result": "⚠️ RESOURCE_POLICY_BLOCKED: blocked",
+        }]},
+    )
+    assert write_block["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
+    assert write_block["reason_code"] == "tool_failure"
 
 
 def test_forced_finalization_with_answer_is_best_effort():
@@ -207,7 +283,7 @@ def test_forced_finalization_with_answer_is_best_effort():
     non-empty non-error text."""
     from ouroboros.outcomes import EXECUTION_BEST_EFFORT, derive_loop_outcome
 
-    for reason in ("budget_exhausted", "round_limit", "finalization_grace"):
+    for reason in ("budget_exhausted", "round_limit", "finalization_grace", "deadline_local"):
         outcome = derive_loop_outcome(
             "Partial result: 3 of 5 modules fixed. Unverified: integration tests.",
             {"execution_status": "failed", "reason_code": reason, "_best_effort_extracted": True},
@@ -318,6 +394,29 @@ def test_outcome_tier_aggregation_and_objective_mapping():
     assert "outcome_tier" not in legacy["outcome_axes"]["objective"]
 
 
+def test_outcome_tier_quorum_pass_not_poisoned_by_dissenting_slot():
+    """A quorum PASS must take its tier from the CONTRIBUTING PASS actors only; a
+    single dissenting/degraded slot's pessimistic tier must not drag the objective
+    to fail (same non-surrender rule as the aggregate-signal quorum)."""
+    from ouroboros.outcomes import derive_loop_outcome
+
+    trace = {
+        "tool_calls": [], "reasoning_notes": [],
+        "review_runs": [{
+            "aggregate_signal": "PASS",  # 2-of-3 PASS quorum
+            "actors": [
+                {"status": "ok", "signal": "PASS", "parsed": {"verdict": "PASS", "outcome_tier": "solved"}},
+                {"status": "ok", "signal": "PASS", "parsed": {"verdict": "PASS", "outcome_tier": "solved"}},
+                # Dissenting slot: degraded, pessimistic tier — must be ignored on a PASS run.
+                {"status": "ok", "signal": "DEGRADED", "parsed": {"outcome_tier": "blocked_with_evidence"}},
+            ],
+        }],
+    }
+    out = derive_loop_outcome("done", {}, trace)
+    assert out["outcome_axes"]["objective"]["status"] == "pass"
+    assert out["outcome_axes"]["objective"]["outcome_tier"] == "solved"
+
+
 def test_final_answer_extraction():
     from ouroboros.outcomes import derive_loop_outcome, extract_final_answer
 
@@ -408,6 +507,7 @@ def test_normalize_outcome_axes_canonicalizes_partial_and_unknown_legacy():
                 "args": {"root": "user_files", "path": "Desktop/report.html"},
                 "is_error": False,
                 "status": "ok",
+                "artifact_registered": True,
                 "result": "OK: wrote user_files:Desktop/report.html\nARTIFACT_OUTPUTS: registered user file -> artifact_store:report.html",
             },
         ]},
@@ -417,7 +517,12 @@ def test_normalize_outcome_axes_canonicalizes_partial_and_unknown_legacy():
     assert recovered["outcome_axes"]["execution"]["recoveries"][0]["status"] == "edit_text_blocked"
     assert recovered["outcome_axes"]["execution"]["recoveries"][0]["recovered_by_call_index"] == 2
 
-    unrelated_recovery = derive_loop_outcome(
+    # T4 (v6.35.0): an unrecovered one-shot run_command non-zero exit is COSMETIC,
+    # not a degraded execution. The error is preserved on the execution axis for
+    # monitoring; because no acceptance review ran, the objective carries a
+    # structural warning so the default-`auto` path still flags a possible
+    # overclaim (honesty moves to the LLM review axis — Bible P5).
+    cosmetic_shell = derive_loop_outcome(
         "Created another file.",
         {"rounds": 3},
         {"tool_calls": [
@@ -433,12 +538,15 @@ def test_normalize_outcome_axes_canonicalizes_partial_and_unknown_legacy():
                 "args": {"root": "user_files", "path": "Desktop/other.html"},
                 "is_error": False,
                 "status": "ok",
+                "artifact_registered": True,
                 "result": "OK: wrote user_files:Desktop/other.html\nARTIFACT_OUTPUTS: registered user file -> artifact_store:other.html",
             },
         ]},
     )
-    assert unrelated_recovery["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert unrelated_recovery["reason_code"] == "tool_failure"
+    assert cosmetic_shell["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert cosmetic_shell["failure"] is None
+    assert cosmetic_shell["outcome_axes"]["execution"]["cosmetic_tool_errors"][0]["status"] == "non_zero_exit"
+    assert cosmetic_shell["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
     cleanup_failure = derive_loop_outcome(
         "Done",
@@ -457,6 +565,56 @@ def test_normalize_outcome_axes_canonicalizes_partial_and_unknown_legacy():
     )
     assert cleanup_failure["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
     assert cleanup_failure["failure"]["kind"] == "verification"
+
+
+def test_t4_cosmetic_partition_guards():
+    # A blocking-status trailing error STILL degrades (partition is structural).
+    blocking = derive_loop_outcome(
+        "Done",
+        {"rounds": 2},
+        {"tool_calls": [{
+            "tool": "write_file",
+            "args": {"root": "active_workspace", "path": "x.py"},
+            "is_error": True,
+            "status": "write_file_blocked",
+            "result": "⚠️ WRITE_FILE_BLOCKED: protected path",
+        }]},
+    )
+    assert blocking["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
+
+    # A failed-then-rerun-IDENTICAL run_command is RECOVERED, not cosmetic.
+    recovered = derive_loop_outcome(
+        "Built it.",
+        {"rounds": 2},
+        {"tool_calls": [
+            {"tool": "run_command", "args": {"cmd": "make build"}, "is_error": True,
+             "status": "non_zero_exit", "result": "⚠️ SHELL_EXIT_ERROR: exit_code=1."},
+            {"tool": "run_command", "args": {"cmd": "make build"}, "is_error": False,
+             "status": "ok", "result": "ok"},
+        ]},
+    )
+    assert recovered["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert not recovered["outcome_axes"]["execution"]["cosmetic_tool_errors"]
+    assert recovered["outcome_axes"]["execution"]["recoveries"]
+    assert "warning" not in recovered["outcome_axes"]["objective"]
+
+    # When an acceptance review DID run, the residual warning is suppressed
+    # (the review axis already judged "did it actually work?").
+    reviewed = derive_loop_outcome(
+        "Done",
+        {"rounds": 2},
+        {
+            "tool_calls": [{
+                "tool": "run_command", "args": {"cmd": "find /nope"}, "is_error": True,
+                "status": "non_zero_exit", "result": "⚠️ SHELL_EXIT_ERROR: exit_code=1.",
+            }],
+            "review_runs": [{"aggregate_signal": "PASS"}],  # a review ran -> objective judged
+            "review_decision": {"eligibility": "eligible", "trigger": "agent_called_tool_result"},
+        },
+    )
+    assert reviewed["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert reviewed["outcome_axes"]["execution"]["cosmetic_tool_errors"]
+    assert "warning" not in reviewed["outcome_axes"]["objective"]
 
 
 def test_tool_arg_sanitizer_uses_value_pattern_redactor():
@@ -701,3 +859,41 @@ def test_artifact_bundle_and_large_verification_ledger_artifact(tmp_path):
     assert contract_entry["contract_status"] == "draft"
     assert contract_entry["objective"] == long_objective
     assert ledger["summary"]["has_failures"] is False
+
+
+def _ledger_with_receipt_status(status: str) -> dict:
+    """A minimal v2 ledger whose only entry is a verification_receipt of the given status."""
+    return {
+        "schema_version": 2,
+        "outcome_axes": {"objective": {"status": OBJECTIVE_NOT_EVALUATED, "source": "none"}},
+        "entries": [{"kind": "verification_receipt", "status": status}],
+    }
+
+
+def test_has_failures_false_for_observed_receipt():
+    # A successful artifact_observation grounding (status=observed) must NOT read as a
+    # ledger failure (regression: observed was missing from the success allow-list).
+    refreshed = refresh_verification_ledger_artifacts(
+        _ledger_with_receipt_status("observed"),
+        {"status": "ready", "artifacts": [], "errors": []},
+    )
+    assert refreshed["summary"]["has_failures"] is False
+
+
+def test_has_failures_false_for_declared_receipt():
+    # An honest no_visible_machine_contract declaration (status=declared) is a SUCCESS
+    # grounding and must NOT read as a ledger failure.
+    refreshed = refresh_verification_ledger_artifacts(
+        _ledger_with_receipt_status("declared"),
+        {"status": "ready", "artifacts": [], "errors": []},
+    )
+    assert refreshed["summary"]["has_failures"] is False
+
+
+def test_has_failures_true_for_failed_receipt():
+    # Sanity: the fix must NOT over-suppress — a real verify_and_record fail still flags.
+    refreshed = refresh_verification_ledger_artifacts(
+        _ledger_with_receipt_status("fail"),
+        {"status": "ready", "artifacts": [], "errors": []},
+    )
+    assert refreshed["summary"]["has_failures"] is True

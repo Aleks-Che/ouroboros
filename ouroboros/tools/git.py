@@ -40,7 +40,7 @@ from ouroboros.tools.review_helpers import (
     paths_from_name_status,
     paths_from_porcelain_line as _review_paths_from_porcelain_line,
 )
-from ouroboros.tools.core import _data_skill_path, is_skill_control_plane_path
+from ouroboros.tools.core import _data_skill_path, _str_match_replace, is_skill_control_plane_path
 from ouroboros.contracts.task_constraint import normalize_task_constraint, resolve_payload_path
 from ouroboros.contracts.skill_payload_policy import (
     cross_skill_redirect_error,
@@ -243,6 +243,7 @@ def _run_reviewed_stage_cycle(
     goal: str = "",
     scope: str = "",
     review_rebuttal: str = "",
+    came_from_detached_checkout: bool = False,
 ) -> Dict[str, Any]:
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
     def _failed(message: str) -> Dict[str, Any]:
@@ -278,6 +279,20 @@ def _run_reviewed_stage_cycle(
     except Exception as exc:
         return _failed(f"⚠️ GIT_ERROR (status): {_sanitize_git_error(str(exc))}")
     if not status.strip():
+        if came_from_detached_checkout:
+            # BUG 2 fix: a clean tree right after a detached-HEAD reconciliation is NOT a
+            # legitimate no-op — it usually means commits/edits were orphaned. Emit a
+            # distinct, actionable diagnostic instead of the generic GIT_NO_CHANGES that
+            # previously misled the agent (it misdiagnosed it as a missing API key).
+            # The token carries the _FAILED marker (loop_tool_execution._FAILURE_MARKERS) and
+            # deliberately does NOT use the "⚠️ GIT_ERROR" prefix, which is carved out to
+            # is_error=False — so this DOES classify as an infra failure (execution=infra_failed)
+            # and counts toward evolution_consecutive_failures instead of resetting it.
+            return _failed(
+                "⚠️ GIT_LOST_WORKTREE_ON_DETACHED_CHECKOUT_FAILED: working tree is clean after "
+                "detached HEAD reconciliation. The detached commits may have been orphaned. "
+                "Inspect `git reflog` and restore if needed."
+            )
         return _failed("⚠️ GIT_NO_CHANGES: nothing to commit.")
 
     try:
@@ -663,8 +678,8 @@ _BINARY_EXTENSIONS = frozenset({
 def _ensure_gitignore(repo_dir) -> None:
     gi = pathlib.Path(repo_dir) / ".gitignore"
     if not gi.exists():
-        gi.write_text("__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.dll\n"
-                       "*.dist-info/\nbase_library.zip\n.DS_Store\n", encoding="utf-8")
+        write_text(gi, "__pycache__/\n*.pyc\n*.pyo\n*.so\n*.dylib\n*.dll\n"
+                       "*.dist-info/\nbase_library.zip\n.DS_Store\n")  # atomic (G)
 def _unstage_binaries(repo_dir) -> List[str]:
     try:
         staged = run_cmd(["git", "diff", "--cached", "--name-only"], cwd=repo_dir)
@@ -1065,28 +1080,21 @@ def _str_replace_editor(
     except Exception as e:
         return f"⚠️ STR_REPLACE_ERROR: cannot read {path}: {e}"
 
-    count = content.count(old_str)
-    if count == 0:
-        preview = content[:2000]
-        return (
-            f"⚠️ STR_REPLACE_ERROR: old_str not found in {path}.\n"
-            f"File preview (first 2000 chars):\n{preview}"
-        )
-    if count > 1:
-        positions = []
-        start = 0
-        for i in range(min(count, 5)):
-            idx = content.index(old_str, start)
-            line_num = content[:idx].count('\n') + 1
-            positions.append(f"line {line_num}")
-            start = idx + 1
-        return (
-            f"⚠️ STR_REPLACE_ERROR: old_str found {count} times in {path} "
-            f"(must be unique). Occurrences at: {', '.join(positions)}. "
-            f"Include more surrounding context in old_str to make it unique."
-        )
+    # Shared exact-match single-replacement (deferral 4): identical count==0/count>1
+    # feedback for the repo and data-plane editors.
+    new_content, _match_err = _str_match_replace(content, old_str, new_str, path, "STR_REPLACE_ERROR")
+    if _match_err:
+        return _match_err
+    if data_skill_target is not None:
+        # Deferral 5: a data-plane skill payload edited via the active_workspace route gets
+        # the SAME shrink guard as the root=skill_payload editor — no silent >30% truncation
+        # of a payload file. (Intentional large rewrites go through root=skill_payload, which
+        # carries the force escape hatch.)
+        from ouroboros.tools.core import _check_data_shrink_guard
 
-    new_content = content.replace(old_str, new_str, 1)
+        _shrink_block = _check_data_shrink_guard(target, new_content)
+        if _shrink_block:
+            return _shrink_block
     try:
         write_text(target, new_content)
     except Exception as e:
@@ -1145,6 +1153,20 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
     if not commit_message.strip():
         return "⚠️ ERROR: commit_message must be non-empty."
     ctx._current_review_commit_message = commit_message
+    # Managed-update merge (P2/SC2): the tx marker authorizes exactly ONE resolution task to
+    # commit while a managed merge is staged in the live tree. The resolved tree commits as a
+    # reviewed 2-parent merge (native MERGE_HEAD), with push/tag suppressed + an inline
+    # pre-restart smoke. Any OTHER task is blocked from committing while the tx is active.
+    from supervisor.update_merge import managed_assisted_tx_for
+
+    _managed_tx, _managed_block = managed_assisted_tx_for(getattr(ctx, "task_id", ""))
+    if _managed_block:
+        _record_commit_attempt(ctx, commit_message, "blocked",
+                               block_reason="managed_update_in_progress", block_details=_managed_block,
+                               duration_sec=0.0, phase="preflight")
+        return _managed_block
+    if _managed_tx:
+        paths = None  # a managed merge always stages the WHOLE resolved tree (ignore paths)
     overlap_err = _check_overlapping_review_attempt(ctx)
     if overlap_err:
         _record_commit_attempt(
@@ -1171,17 +1193,45 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
         block_reason="infra_failure", block_details=msg,
         duration_sec=time.time() - _commit_start), msg)[1]
     try:
-        try:
-            run_cmd(["git", "checkout", ctx.branch_dev], cwd=ctx.repo_dir)
-        except Exception as e:
-            err_msg = _sanitize_git_error(str(e))
-            already_on_target = False
+        is_detached = False
+        came_from_detached_checkout = False
+        if not _managed_tx:
+            # BUG 1 detection: a detached HEAD ahead of the branch must NOT be reconciled with
+            # a plain `git checkout ctx.branch_dev` (it would orphan the in-flight commits). The
+            # managed-merge path keeps a live MERGE_HEAD and does no checkout below, so it never
+            # needs this — only probe HEAD on the normal path.
             try:
                 current_branch = run_cmd(
                     ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                     cwd=ctx.repo_dir,
                 ).strip()
-                already_on_target = (current_branch == ctx.branch_dev)
+                is_detached = (current_branch == "HEAD")
+            except Exception:
+                pass
+        try:
+            # A managed assisted merge has a LIVE MERGE_HEAD + unmerged index (the agent
+            # resolved files but `git add` only happens in the stage cycle). A `git checkout`
+            # of the current branch can refuse on a conflicted index, so skip it — materialize
+            # already pinned HEAD to the branch and managed_assisted_precommit_verify re-checks.
+            if not _managed_tx:
+                if is_detached:
+                    # BUG 1 fix: HEAD detached (e.g. seeded from a tag checkout). A plain
+                    # `git checkout ctx.branch_dev` would jump to the branch's (older) tip and
+                    # silently discard in-flight commits/work-tree edits. Force-move the branch
+                    # to the current HEAD instead, preserving the detached commits and work tree.
+                    run_cmd(["git", "checkout", "-B", ctx.branch_dev, "HEAD"], cwd=ctx.repo_dir)
+                    came_from_detached_checkout = True
+                else:
+                    run_cmd(["git", "checkout", ctx.branch_dev], cwd=ctx.repo_dir)
+        except Exception as e:
+            err_msg = _sanitize_git_error(str(e))
+            already_on_target = False
+            try:
+                current_branch_after = run_cmd(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=ctx.repo_dir,
+                ).strip()
+                already_on_target = (current_branch_after == ctx.branch_dev)
             except Exception:
                 pass
             if not already_on_target:
@@ -1204,6 +1254,12 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                     "the checkout failure as an incidental dirty-tree no-op.\n"
                     f"{unmerged}"
                 )
+        if _managed_tx:
+            from supervisor.update_merge import managed_assisted_precommit_verify
+
+            _mok, _merr = managed_assisted_precommit_verify(_managed_tx)
+            if not _mok:
+                return _fail(_merr)
         outcome = _run_reviewed_stage_cycle(
             ctx,
             commit_message,
@@ -1214,11 +1270,36 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             goal=goal,
             scope=scope,
             review_rebuttal=review_rebuttal,
+            came_from_detached_checkout=came_from_detached_checkout,
         )
         if outcome.get("status") != "passed":
+            if _managed_tx:
+                # A blocked review's index reset can clear the live MERGE_HEAD; re-establish it so
+                # the agent can fix the flagged issues and re-commit (precommit_verify needs it),
+                # rather than stranding the resolution until the watchdog / boot rollback.
+                try:
+                    from supervisor.update_merge import reestablish_merge_head
+
+                    reestablish_merge_head(str(_managed_tx.get("target_sha") or ""))
+                except Exception:
+                    log.debug("reestablish_merge_head after blocked managed review failed", exc_info=True)
             return str(outcome.get("message", "") or "")
         pre_fingerprint = outcome.get("pre_fingerprint", {}) or {}
         post_fingerprint = outcome.get("post_fingerprint", {}) or {}
+
+        if _managed_tx:
+            # PRIMARY conflict-marker leakage gate (a `git add`-ed marker file is a resolved
+            # entry that --diff-filter=U misses), then mark the crash-window phase before the
+            # native 2-parent commit (MERGE_HEAD is still set, so `git commit` records both
+            # parents — local_snapshot + target).
+            from supervisor.update_merge import managed_assisted_marker_check, write_update_tx
+
+            _mok, _merr = managed_assisted_marker_check()
+            if not _mok:
+                return _fail(_merr)
+            _committing = dict(_managed_tx)
+            _committing["phase"] = "committing_assisted"
+            write_update_tx(_committing)
 
         try:
             run_cmd(["git", "commit", "-m", commit_message], cwd=ctx.repo_dir)
@@ -1263,9 +1344,27 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
         ctx._scope_review_history = {}  # Clear on success — next commit starts fresh
         _post_commit_result(ctx, commit_message, skip_tests, test_warning_ref)
-        tag_info = _auto_tag_on_version_bump(ctx.repo_dir, commit_message)
+        # A managed-update merge commit must NOT auto-tag/auto-push pre-restart (an un-smoked
+        # update would otherwise reach origin / create a version tag, and a later rollback would
+        # diverge from origin). The official version tag is handled on the owner's terms.
+        tag_info = "" if _managed_tx else _auto_tag_on_version_bump(ctx.repo_dir, commit_message)
     finally:
         _release_git_lock(lock)
+    if _managed_tx:
+        # Inline pre-restart smoke + tx transition (auto_merge parity); on failure it rolls back
+        # and the agent is told. No push (the merge lands locally; restart + boot finalize seal it).
+        from supervisor.update_merge import managed_assisted_postcommit
+
+        _ok_pc, _msg_pc = managed_assisted_postcommit(_managed_tx, commit_sha)
+        ctx.last_push_succeeded = False
+        if not _ok_pc:
+            # Smoke failed and the merge was rolled back — do NOT advertise an 'OK: committed'
+            # result (callers key on the leading text). Return the failure first + record it.
+            _record_commit_attempt(ctx, commit_message, "failed",
+                                   block_reason="managed_update_smoke_failed", block_details=_msg_pc,
+                                   duration_sec=time.time() - _commit_start)
+            return _msg_pc
+        return _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc
     push_status = _auto_push(ctx.repo_dir)
     ctx.last_push_succeeded = "[pushed:" in push_status
     if str(ctx.current_task_type or "") == "evolution":

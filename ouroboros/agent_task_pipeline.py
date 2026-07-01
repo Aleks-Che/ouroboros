@@ -17,8 +17,11 @@ from ouroboros.task_results import (
 )
 from ouroboros.artifacts import collect_task_artifact_records, merge_artifact_records
 from ouroboros.outcomes import (
+    EXECUTION_BEST_EFFORT,
     EXECUTION_FAILED,
     EXECUTION_INFRA_FAILED,
+    EXECUTION_OK,
+    apply_receipt_absent_flag,
     artifact_bundle_from_result,
     build_verification_ledger,
     derive_loop_outcome,
@@ -144,6 +147,67 @@ def _apply_reflection_memory_actions(
     except Exception:
         log.debug("Reflection memory action application failed", exc_info=True)
         return 0
+
+
+def _build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Compact derived swarm-efficiency rollup for a task that fanned out subagents.
+
+    Computed from the durable ``swarm_fanout`` telemetry this task already emits
+    (control.py:_emit_swarm_fanout): the number of children, the number of fan-out
+    waves, the summed inter-wave latency, and the set of effective model lanes used.
+    Returns None for a plain task (no fan-out), so the block only appears on real
+    swarms.
+
+    OMITTED (no reliable structured source today): ``observed_max_concurrency`` —
+    child task results carry only ``ts``/``updated_at``, not a per-child running-start
+    vs finish timestamp, so true overlap cannot be derived honestly here — and
+    ``parent_blocked_wait_sec`` (wait_task returns prose, not a typed duration).
+    """
+    task_id = str(task.get("id") or task.get("task_id") or "")
+    if not task_id:
+        return None
+    try:
+        from ouroboros.utils import iter_jsonl_objects
+
+        drive_root = getattr(env, "drive_root", None)
+        if drive_root is None:
+            return None
+        events_path = pathlib.Path(drive_root) / "logs" / "events.jsonl"
+        child_ids: set[str] = set()
+        wave_count = 0
+        inter_wave_latency_total = 0.0
+        lanes: list[str] = []
+        # Read the FULL per-task events stream (not a tail window): the swarm_fanout
+        # events can occur EARLY in a long fan-out task, so a bounded tail would
+        # silently undercount waves/children (P1 no-silent-loss). This runs once at
+        # finalization (not a hot path) and only for fan-out tasks.
+        for ev in iter_jsonl_objects(events_path):
+            if ev.get("type") != "swarm_fanout":
+                continue
+            if str(ev.get("parent_task_id") or ev.get("task_id") or "") != task_id:
+                continue
+            wave_count += 1
+            for tid in ev.get("task_ids") or []:
+                if str(tid or "").strip():
+                    child_ids.add(str(tid))
+            try:
+                inter_wave_latency_total += float(ev.get("inter_wave_latency_sec") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            for lane in ev.get("effective_model_lanes") or []:
+                if str(lane or "").strip() and str(lane) not in lanes:
+                    lanes.append(str(lane))
+        if not child_ids:
+            return None
+        return {
+            "subagent_count": len(child_ids),
+            "wave_count": wave_count,
+            "inter_wave_latency_sec_total": round(inter_wave_latency_total, 3),
+            "lanes_used": lanes,
+        }
+    except Exception:
+        log.debug("swarm efficiency rollup failed", exc_info=True)
+        return None
 
 
 def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> str:
@@ -287,9 +351,25 @@ def emit_task_results(
 ) -> None:
     """Emit all end-of-task events to supervisor and run post-task processing."""
     loop_outcome = derive_loop_outcome(text or "", usage, llm_trace)
+    # FR3 observability: apply the receipt_absent / expected_output_ungrounded objective-axis
+    # flag HERE — once — so the SAME flagged loop_outcome feeds the task_eval / task_metrics /
+    # task_done event stream (the day-1 monitoring metric reads it) AND the durable
+    # task_result.json. _store_task_result reuses this loop_outcome (single source), so the
+    # flag is no longer applied to a second, independently-derived outcome the events never saw.
+    apply_receipt_absent_flag(
+        loop_outcome, llm_trace, getattr(env, "drive_root", None), str(task.get("id") or ""),
+        expected_output=str(task.get("expected_output") or ""),
+    )
     outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
     execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
     reason_code = str(loop_outcome.get("reason_code") or "")
+    # CW3 (v6.34.0): a short same-route "turn=decision" turn (ephemeral, run while the
+    # main agent is busy) DELIVERS its inline answer but must not leave a durable TASK
+    # RECORD \u2014 no task_result file, no task_eval ledger row. The cognitive-memory writes
+    # (reflection/consolidation/letters-home) are already gated further below; this
+    # closes the remaining durable task-record writes. The answer + card resolution
+    # (send_message/task_done) and budget metrics still flow so the reply is visible.
+    _ephemeral = bool(task.get("_ephemeral_turn"))
     pending_events.append({
         "type": "send_message", "chat_id": task["chat_id"],
         "text": text or "\u200b", "log_text": text or "",
@@ -301,22 +381,23 @@ def emit_task_results(
     n_tool_calls = len(llm_trace.get("tool_calls", []))
     n_tool_errors = sum(1 for tc in llm_trace.get("tool_calls", [])
                         if isinstance(tc, dict) and tc.get("is_error"))
-    try:
-        append_jsonl(drive_logs / "events.jsonl", {
-            "ts": utc_now_iso(), "type": "task_eval", "ok": execution_status not in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED},
-            "task_id": task.get("id"), "task_type": task.get("type"),
-            "outcome_axes": outcome_axes,
-            "reason_code": reason_code,
-            "review_eligibility": str(loop_outcome.get("review_eligibility") or ""),
-            "review_trigger": str(loop_outcome.get("review_trigger") or ""),
-            "duration_sec": duration_sec,
-            "tool_calls": n_tool_calls,
-            "tool_errors": n_tool_errors,
-            "response_len": len(text),
-        })
-    except Exception:
-        log.warning("Failed to log task eval event", exc_info=True)
-        pass
+    if not _ephemeral:
+        try:
+            append_jsonl(drive_logs / "events.jsonl", {
+                "ts": utc_now_iso(), "type": "task_eval", "ok": execution_status not in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED},
+                "task_id": task.get("id"), "task_type": task.get("type"),
+                "outcome_axes": outcome_axes,
+                "reason_code": reason_code,
+                "review_eligibility": str(loop_outcome.get("review_eligibility") or ""),
+                "review_trigger": str(loop_outcome.get("review_trigger") or ""),
+                "duration_sec": duration_sec,
+                "tool_calls": n_tool_calls,
+                "tool_errors": n_tool_errors,
+                "response_len": len(text),
+            })
+        except Exception:
+            log.warning("Failed to log task eval event", exc_info=True)
+            pass
 
     pending_events.append({
         "type": "task_metrics",
@@ -344,13 +425,21 @@ def emit_task_results(
     except Exception:
         log.debug("Failed to collect review evidence", exc_info=True)
 
-    _store_task_result(env, task, text, usage, llm_trace, review_evidence=review_evidence)
-    stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
+    if not _ephemeral:
+        _store_task_result(env, task, text, usage, llm_trace, review_evidence=review_evidence, loop_outcome=loop_outcome)
+        stored_result = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
+    else:
+        # No durable task_result file for a transient decision turn; the card still
+        # resolves via task_done below (with empty artifact/review status).
+        stored_result = {}
     artifact_bundle = stored_result.get("artifact_bundle") if isinstance(stored_result.get("artifact_bundle"), dict) else {}
     pending_events.append({
         "type": "task_done",
         "task_id": task.get("id"),
         "task_type": task.get("type"),
+        # CW3: tells the supervisor's task_done handler to NOT synthesize a durable
+        # missing-result task_result for a transient decision turn (which has none).
+        "_ephemeral": _ephemeral,
         # Carry the thread so the terminal card finalizes in its project panel
         # (per-thread fan-out), not just the main chat.
         "chat_id": int(task.get("chat_id") or 0),
@@ -385,8 +474,15 @@ def emit_task_results(
         post_usage = dict(usage or {})
         post_usage["outcome_axes"] = outcome_axes
         post_usage["reason_code"] = reason_code
-        _run_chat_consolidation(env, memory, llm, task, drive_logs)
-        _run_scratchpad_consolidation(env, memory, llm)
+        # Ephemeral same-route turns (the "turn=decision" anti-freeze path while the
+        # main agent is busy) are PROHIBITED from ALL durable memory: not only
+        # reflection/evolution (below) but chat/scratchpad consolidation and project
+        # letters-home too — the locked main path owns those (v6.33.0 WS10
+        # idempotency contract; claudexor B5). ``_ephemeral`` is computed once near
+        # the top of this function (it also gates the durable task-record writes).
+        if not _ephemeral:
+            _run_chat_consolidation(env, memory, llm, task, drive_logs)
+            _run_scratchpad_consolidation(env, memory, llm)
         from ouroboros.project_facts import resolve_project_id
 
         _project_scoped = bool(resolve_project_id(task))
@@ -398,7 +494,7 @@ def emit_task_results(
         # observation and stall the global chat lock). Only real pooled project
         # tasks get the letters-home + blocking treatment.
         _is_direct_chat = bool(task.get("_is_direct_chat"))
-        _project_task = _project_scoped and not _is_direct_chat
+        _project_task = _project_scoped and not _is_direct_chat and not _ephemeral
         if _project_task:
             # Letters home (v6.32.0): record the cycle in the project's own
             # journal and emit a concise completion digest for consciousness
@@ -423,12 +519,32 @@ def emit_task_results(
 
                 append_journal_milestone(
                     _pid,
-                    "done" if _exec_status in ("success", "best_effort") else "blocked",
+                    # Compare against the canonical execution-axis constants, not raw
+                    # "success"/"best_effort" — the axis value for a clean finish is
+                    # EXECUTION_OK ("ok"), so the old literal never matched and every
+                    # successful task was journaled as "blocked" (C9.1 seed bug).
+                    "done" if _exec_status in (EXECUTION_OK, EXECUTION_BEST_EFFORT) else "blocked",
                     f"Task finished ({_exec_status}): {_objective}",
                     task_id=str(task.get("id") or ""),
                 )
             except Exception:
                 log.debug("project journal task-done entry failed", exc_info=True)
+            # F2 (v6.39): when the SWARM ROOT (a top-level project task — no parent) finishes,
+            # mirror its ephemeral task-tree ledger's durable-worthy coordination (attention
+            # beacons + interface contracts) into the durable project journal once, so the
+            # swarm's blockers/contracts survive the tree GC. Subagents skip this (the root
+            # absorbs the whole tree); the helper no-ops when there is no ledger.
+            if not str(task.get("parent_task_id") or "").strip():
+                try:
+                    from ouroboros.tools.project_journal import mirror_tree_coordination_to_journal
+
+                    mirror_tree_coordination_to_journal(
+                        _pid,
+                        str(task.get("root_task_id") or task.get("id") or ""),
+                        task_id=str(task.get("id") or ""),
+                    )
+                except Exception:
+                    log.debug("project journal swarm-coordination mirror failed", exc_info=True)
             try:
                 pending_events.append({
                     "type": "project_digest",
@@ -441,16 +557,20 @@ def emit_task_results(
                 })
             except Exception:
                 log.debug("project digest emission failed", exc_info=True)
-        # LLM-heavy memory work stays off the reply critical path.
-        reflection_entry = _run_post_task_processing_async(
-            env, task, post_usage, llm_trace, review_evidence, drive_logs,
-            blocking=(
-                str(task.get("type") or "") == "evolution"
-                or bool(str(task.get("workspace_root") or "").strip())
-                or bool(str(task.get("workspace_mode") or "").strip())
-                or _project_task
-            ),
-        )
+        # LLM-heavy memory work stays off the reply critical path; ephemeral turns
+        # skip reflection/evolution too (see the idempotency note above).
+        if _ephemeral:
+            reflection_entry = None
+        else:
+            reflection_entry = _run_post_task_processing_async(
+                env, task, post_usage, llm_trace, review_evidence, drive_logs,
+                blocking=(
+                    str(task.get("type") or "") == "evolution"
+                    or bool(str(task.get("workspace_root") or "").strip())
+                    or bool(str(task.get("workspace_mode") or "").strip())
+                    or _project_task
+                ),
+            )
         budget_drive_root = str(task.get("budget_drive_root") or "").strip()
         # Leak guard (Phase 3b / red-team R3.1): a project-scoped task must NEVER
         # write its learnings to the canonical parent drive — project facts live
@@ -479,12 +599,27 @@ def emit_task_results(
 
 def _store_task_result(env: Any, task: Dict[str, Any], text: str,
                        usage: Dict[str, Any], llm_trace: Dict[str, Any],
-                       review_evidence: Dict[str, Any] | None = None) -> None:
-    """Store task result for parent task retrieval."""
+                       review_evidence: Dict[str, Any] | None = None,
+                       loop_outcome: Dict[str, Any] | None = None) -> None:
+    """Store task result for parent task retrieval.
+
+    ``loop_outcome``, when supplied by ``emit_task_results``, is the SINGLE already-
+    derived, already-receipt_absent-flagged outcome that also fed the task_eval /
+    task_metrics event stream — so the persisted axes match the events exactly and we
+    do not derive/flag a second time. It is only re-derived here when called without one.
+    """
     try:
         trace_summary = build_trace_summary(llm_trace)
         existing = load_task_result(env.drive_root, str(task.get("id") or "")) or {}
-        loop_outcome = derive_loop_outcome(text or "", usage, llm_trace)
+        if loop_outcome is None:
+            loop_outcome = derive_loop_outcome(text or "", usage, llm_trace)
+            # FR3: inject durable verification receipts into the trace and flag
+            # receipt_absent on a clean-but-unverified effects turn — BEFORE normalize so
+            # the persisted axes and the ledger agree (claudexor lockstep fix).
+            apply_receipt_absent_flag(
+                loop_outcome, llm_trace, env.drive_root, str(task.get("id") or ""),
+                expected_output=str(task.get("expected_output") or ""),
+            )
         outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
         execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
         reason_code = str(loop_outcome.get("reason_code") or "")
@@ -531,6 +666,9 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             artifact_axis.update(outcome_axes.get("artifacts") or {})
         artifact_axis["status"] = str(artifact_bundle.get("status") or artifact_axis.get("status") or "not_applicable")
         outcome_axes["artifacts"] = artifact_axis
+        # B1: compact swarm-efficiency rollup, only for a task that actually fanned
+        # out subagents (None for a plain task -> kwarg omitted).
+        swarm_efficiency = _build_swarm_efficiency(env, task)
         subagent_envelope = task.get("subagent_envelope") if isinstance(task.get("subagent_envelope"), dict) else {}
         if str(task.get("delegation_role") or "").lower() == "subagent":
             subagent_envelope = build_subagent_envelope(
@@ -568,6 +706,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             role=task.get("role"),
             description=task.get("description"),
             objective=task.get("objective") or task.get("description"),
+            title=task.get("title"),
             expected_output=task.get("expected_output"),
             constraints=task.get("constraints"),
             context=task.get("context"),
@@ -597,6 +736,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             verification_ledger=verification_refs.get("inline"),
             artifact_bundle=artifact_bundle,
             artifacts=artifacts,
+            **({"swarm_efficiency": swarm_efficiency} if swarm_efficiency else {}),
             ts=utc_now_iso(),
         )
     except Exception as e:

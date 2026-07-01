@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import hashlib
 from hashlib import sha256
 import json
@@ -20,8 +19,8 @@ import threading
 import uuid
 from typing import Any, Dict, List
 
-from ouroboros.artifacts import artifact_store_path_block_reason, copy_directory_to_task_artifacts, copy_file_to_task_artifacts
-from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, subprocess_new_group_kwargs
+from ouroboros.artifacts import artifact_store_path_block_reason, copy_directory_to_task_artifacts, copy_file_to_task_artifacts, record_task_scratch
+from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
 from ouroboros.config import SETTINGS_DEFAULTS, get_runtime_mode, load_settings
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
@@ -30,7 +29,7 @@ from ouroboros.runtime_mode_policy import (
     protected_paths_in,
 )
 from ouroboros.tools.commit_gate import _invalidate_advisory
-from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, shell_argv_with_inline
+from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, recover_stringified_argv, shell_argv_with_inline
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
 from ouroboros.tool_access import (
     active_tool_profile,
@@ -66,8 +65,14 @@ _OUTPUT_DIR_MAX_FILES = 1000
 _OUTPUT_DIR_MAX_BYTES = 50 * 1024 * 1024
 
 def _tracked_subprocess_run(cmd, **kwargs):
-    """subprocess.run replacement with process-tree tracking."""
+    """subprocess.run replacement with process-tree tracking. When capturing TEXT
+    output, decode tolerantly (errors='replace') so binary stdout/stderr (a MIPS
+    interpreter, a DOOM framebuffer, raw bytes) surfaces as readable text instead
+    of raising UnicodeDecodeError and collapsing the whole call into a
+    shell_error."""
     timeout = kwargs.pop("timeout", None)
+    if kwargs.get("text") or kwargs.get("universal_newlines"):
+        kwargs.setdefault("errors", "replace")
     kwargs.update(subprocess_new_group_kwargs())
     kwargs.setdefault("stdin", subprocess.DEVNULL)
     proc = subprocess.Popen(cmd, **kwargs)
@@ -100,28 +105,91 @@ def kill_all_tracked_subprocesses():
         _active_subprocesses.clear()
 
 
-def _resolve_effective_timeout(default_timeout_sec: int, ctx: ToolContext | None = None) -> int:
-    """Resolve effective timeout, capping defaults by task deadline when present."""
-    default_setting = int(SETTINGS_DEFAULTS.get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
-    raw = str(os.environ.get("OUROBOROS_TOOL_TIMEOUT_SEC", "") or "").strip()
-    if raw:
-        try:
-            parsed = int(raw)
-            if parsed > 0 and parsed != default_setting:
-                return parsed
-        except ValueError:
-            pass
+def _shell_env_for_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> "dict | None":
+    """For a command whose cwd is OUTSIDE the Ouroboros system repo (an external
+    workspace / target project, e.g. SWE-bench dig-direct ``/app``), return an
+    env copy with the repo dir scrubbed from ``PYTHONPATH`` so the target cannot
+    shadow-import Ouroboros's own modules (R2). ``ctx.repo_dir`` stays pinned to
+    the Ouroboros repo even in workspace mode, so this is the authoritative
+    in-repo test. Returns ``None`` for commands inside the system repo (Ouroboros
+    tooling legitimately imports itself) so they inherit ``os.environ``."""
     try:
-        settings_val = int(load_settings().get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
-        if settings_val > 0 and settings_val != default_setting:
-            return settings_val
+        system_repo = pathlib.Path(getattr(ctx, "repo_dir")).resolve(strict=False)
+        wd = pathlib.Path(work_dir).resolve(strict=False)
     except Exception:
-        pass
+        return None
+    try:
+        in_repo = wd == system_repo or wd.is_relative_to(system_repo)
+    except AttributeError:  # pragma: no cover - py<3.9
+        in_repo = str(wd) == str(system_repo) or str(wd).startswith(str(system_repo) + os.sep)
+    if in_repo:
+        return None
+    return scrub_repo_from_pythonpath(dict(os.environ), system_repo)
+
+
+def _resolve_effective_timeout(
+    default_timeout_sec: int,
+    ctx: ToolContext | None = None,
+    override_sec: int | None = None,
+) -> int:
+    """Resolve the effective per-command timeout as ONE normalized pipeline:
+    resolve the REQUESTED value from a single precedence chain (per-call
+    ``override_sec`` > env ``OUROBOROS_TOOL_TIMEOUT_SEC`` > settings.json > config
+    ``SETTINGS_DEFAULTS`` > the in-code last-resort ``default_timeout_sec``), then
+    apply the per-call ceiling, then clamp toward the remaining task-deadline budget
+    (60s floor when a deadline exists), then floor at 1s. The outer budget loop
+    remains the hard deadline enforcer.
+
+    Hygiene fix (SSOT): the prior code skipped an env/settings value EQUAL to the
+    config default (``!= default_setting``), so ``OUROBOROS_TOOL_TIMEOUT_SEC=600``
+    (= the SETTINGS_DEFAULTS value) silently fell through to the in-code 360s default.
+    The configured value is now honored regardless of equality, and env/settings
+    values no longer BYPASS the ceiling/deadline clamp. RELEASE NOTE: installs that
+    relied on the buggy effective 360s now get the configured 600s — a foreground
+    command may hold the task longer (still bounded by ceiling + task deadline).
+    """
+    from ouroboros.config import get_per_call_timeout_ceiling_sec
+
+    # 1. Resolve the REQUESTED timeout from a single precedence chain.
+    requested: int | None = None
+    if override_sec is not None:
+        try:
+            ov = int(override_sec)
+        except (TypeError, ValueError):
+            ov = 0
+        if ov > 0:
+            requested = ov
+    if requested is None:
+        raw = str(os.environ.get("OUROBOROS_TOOL_TIMEOUT_SEC", "") or "").strip()
+        if raw:
+            try:
+                v = int(raw)
+                if v > 0:
+                    requested = v
+            except ValueError:
+                pass
+    if requested is None:
+        try:
+            settings_val = int(load_settings().get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
+            if settings_val > 0:
+                requested = settings_val
+        except Exception:
+            pass
+    if requested is None:
+        cfg_default = int(SETTINGS_DEFAULTS.get("OUROBOROS_TOOL_TIMEOUT_SEC") or 0)
+        requested = cfg_default if cfg_default > 0 else int(default_timeout_sec)
+
+    # 2. Per-call ceiling.
+    effective = min(requested, get_per_call_timeout_ceiling_sec())
+
+    # 3. Clamp toward the remaining task-deadline budget (60s floor when a deadline exists).
     if ctx is not None:
         remaining = deadline_remaining_sec(ctx)
         if remaining > 0:
-            return int(max(60, min(1800, remaining * 0.5)))
-    return max(int(default_timeout_sec), 1)
+            effective = int(max(60, min(effective, remaining * 0.5)))
+
+    # 4. Floor at 1s.
+    return max(1, int(effective))
 
 
 def _describe_returncode(returncode: int, *, cwd: pathlib.Path | str | None = None) -> str:
@@ -142,12 +210,12 @@ def _describe_returncode(returncode: int, *, cwd: pathlib.Path | str | None = No
 
 def _format_process_output(stdout: str, stderr: str, *, limit: int = 50_000) -> str:
     """Render bounded stdout/stderr sections."""
-    stdout_text = str(stdout or "").strip()
-    stderr_text = str(stderr or "").strip()
+    stdout_text = str(stdout or "")
+    stderr_text = str(stderr or "")
     parts: List[str] = []
-    if stdout_text:
+    if stdout_text.strip():
         parts.append(f"STDOUT:\n{stdout_text}")
-    if stderr_text:
+    if stderr_text.strip():
         parts.append(f"STDERR:\n{stderr_text}")
     rendered = "\n\n".join(parts) if parts else "STDOUT:\n(empty)"
     if len(rendered) > limit:
@@ -161,7 +229,11 @@ def _allowed_output_roots(ctx: ToolContext, work_dir: pathlib.Path, cwd_root: st
     roots.append((root_label, pathlib.Path(work_dir).resolve(strict=False)))
     profile = active_tool_profile(ctx)
     for label in ("task_drive", "artifact_store", "user_files"):
-        if not decide_tool_access(profile=profile, root=label, operation="read").allow:  # type: ignore[arg-type]
+        # An output is a deliverable the command PRODUCED, so its root must be WRITABLE by the
+        # profile — not merely readable. (v6.52.0: workspace_task gained user_files READ for
+        # attachments; that must NOT make user_files a valid run_command output destination.)
+        op = "write" if label == "user_files" else "read"
+        if not decide_tool_access(profile=profile, root=label, operation=op).allow:  # type: ignore[arg-type]
             continue
         try:
             root_path = resource_root_path(ctx, label)  # type: ignore[arg-type]
@@ -399,6 +471,7 @@ def _register_process_outputs(
         return "", False
     notes: list[str] = []
     failed = False
+    registered = False  # at least one canonical artifact record was actually created
     for raw_item in outputs:
         text = str(raw_item or "").strip()
         source, block_reason = _resolve_declared_output(
@@ -423,8 +496,12 @@ def _register_process_outputs(
         before = (before_outputs or {}).get(str(source), (False, -1, ""))
         after = _fingerprint_output(source)
         if before[0] and before == after:
-            notes.append(f"unchanged output: {text}")
-            failed = True
+            # Present-but-unchanged is NOT a failure (a deterministic re-run, or a
+            # command that re-verifies an existing artifact): note it cosmetically
+            # and skip re-registration. "Did it actually work?" lives on the
+            # objective/review axis, not the tool-execution axis (Bible P5). A
+            # genuinely MISSING declared output above stays a blocking failure.
+            notes.append(f"unchanged output (cosmetic): {text}")
             continue
         if source.is_file():
             try:
@@ -434,6 +511,7 @@ def _register_process_outputs(
                 failed = True
                 continue
             if record:
+                registered = True
                 notes.append(
                     f"registered output {source} -> artifact_store:{record.get('name')} "
                     f"sha256={str(record.get('sha256') or '')[:12]}"
@@ -464,6 +542,7 @@ def _register_process_outputs(
                 failed = True
                 continue
             if records:
+                registered = True
                 names = ", ".join(str(record.get("name") or "") for record in records)
                 notes.append(f"registered directory output {source} -> artifact_store:{names}")
             else:
@@ -474,7 +553,18 @@ def _register_process_outputs(
             failed = True
     if not notes:
         return "", False
-    prefix = "⚠️ ARTIFACT_OUTPUT_ERROR" if failed else "ARTIFACT_OUTPUTS"
+    # Distinguish a CANONICAL artifact registration from a cosmetic-only note (e.g.
+    # an unchanged declared output): the downstream artifact_registered detector
+    # (outcomes.py / loop_tool_execution.py) keys on the exact "ARTIFACT_OUTPUTS"
+    # marker, so a cosmetic note must NOT borrow it — else an unchanged output reads
+    # as a real registration / false recovery signal. "ARTIFACT_OUTPUT_NOTE" does
+    # not contain the "ARTIFACT_OUTPUTS" substring, so it is correctly ignored.
+    if failed:
+        prefix = "⚠️ ARTIFACT_OUTPUT_ERROR"
+    elif registered:
+        prefix = "ARTIFACT_OUTPUTS"
+    else:
+        prefix = "ARTIFACT_OUTPUT_NOTE"
     return "\n\n" + prefix + ":\n" + "\n".join(f"- {note}" for note in notes), failed
 
 
@@ -502,6 +592,45 @@ def _status_snapshot(repo_dir: pathlib.Path | None) -> list[str]:
     if repo_dir is None:
         return []
     return sorted(_get_changed_files(repo_dir))
+
+
+def _shallow_listing(work_dir: pathlib.Path, cap: int = 5000) -> dict:
+    """Bounded immediate-children {name: (mtime_ns, size)} snapshot of a cwd. One
+    directory level, capped — NOT a recursive filesystem monitor (R5). Used to
+    detect a non-git user_files cwd actually producing a top-level deliverable."""
+    out: dict = {}
+    try:
+        with os.scandir(work_dir) as it:
+            for entry in it:
+                if len(out) >= cap:
+                    break
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                    out[entry.name] = (int(st.st_mtime_ns), int(st.st_size))
+                except OSError:
+                    continue
+    except OSError:
+        return {}
+    return out
+
+
+def _user_files_run_had_effect(
+    before_changed: list[str],
+    after_changed: list[str],
+    before_listing: dict | None,
+    work_dir: pathlib.Path,
+) -> bool:
+    """Effect-based gate for the ARTIFACT_AUDIT_GAP nudge (R5): warn only when the
+    command produced an OBSERVABLE filesystem change in the cwd, not merely
+    because it ran in a user_files cwd. Git-tracked cwd (e.g. dig-direct /app) →
+    a status delta (modified or new untracked file). Non-git cwd → a bounded
+    shallow immediate-children snapshot delta. A read-only command (ls/cat/grep)
+    changes neither and is no longer falsely flagged."""
+    if after_changed != before_changed:
+        return True
+    if before_listing is not None:
+        return _shallow_listing(work_dir) != before_listing
+    return False
 
 
 def _protected_runtime_dirty_paths(repo_dir: pathlib.Path) -> list[str]:
@@ -692,6 +821,19 @@ _SHELL_BUILTINS = frozenset([
 ])
 
 _SHELL_OPERATORS = frozenset(["&&", "||", "|", ";", ">", ">>", "<", "<<"])
+# A redirect GLUED into a single argv element ("2>/dev/null", "2>&1", ">out.log",
+# "&>x") — the standalone-operator set above misses these. Anchored at the element
+# START so a '>' inside a sed/awk/grep expression ("s/a>b/c/g") is NOT flagged.
+# Output redirects keep a permissive glued tail. Input redirects are restricted to
+# UNAMBIGUOUS shapes — heredoc/herestring ("<<EOF", "<<<s"), an fd-prefixed input
+# ("0<f", "2<&1"), or a bare standalone "<" — because a plain "<word" element is
+# indistinguishable from a legitimate literal angle-bracket arg (grep "<div>",
+# "<stdin>"), and false-flagging those is worse than missing a rare glued "<file"
+# input redirect. Pipes/control operators are deliberately NOT matched (a glued
+# '|' is valid regex alternation, grep "a|b").
+_GLUED_REDIRECT_RE = re.compile(
+    r'^(?:(?:\d+>>?|>>?&?\d*|\d*>&\d*|&>>?)(?:\S.*)?|\d+<\S*|<<\S*|<)$'
+)
 _SHELL_INTERPRETERS = frozenset({"sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"})
 _ENV_REF_PATTERN = re.compile(r'\$(?:\{[A-Z][A-Z0-9_]*\}|[A-Z][A-Z0-9_]*)')
 _SENSITIVE_OUTPUT_NAMES = frozenset({".env", ".env.local", "credentials.json", "secrets.json", "token.json"})
@@ -788,11 +930,81 @@ def _maybe_autocorrect_grep_backslash_pipe(cmd: List[str]) -> tuple[List[str], s
     )
 
 
-def _mentioned_user_file_outputs_without_declaration(ctx: ToolContext, cmd: List[str], outputs: List[str] | None) -> list[str]:
-    """Best-effort audit for scripts that write absolute user_files without outputs."""
+def _resolve_scratch_abs(scratch: List[str] | None, work_dir) -> list[pathlib.Path]:
+    """Resolve declared ephemeral `scratch=[...]` paths to absolute host paths (relative ones
+    against the command cwd). Blank entries dropped. (v6.52.2)"""
+    base = pathlib.Path(work_dir).resolve(strict=False) if work_dir else None
+    out: list[pathlib.Path] = []
+    for raw in (scratch or []):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        p = pathlib.Path(text).expanduser()
+        out.append((p if p.is_absolute() else ((base / p) if base is not None else p)).resolve(strict=False))
+    return out
+
+
+def _scratch_safety_reason(scratch_abs: list[pathlib.Path], work_dir, repo_root) -> str:
+    """Pre-exec gate for declared scratch (v6.52.2): the cwd must be inside a git worktree (so the
+    'NEW + git-untracked' proof is meaningful and the patch-exclusion contract applies), and each
+    path must be CONFINED to the command cwd and be NONEXISTENT + git-UNTRACKED — so an ephemeral
+    verification file can never mask a real pre-existing/tracked edit, and a new user_files
+    deliverable cannot bypass the undeclared-output guard by mislabeling itself scratch. Returns a
+    refusal reason or ''."""
+    if not scratch_abs:
+        return ""
+    if repo_root is None:
+        # No git worktree at the cwd: we cannot prove a path is git-untracked, and there is no
+        # workspace patch to exclude it from — so scratch is not meaningful here.
+        return "scratch requires a git-worktree cwd (it is for in-repo verification); use outputs= for a deliverable"
+    base = pathlib.Path(work_dir).resolve(strict=False) if work_dir else None
+    tracked: set[str] = set()
+    if repo_root is not None:
+        try:
+            res = subprocess.run(["git", "ls-files"], cwd=str(repo_root), capture_output=True, text=True, timeout=20)
+            if res.returncode == 0:
+                root = pathlib.Path(repo_root).resolve(strict=False)
+                tracked = {str((root / line.strip()).resolve(strict=False)) for line in (res.stdout or "").splitlines() if line.strip()}
+        except Exception:
+            tracked = set()
+    for cand in scratch_abs:
+        if base is not None and not (cand == base or path_is_relative_to(cand, base)):
+            return f"scratch path escapes the command cwd ({base}): {cand}"
+        if cand.exists():
+            return f"scratch path already exists — declare a NEW throwaway file, or use outputs= for a deliverable: {cand}"
+        if str(cand) in tracked:
+            return f"scratch path is git-tracked — not a throwaway (use outputs=, or edit it as a real change): {cand}"
+    return ""
+
+
+def _record_scratch_fingerprints(ctx: ToolContext, scratch_abs: list[pathlib.Path]) -> None:
+    """Record sha256 of declared scratch files that exist NOW (post-exec) so workspace patch
+    capture can exclude them while they still match. Called on EVERY exit path — normal, nonzero,
+    timeout, and exception — so a file created by a command that then times out is still managed
+    (v6.52.2). Fail-soft; only records files that currently exist."""
+    if not scratch_abs:
+        return
+    fingerprints: dict = {}
+    for sp in scratch_abs:
+        try:
+            if sp.is_file():
+                fingerprints[str(sp)] = sha256(sp.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    if fingerprints:
+        record_task_scratch(ctx, fingerprints)
+
+
+def _mentioned_user_file_outputs_without_declaration(
+    ctx: ToolContext, cmd: List[str], outputs: List[str] | None, scratch_abs: list[pathlib.Path] | None = None
+) -> list[str]:
+    """Best-effort audit for scripts that write absolute user_files without outputs. Declared
+    ephemeral `scratch` paths (v6.52.2) are exempt — they are transient verification files, not
+    deliverables, and are excluded from the workspace patch."""
 
     if outputs:
         return []
+    scratch_set = {str(p) for p in (scratch_abs or [])}
     mentioned: list[str] = []
     for token in shell_argv_with_inline(cmd):
         token_text = str(token)
@@ -823,33 +1035,44 @@ def _mentioned_user_file_outputs_without_declaration(ctx: ToolContext, cmd: List
             if user_files_path_block_reason(ctx, path):
                 continue
             path_text = str(path)
+            if path_text in scratch_set:
+                continue  # declared ephemeral scratch (v6.52.2) — not an undeclared deliverable
             if path_text in mentioned:
                 continue
             mentioned.append(path_text)
     return mentioned
 
 
-def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None = None) -> str:
+def _run_shell(
+    ctx: ToolContext,
+    cmd,
+    cwd: str = "",
+    outputs: List[str] | None = None,
+    scratch: List[str] | None = None,
+    timeout_sec: int | None = None,
+    timeout: int | None = None,
+) -> str:
+    # Per-call timeout override (canonical timeout_sec; timeout accepted as alias).
+    _timeout_override = timeout_sec if timeout_sec is not None else timeout
     if isinstance(cmd, str):
-        # Recover common stringified argv mistakes before failing.
-        recovered = None
-        try:
-            parsed = json.loads(cmd)
-            if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-                recovered = parsed
-        except (json.JSONDecodeError, ValueError):
-            pass
-        if recovered is None:
-            try:
-                parsed = ast.literal_eval(cmd)
-                if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-                    recovered = parsed
-            except (ValueError, SyntaxError):
-                pass
+        # Recover common stringified argv mistakes before failing (shared SSOT with
+        # verify_and_record via shell_parse.recover_stringified_argv — P7 DRY / P2 class-fix).
+        recovered = recover_stringified_argv(cmd)
         # Malformed structured literals are not shell commands; refuse explicitly.
         if recovered is None:
             stripped = cmd.lstrip()
             is_posix_test_cmd = stripped.startswith("[ ") and stripped.rstrip().endswith(" ]")
+            # A shell brace group `{ ...; }` starts with "{ " (brace + space, the
+            # reserved word) — distinct from a JSON object `{"k":...}`. It is valid
+            # shell, not a malformed list, so don't emit the misleading JSON error;
+            # point at sh -c instead (run_command runs argv directly, no shell).
+            is_brace_group = stripped.startswith("{ ") and stripped.rstrip().endswith("}")
+            if is_brace_group:
+                return (
+                    '⚠️ SHELL_CMD_ERROR: `{ ...; }` is a shell brace group, which run_command '
+                    'cannot execute directly (it runs argv without a shell). Wrap it in a shell:\n'
+                    '  run_command(cmd=["sh", "-c", "{ cmd1; cmd2; }"])'
+                )
             if stripped[:1] in ("[", "{") and not is_posix_test_cmd:
                 return (
                     '⚠️ SHELL_ARG_ERROR: `cmd` looks like a JSON/Python list literal '
@@ -923,6 +1146,19 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
             '(2) For pipes/chaining: ["sh", "-c", "cmd1 && cmd2"]'
         )
 
+    # A redirect glued into one argv element (e.g. "2>/dev/null", "2>&1") slips
+    # past the standalone-operator set above and reaches the program as a literal
+    # arg — the program then dies cryptically ("find: 2>/dev/null: unknown
+    # primary"). Surface the same actionable hint before subprocess runs.
+    for arg in cmd:
+        if _GLUED_REDIRECT_RE.match(arg):
+            return (
+                f'⚠️ SHELL_CMD_ERROR: Shell redirection "{arg}" found in cmd array. '
+                'Subprocess does not interpret shell syntax, so it reaches the '
+                'program as a literal argument. '
+                'Use ["sh", "-c", "your command with redirects"] for redirection.'
+            )
+
     active_repo_dir = active_repo_dir_for(ctx)
     active_root = pathlib.Path(active_repo_dir).resolve(strict=False)
     try:
@@ -943,6 +1179,14 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
         return f"⚠️ SHELL_CWD_BLOCKED: cwd is not a directory: {cwd or work_dir}. allowed_roots: {roots}"
     repo_root = _resolve_git_root(pathlib.Path(work_dir))
     before_changed = _status_snapshot(repo_root)
+    # R5: for a non-git user_files cwd, take a bounded shallow snapshot so the
+    # artifact-audit nudge can be effect-based (only when the command actually
+    # produced a top-level deliverable), not fired on every read-only command.
+    before_listing = (
+        _shallow_listing(pathlib.Path(work_dir))
+        if (cwd_root == "user_files" and repo_root is None and not outputs)
+        else None
+    )
     before_outputs = _snapshot_declared_outputs(
         ctx,
         outputs,
@@ -951,17 +1195,34 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
         changed_paths=set(before_changed or []),
     )
 
-    timeout_sec = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx)
+    # Ephemeral verification scratch (v6.52.2): a sanctioned channel for a throwaway in-workspace
+    # file the agent writes, runs, and deletes (e.g. an in-package scratch test that MUST live in
+    # the repo to compile). Pre-exec gate it (confined + NEW + untracked) so it cannot mask a real
+    # edit, then record it so workspace patch capture EXCLUDES it. It is exempt from the
+    # undeclared-output guard below and is never registered as a task artifact.
+    scratch_abs = _resolve_scratch_abs(scratch, work_dir)
+    if scratch_abs:
+        _scratch_reason = _scratch_safety_reason(scratch_abs, pathlib.Path(work_dir), repo_root)
+        if _scratch_reason:
+            return f"⚠️ SCRATCH_BLOCKED: {_scratch_reason}."
+
+    timeout_sec = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx, override_sec=_timeout_override)
     bootstrap_process_path()
     try:
         if _executor_can_run_cwd(ctx, pathlib.Path(work_dir)):
             res = executor_execute(ctx, cmd, pathlib.Path(work_dir), timeout_sec)
         else:
+            run_env = _shell_env_for_cwd(ctx, pathlib.Path(work_dir))
             res = _tracked_subprocess_run(
                 cmd, cwd=str(work_dir),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, timeout=timeout_sec,
+                **({"env": run_env} if run_env is not None else {}),
             )
+        # Record scratch FINGERPRINTS (sha256 of declared scratch files that exist AFTER the command)
+        # so workspace patch capture excludes a file ONLY while it still matches — a later real file at
+        # the same path has a different sha and is NOT dropped (v6.52.2; runs regardless of exit code).
+        _record_scratch_fingerprints(ctx, scratch_abs)
         if res.returncode != 0:
             executor_note = ""
             if getattr(res, "backend_trace", None):
@@ -984,7 +1245,7 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
                 mutation_root=repo_root,
                 source_tool="run_command",
             )
-        undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(ctx, cmd, outputs)
+        undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(ctx, cmd, outputs, scratch_abs=scratch_abs)
         if undeclared_user_outputs:
             return (
                 autocorrect_note
@@ -1005,10 +1266,33 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
         )
         audit_note = ""
         if cwd_root == "user_files" and not outputs:
-            audit_note = (
-                "\n\n⚠️ ARTIFACT_AUDIT_GAP: command ran in user_files cwd without "
-                "outputs=[...]. If it created a deliverable, rerun/register the file "
-                "with outputs or write_file(root=artifact_store) before claiming it."
+            # Audit only NON-scratch user_files effects: declared scratch is transient (not a
+            # deliverable), but a command may ALSO create a real undeclared deliverable — so strip the
+            # scratch paths from the change set rather than disabling the audit whenever scratch exists.
+            _after_for_audit = after_changed
+            if scratch_abs and repo_root is not None:
+                _repo = pathlib.Path(repo_root).resolve(strict=False)
+                _scratch_rel: set[str] = set()
+                for _sp in scratch_abs:
+                    try:
+                        _scratch_rel.add(_sp.resolve(strict=False).relative_to(_repo).as_posix())
+                    except ValueError:
+                        continue
+                if _scratch_rel:
+                    _after_for_audit = [p for p in (after_changed or []) if p not in _scratch_rel]
+            if _user_files_run_had_effect(before_changed, _after_for_audit, before_listing, pathlib.Path(work_dir)):
+                audit_note = (
+                    "\n\n⚠️ ARTIFACT_AUDIT_GAP: command modified files in a user_files cwd without "
+                    "outputs=[...]. If it created a deliverable, rerun/register the file "
+                    "with outputs or write_file(root=artifact_store) before claiming it."
+                )
+        scratch_note = ""
+        _scratch_remaining = [str(p) for p in scratch_abs if p.exists()]
+        if _scratch_remaining:
+            scratch_note = (
+                "\n\n⚠️ SCRATCH_REMAINS: declared scratch still on disk after the command: "
+                + ", ".join(_scratch_remaining[:5])
+                + ". It is excluded from the workspace patch, but delete it before finishing so it does not linger."
             )
         if artifact_failed:
             return (
@@ -1021,13 +1305,21 @@ def _run_shell(ctx: ToolContext, cmd, cwd: str = "", outputs: List[str] | None =
         executor_note = ""
         if getattr(res, "backend_trace", None):
             executor_note = "\n\nEXECUTOR_TRACE:\n" + json.dumps(res.backend_trace, ensure_ascii=False, indent=2)
-        return autocorrect_note + f"{_describe_returncode(0, cwd=work_dir)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{executor_note}"
+        return autocorrect_note + f"{_describe_returncode(0, cwd=work_dir)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{scratch_note}{executor_note}"
     except subprocess.TimeoutExpired:
+        # A timed-out command may have created its declared scratch before the kill — fingerprint it
+        # so headless still excludes it from the workspace patch (v6.52.2 leak-safety on the timeout path).
+        _record_scratch_fingerprints(ctx, scratch_abs)
         return (
-            f"⚠️ TOOL_TIMEOUT (run_command): command exceeded {timeout_sec}s. "
-            f"Subprocess tree was terminated. cwd={work_dir}"
+            f"⚠️ TOOL_TIMEOUT (run_command): command exceeded the per-command timeout of {timeout_sec}s "
+            f"and its subprocess tree was terminated (cwd={work_dir}). NOTE: this is the per-command "
+            f"FOREGROUND timeout, NOT the task deadline. For genuinely long-running compute (training, "
+            f"sampling, large builds/downloads), start it with start_service and poll "
+            f"service_status/service_logs while you do other work, or pass an explicit timeout_sec=<seconds> "
+            f"(up to the per-call ceiling) — and preserve a best-effort deliverable before the task deadline."
         )
     except Exception as e:
+        _record_scratch_fingerprints(ctx, scratch_abs)
         return f"⚠️ SHELL_ERROR: {e}. cwd={work_dir}"
 
 
@@ -1044,7 +1336,7 @@ def _load_project_context(repo_dir: pathlib.Path) -> str:
         fpath = repo_dir / relpath
         if fpath.is_file():
             try:
-                content = fpath.read_text(encoding="utf-8")
+                content = fpath.read_text(encoding="utf-8", errors="replace")
                 parts.append(f"## {label}\n\n{content}")
             except Exception:
                 pass
@@ -1427,8 +1719,14 @@ def _run_script(
     args: List[str] | None = None,
     cwd: str = "",
     outputs: List[str] | None = None,
+    scratch: List[str] | None = None,
+    **kwargs,
 ) -> str:
-    """Write a task-scoped temporary script and run it as a foreground command."""
+    """Write a task-scoped temporary script and run it as a foreground command. The `timeout_sec`
+    / `timeout` aliases ride in **kwargs to keep the signature within the <=8-parameter rule
+    (DEVELOPMENT.md) after the `scratch` addition; both are forwarded to _run_shell unchanged."""
+    timeout_sec = kwargs.get("timeout_sec")
+    timeout = kwargs.get("timeout")
     interp = str(interpreter or "python3").strip()
     allowed = {"python", "python3", "bash", "sh", "node", "ruby"}
     if pathlib.PurePath(interp).name not in allowed:
@@ -1436,7 +1734,19 @@ def _run_script(
     body = str(script or "")
     if not body.strip():
         return "⚠️ TOOL_ARG_ERROR (run_script): script is required."
-    undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(ctx, [interp, "-c", body], outputs)
+    # Resolve the early body-audit scratch against the SAME effective cwd the script will execute in
+    # (light + empty cwd -> task_drive; else the declared cwd; else the active workspace) — NOT the raw
+    # `cwd` (often empty) — so a relatively-declared scratch path matches a user_files write in the body
+    # and is not falsely flagged. The authoritative scratch handling still runs in _run_shell against
+    # the resolved work_dir.
+    _audit_cwd = str(cwd or "").strip()
+    if not _audit_cwd and get_runtime_mode() == "light" and not bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
+        try:
+            _audit_cwd = str(pathlib.Path(ctx.task_drive_root()).resolve(strict=False))
+        except Exception:
+            _audit_cwd = ""
+    _scratch_abs_body = _resolve_scratch_abs(scratch, _audit_cwd or active_repo_dir_for(ctx))
+    undeclared_user_outputs = _mentioned_user_file_outputs_without_declaration(ctx, [interp, "-c", body], outputs, scratch_abs=_scratch_abs_body)
     if undeclared_user_outputs:
         return (
             "⚠️ ARTIFACT_OUTPUT_ERROR: run_script would write user_files without declaring outputs: "
@@ -1489,7 +1799,7 @@ def _run_script(
     ):
         effective_cwd = str(pathlib.Path(ctx.task_drive_root()).resolve(strict=False))
     try:
-        result = _run_shell(ctx, argv, cwd=effective_cwd, outputs=outputs)
+        result = _run_shell(ctx, argv, cwd=effective_cwd, outputs=outputs, scratch=scratch, timeout_sec=timeout_sec, timeout=timeout)
     finally:
         if workspace_backed_script:
             try:
@@ -1512,7 +1822,9 @@ def get_tools() -> List[ToolEntry]:
                 "Every result header echoes the resolved cwd. "
                 "cmd MUST be an array of strings, never a single shell-style "
                 "string. Use cwd= for working directory; cd is rejected. "
-                "For pipes/chaining use [\"sh\", \"-c\", \"cmd1 && cmd2\"]."
+                "For pipes/chaining use [\"sh\", \"-c\", \"cmd1 && cmd2\"]. "
+                "Prefer the dedicated tools where one fits: read_file (not cat/head/sed-as-reader), "
+                "search_code/query_code (not grep/find-as-search), write_file/edit_text (not sed/echo-redirect)."
             ),
             "parameters": {"type": "object", "properties": {
                 "cmd": {
@@ -1541,6 +1853,28 @@ def get_tools() -> List[ToolEntry]:
 	                    "default": [],
 	                    "description": "Generated file paths to copy/register into the task artifact store after success.",
 	                },
+	                "scratch": {
+	                    "type": "array",
+	                    "items": {"type": "string"},
+	                    "default": [],
+	                    "description": (
+	                        "Transient in-repo verification files (e.g. a throwaway test you write, run, and "
+	                        "delete to check your own work). Each must be NEW + untracked and confined to the "
+	                        "cwd; they are exempt from the deliverable-output guard, never registered as "
+	                        "artifacts, and EXCLUDED from the workspace patch. Use outputs=[...] for real deliverables."
+	                    ),
+	                },
+	                "timeout_sec": {
+	                    "type": "integer",
+	                    "description": (
+	                        "Optional per-call timeout in seconds for long builds/tests (alias: timeout). "
+	                        "Clamped to the remaining task-deadline budget. Omit for the default (deadline-capped)."
+	                    ),
+	                },
+	                "timeout": {
+	                    "type": "integer",
+	                    "description": "Alias for timeout_sec (per-call timeout in seconds).",
+	                },
 	            }, "required": ["cmd"]},
         }, _run_shell, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
         ToolEntry("claude_code_edit", {
@@ -1567,8 +1901,8 @@ def get_tools() -> List[ToolEntry]:
 	                },
                 "budget": {"type": "number", "default": 5.0},
                 "validate": {"type": "boolean", "default": False},
-                "bucket": {"type": "string", "default": ""},
-                "skill_name": {"type": "string", "default": ""},
+                "bucket": {"type": "string", "default": "", "description": "Skill payload bucket — set ONLY for skill_payload edits; leave empty otherwise."},
+                "skill_name": {"type": "string", "default": "", "description": "Skill slug — set ONLY for skill_payload edits; leave empty otherwise."},
                 "outputs": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1594,6 +1928,28 @@ def get_tools() -> List[ToolEntry]:
 	                    "items": {"type": "string"},
 	                    "default": [],
 	                    "description": "Generated file paths to copy/register into the task artifact store after success.",
+	                },
+	                "scratch": {
+	                    "type": "array",
+	                    "items": {"type": "string"},
+	                    "default": [],
+	                    "description": (
+	                        "Transient in-repo verification files (e.g. a throwaway test you write, run, and "
+	                        "delete to check your own work). Each must be NEW + untracked and confined to the "
+	                        "cwd; they are exempt from the deliverable-output guard, never registered as "
+	                        "artifacts, and EXCLUDED from the workspace patch. Use outputs=[...] for real deliverables."
+	                    ),
+	                },
+	                "timeout_sec": {
+	                    "type": "integer",
+	                    "description": (
+	                        "Optional per-call timeout in seconds for long scripts (alias: timeout). "
+	                        "Clamped to the remaining task-deadline budget. Omit for the default (deadline-capped)."
+	                    ),
+	                },
+	                "timeout": {
+	                    "type": "integer",
+	                    "description": "Alias for timeout_sec (per-call timeout in seconds).",
 	                },
 	            }, "required": ["script"]},
         }, _run_script, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
