@@ -12,6 +12,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from ouroboros.config import block_external_url
+
 OFFICIAL_REPO = "razzant/ouroboros"
 PERSONAL_REMOTE_NAME = "origin"
 OFFICIAL_REMOTE_NAME = "managed"
@@ -59,8 +61,10 @@ class GitHubRemoteClient:
     def _request_json(self, method: str, path: str, body: Optional[dict] = None) -> Dict[str, Any]:
         if not self.token:
             raise RuntimeError("GITHUB_TOKEN is required")
+        url = f"{self.api_base}{path}"
+        block_external_url(url, "GitHub API")
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(f"{self.api_base}{path}", data=data, method=method)
+        req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Authorization", f"Bearer {self.token}")
         req.add_header("Accept", "application/vnd.github+json")
         req.add_header("X-GitHub-Api-Version", "2022-11-28")

@@ -19,6 +19,39 @@ from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquir
 from ouroboros.platform_layer import pid_lock_release as _compat_pid_lock_release
 from ouroboros.provider_models import compute_direct_review_models_fallback, migrate_model_value
 
+# Network security: block all external URLs in closed network
+OUROBOROS_CLOSED_NETWORK = os.environ.get("OUROBOROS_CLOSED_NETWORK", "true").lower() in ("true", "1", "yes")
+
+def is_external_url(url: str) -> bool:
+    """Check if URL points to external (non-localhost, non-corporate) network."""
+    if not OUROBOROS_CLOSED_NETWORK:
+        return False
+    from urllib.parse import urlparse
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    if not host:
+        return False
+    # Allow localhost
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return False
+    # Allow corporate internal domains (configure via OUROBOROS_ALLOWED_DOMAINS)
+    allowed_domains = os.environ.get("OUROBOROS_ALLOWED_DOMAINS", "")
+    if allowed_domains:
+        for domain in allowed_domains.split(","):
+            domain = domain.strip().lower()
+            if domain and (host == domain or host.endswith("." + domain)):
+                return False
+    # Block everything else
+    return True
+
+def block_external_url(url: str, context: str = "") -> str:
+    """Raise error if URL is external in closed network."""
+    if is_external_url(url):
+        msg = f"⚠️ EXTERNAL_URL_BLOCKED: {url} is not allowed in closed network"
+        if context:
+            msg += f" ({context})"
+        raise RuntimeError(msg)
+    return ""
 
 # Paths
 HOME = pathlib.Path.home()

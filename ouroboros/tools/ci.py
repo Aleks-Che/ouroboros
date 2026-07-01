@@ -12,7 +12,7 @@ import urllib.parse
 import urllib.request
 from typing import List, Optional, Tuple
 
-from ouroboros.config import load_settings
+from ouroboros.config import load_settings, block_external_url
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.utils import utc_now_iso, run_cmd
 
@@ -37,6 +37,7 @@ def _get_github_config() -> Tuple[str, str]:
 def _gh_api(method: str, path: str, token: str, body: Optional[dict] = None,
             timeout: int = 30) -> Tuple[int, dict]:
     url = f"{_GITHUB_API}{path}"
+    block_external_url(url, "GitHub API")
     data = json.dumps(body).encode() if body else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"token {token}")

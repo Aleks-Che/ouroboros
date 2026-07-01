@@ -105,6 +105,8 @@ def _registry_base_url(override: Optional[str] = None) -> str:
         url = get_clawhub_registry_url()
     else:
         url = str(override).strip()
+    from ouroboros.config import block_external_url
+    block_external_url(url, "ClawHub marketplace")
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("https", "http"):
         raise ClawHubClientHostBlocked(

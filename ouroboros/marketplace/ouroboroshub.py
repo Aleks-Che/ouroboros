@@ -15,7 +15,7 @@ from ouroboros.marketplace import AllowlistRedirectHandler
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ouroboros.config import get_ouroboroshub_catalog_url, get_ouroboroshub_skills_dir
+from ouroboros.config import get_ouroboroshub_catalog_url, get_ouroboroshub_skills_dir, block_external_url
 from ouroboros.marketplace.fetcher import FetchError, land_staged_tree
 from ouroboros.marketplace.install_specs import install_specs_hash
 from ouroboros.marketplace.isolated_deps import DEPS_STATE_FILENAME, read_deps_state
@@ -98,6 +98,7 @@ class HubInstallResult:
 
 
 def _fetch_bytes(url: str, *, max_bytes: int, timeout_sec: int = 15) -> bytes:
+    block_external_url(url, "OuroborosHub marketplace")
     parsed = urllib.parse.urlparse(url)
     _raise_if(parsed.scheme not in {"https", "http"}, f"URL must use https:// (or localhost http): {url}")
     _raise_if(parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1"}, f"URL must use https:// for non-localhost hosts: {url}")

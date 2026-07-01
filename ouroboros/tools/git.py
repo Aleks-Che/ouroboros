@@ -12,7 +12,7 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
-from ouroboros.config import get_runtime_mode
+from ouroboros.config import get_runtime_mode, block_external_url
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
     format_protected_paths,
@@ -811,6 +811,7 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
             f"?per_page=10&branch={urllib.parse.quote(branch, safe='')}"
             f"&event=push&head_sha={urllib.parse.quote(local_sha, safe='')}"
         )
+        block_external_url(runs_url, "GitHub CI status")
         with urllib.request.urlopen(urllib.request.Request(runs_url, headers=headers), timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         runs = [r for r in (data.get("workflow_runs") or []) if r.get("head_sha") == local_sha]

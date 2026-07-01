@@ -12,6 +12,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ouroboros.config import load_settings
+from ouroboros.config import block_external_url
 from ouroboros.gateway._helpers import json_error, json_exception
 
 log = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ async def _fetch_openrouter_model_catalog(
     client: httpx.AsyncClient,
     api_key: str,
 ) -> list[dict[str, str]]:
+    block_external_url("https://openrouter.ai/api/v1/models", "OpenRouter model catalog")
     response = await client.get(
         "https://openrouter.ai/api/v1/models",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -101,6 +103,7 @@ async def _fetch_openai_compatible_model_catalog(
     if not api_root:
         return []
 
+    block_external_url(api_root, "OpenAI-compatible model catalog")
     headers = {"Authorization": f"Bearer {api_key}"} if str(api_key or "").strip() else None
     response = await client.get(
         f"{api_root}/models",
@@ -130,6 +133,7 @@ async def _fetch_anthropic_model_catalog(
     client: httpx.AsyncClient,
     api_key: str,
 ) -> list[dict[str, str]]:
+    block_external_url("https://api.anthropic.com/v1/models", "Anthropic model catalog")
     response = await client.get(
         "https://api.anthropic.com/v1/models",
         headers={

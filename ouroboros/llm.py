@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ouroboros.provider_models import PROVIDER_PREFIXES, normalize_anthropic_model_id, normalize_model_identity
 from ouroboros.utils import in_worker_process
+from ouroboros.config import block_external_url, is_external_url
 
 log = logging.getLogger(__name__)
 
@@ -502,6 +503,10 @@ class LLMClient:
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
         cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
 
+        # Block external URLs in closed network
+        if base_url:
+            block_external_url(base_url, "LLM provider")
+
         client = self._remote_clients.get(cache_key)
         if client is None:
             from openai import OpenAI
@@ -588,6 +593,10 @@ class LLMClient:
         headers_dict = dict(target.get("default_headers") or {})
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
         cache_key = (str(target.get("provider") or ""), base_url, api_key, headers)
+
+        # Block external URLs in closed network
+        if base_url:
+            block_external_url(base_url, "LLM async provider")
 
         client = self._async_remote_clients.get(cache_key)
         if client is None:
@@ -2761,6 +2770,7 @@ def openrouter_web_search_server_tool(
 ) -> Any:
     """Run OpenRouter's provider-owned web_search server tool."""
 
+    block_external_url("https://openrouter.ai/api/v1", "OpenRouter web search")
     from openai import OpenAI
 
     client = OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1")
@@ -2783,6 +2793,7 @@ def anthropic_web_search_server_tool(
 ) -> Any:
     """Run Anthropic's provider-owned web_search server tool."""
 
+    block_external_url("https://api.anthropic.com/v1", "Anthropic web search")
     import anthropic
 
     client = anthropic.Anthropic(api_key=api_key)

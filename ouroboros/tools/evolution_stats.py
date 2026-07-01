@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ouroboros.config import block_external_url
+
 log = logging.getLogger(__name__)
 
 _VERSION_RE = re.compile(r"v(\d+\.\d+\.\d+)")
@@ -150,6 +152,7 @@ def _push_to_github(data: dict[str, Any]) -> str:
     branch = os.environ.get("GITHUB_BRANCH", "ouroboros")
 
     url = f"https://api.github.com/repos/{repo_slug}/contents/{file_path}"
+    block_external_url(url, "GitHub evolution stats")
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",

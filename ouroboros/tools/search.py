@@ -11,6 +11,7 @@ from typing import Any, Dict, List
 from ouroboros.pricing import estimate_cost
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.utils import sanitize_tool_result_for_log, utc_now_iso
+from ouroboros.config import block_external_url
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ def _emit_simple_usage(
 
 
 def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search_context_size: str = "") -> str:
+    block_external_url("https://openrouter.ai/api/v1", "OpenRouter web search")
     api_key = str(os.environ.get("OPENROUTER_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
@@ -203,6 +205,7 @@ def _web_search_openrouter(ctx: ToolContext, query: str, model: str = "", search
 
 
 def _web_search_anthropic(ctx: ToolContext, query: str, model: str = "") -> str:
+    block_external_url("https://api.anthropic.com/v1", "Anthropic web search")
     api_key = str(os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured")
@@ -351,6 +354,7 @@ def _web_search(
     if not api_key:
         return _fallbacks()
 
+    block_external_url(base_url or "https://api.openai.com/v1", "OpenAI web search")
     active_model = model or os.environ.get("OUROBOROS_WEBSEARCH_MODEL", DEFAULT_SEARCH_MODEL)
     active_context = search_context_size or DEFAULT_SEARCH_CONTEXT_SIZE
     active_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
