@@ -3,6 +3,11 @@
 .env.*
 *.key
 *.pem
+*.cert
+*.ca
+certs/
+cookies.txt
+jira_cookies.txt
 
 # IDE
 .cursor/
@@ -84,3 +89,12 @@ MagicMock/
 /extracted_*/
 /*.pdf
 /*.png
+
+# Corporate secrets (Sberbank)
+*.zip
+*.log*
+
+# Debug scripts
+debug_*.py
+david_debug_*.py
+test_file_for_sh.py

@@ -210,159 +210,13 @@ def add_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
 
 
 def fetch_openrouter_pricing() -> Dict[str, Tuple[float, ...]]:
-    """Fetch OpenRouter pricing as model_id -> per-1M prices.
-
-    Tuples are ``(input, cached_read, output)`` or
-    ``(input, cached_read, cache_write, output)`` when OpenRouter exposes a
-    provider-specific write price.
-    """
-    import logging
-    log = logging.getLogger("ouroboros.llm")
-
-    try:
-        import requests
-    except ImportError:
-        log.warning("requests not installed, cannot fetch pricing")
-        return {}
-
-    try:
-        url = "https://openrouter.ai/api/v1/models"
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-
-        data = resp.json()
-        models = data.get("data", [])
-
-        prefixes = ("anthropic/", "openai/", "google/", "meta-llama/", "x-ai/", "qwen/")
-
-        pricing_dict = {}
-        for model in models:
-            model_id = model.get("id", "")
-            if not model_id.startswith(prefixes):
-                continue
-
-            pricing = model.get("pricing", {})
-            if not pricing or not pricing.get("prompt"):
-                continue
-
-            raw_prompt = float(pricing.get("prompt", 0))
-            raw_completion = float(pricing.get("completion", 0))
-            raw_cached_str = pricing.get("input_cache_read")
-            raw_cached = float(raw_cached_str) if raw_cached_str else None
-            raw_cache_write_str = pricing.get("input_cache_write")
-            raw_cache_write = float(raw_cache_write_str) if raw_cache_write_str else None
-
-            prompt_price = round(raw_prompt * 1_000_000, 4)
-            completion_price = round(raw_completion * 1_000_000, 4)
-            if raw_cached is not None:
-                cached_price = round(raw_cached * 1_000_000, 4)
-            else:
-                # Missing cache-read pricing is not a provider promise. Use the
-                # conservative input price unless the response carries an
-                # authoritative usage.cost value.
-                cached_price = prompt_price
-            cache_write_price = (
-                round(raw_cache_write * 1_000_000, 4)
-                if raw_cache_write is not None else None
-            )
-
-            if prompt_price > 1000 or completion_price > 1000:
-                log.warning(f"Skipping {model_id}: prices seem wrong (prompt={prompt_price}, completion={completion_price})")
-                continue
-
-            if cache_write_price is not None:
-                row = (prompt_price, cached_price, cache_write_price, completion_price)
-            else:
-                row = (prompt_price, cached_price, completion_price)
-            pricing_dict[model_id] = row
-            normalized_model_id = normalize_model_identity(model_id)
-            if normalized_model_id != model_id:
-                pricing_dict[normalized_model_id] = row
-
-        log.info(f"Fetched pricing for {len(pricing_dict)} models from OpenRouter")
-        return pricing_dict
-
-    except (requests.RequestException, ValueError, KeyError) as e:
-        log.warning(f"Failed to fetch OpenRouter pricing: {e}")
-        return {}
+    """Fetch OpenRouter pricing — DISABLED in closed network."""
+    return {}
 
 
 def fetch_cloudru_pricing() -> Dict[str, Tuple[float, ...]]:
-    """Fetch cloud.ru Foundation Models pricing as ``cloudru/<id>`` -> per-1M USD.
-
-    cloud.ru's ``GET /v1/models`` returns per-model ``metadata`` with token costs
-    (``prompt_tokens_cost``, ``generated_tokens_cost``, ``cache_read_tokens_cost``,
-    ``cache_write_tokens_cost``) in RUB per 1M tokens — i.e. the real resale price
-    the owner pays. We convert to USD via ``OUROBOROS_RUB_USD_RATE`` so the catalog
-    is the SSOT for ALL cloud.ru models (no hardcoded per-model table). Models with
-    ``is_billable`` false/None are free → no row (estimate_cost returns 0). Returns
-    {} when no cloud.ru key is configured or the fetch fails (caller falls back to
-    the static table). Tuples are ``(input, cached_read, cache_write, output)``."""
-    import logging
-    log = logging.getLogger("ouroboros.llm")
-
-    api_key = (os.environ.get("CLOUDRU_FOUNDATION_MODELS_API_KEY", "") or "").strip()
-    if not api_key:
-        return {}
-    try:
-        import requests
-    except ImportError:
-        return {}
-
-    base_url = (
-        os.environ.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL", "") or ""
-    ).strip() or "https://foundation-models.api.cloud.ru/v1"
-    try:
-        rate = float(os.environ.get("OUROBOROS_RUB_USD_RATE", "") or 95.0)
-    except (TypeError, ValueError):
-        rate = 95.0
-    if rate <= 0:
-        rate = 95.0
-
-    try:
-        resp = requests.get(
-            f"{base_url.rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        models = resp.json().get("data", []) or []
-
-        def _rub_per_1m_to_usd(value: Any) -> Optional[float]:
-            try:
-                num = float(value)
-            except (TypeError, ValueError):
-                return None
-            if num < 0:  # cloud.ru uses -1 for "n/a" (e.g. embedding output)
-                return None
-            return round(num / rate, 6)
-
-        pricing_dict: Dict[str, Tuple[float, ...]] = {}
-        for model in models:
-            model_id = str(model.get("id") or "").strip()
-            meta = model.get("metadata") if isinstance(model.get("metadata"), dict) else {}
-            if not model_id or not meta or not meta.get("is_billable"):
-                continue
-            prompt_price = _rub_per_1m_to_usd(meta.get("prompt_tokens_cost"))
-            output_price = _rub_per_1m_to_usd(meta.get("generated_tokens_cost"))
-            if prompt_price is None or output_price is None:
-                continue
-            cached_price = _rub_per_1m_to_usd(meta.get("cache_read_tokens_cost"))
-            cache_write_price = _rub_per_1m_to_usd(meta.get("cache_write_tokens_cost"))
-            row = (
-                prompt_price,
-                cached_price if cached_price is not None else prompt_price,
-                cache_write_price if cache_write_price is not None else prompt_price,
-                output_price,
-            )
-            pricing_dict[f"cloudru/{model_id}"] = row
-            pricing_dict[f"cloudru::{model_id}"] = row
-
-        log.info(f"Fetched pricing for {len(pricing_dict) // 2} models from cloud.ru")
-        return pricing_dict
-    except (requests.RequestException, ValueError, KeyError) as e:
-        log.warning(f"Failed to fetch cloud.ru pricing: {e}")
-        return {}
+    """Fetch cloud.ru pricing — DISABLED in closed network."""
+    return {}
 
 
 class LLMClient:
@@ -399,46 +253,9 @@ class LLMClient:
 
     @classmethod
     def _fetch_openrouter_capabilities(cls) -> None:
-        """Populate _SUPPORTED_PARAMS_CACHE once from OpenRouter /models."""
+        """DISABLED in closed network — cannot reach OpenRouter."""
         cls._SUPPORTED_PARAMS_FETCHED = True
-        cls._CAPABILITIES_FETCH_OK = False  # set True only on a clean 200 + parse
-        try:
-            import requests
-            # 5s, not 15s: this fetch is on the synchronous capability-probe path
-            # behind the max-context-mode gate (settings save / max toggle). A slow
-            # probe must fail-closed quickly (-> window unknown -> max blocked with
-            # the owner-ack escape), never hang the save (v6.33.0 WS4 timing budget).
-            resp = requests.get(
-                "https://openrouter.ai/api/v1/models",
-                timeout=5,
-            )
-            if resp.status_code != 200:
-                log.debug(
-                    "OpenRouter /models returned %d; supported_parameters cache empty",
-                    resp.status_code,
-                )
-                return
-            from ouroboros.provider_models import update_vision_overlay
-
-            for m in resp.json().get("data", []) or []:
-                mid = m.get("id") or ""
-                sp = m.get("supported_parameters")
-                if mid and isinstance(sp, list) and sp:
-                    cls._SUPPORTED_PARAMS_CACHE[mid] = set(sp)
-                # Context window (provider_metadata Capability Evidence source).
-                cl = m.get("context_length")
-                if mid and isinstance(cl, (int, float)) and cl > 0:
-                    cls._CONTEXT_LENGTH_CACHE[mid] = int(cl)
-                # Vision overlay for supports_vision(): authoritative
-                # input_modalities from the same /models payload.
-                arch = m.get("architecture")
-                if mid and isinstance(arch, dict):
-                    modalities = arch.get("input_modalities")
-                    if isinstance(modalities, list) and modalities:
-                        update_vision_overlay(mid, "image" in modalities)
-            cls._CAPABILITIES_FETCH_OK = True  # reached the provider and parsed it
-        except Exception:
-            log.debug("Failed to fetch OpenRouter model capabilities", exc_info=True)
+        cls._CAPABILITIES_FETCH_OK = False
 
     @classmethod
     def metadata_fetch_attempted_and_failed(cls) -> bool:
@@ -1314,7 +1131,6 @@ class LLMClient:
         temperature: Optional[float] = None,
         no_proxy: bool = False,
         timeout: Optional[float] = None,
-        allow_server_web_search: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Single LLM call returning (message, usage); no_proxy avoids macOS fork proxy crashes."""
         messages = self._normalize_system_message_placement(messages)
@@ -1331,7 +1147,6 @@ class LLMClient:
             target, messages, tools, reasoning_effort, max_tokens, tool_choice, temperature,
             no_proxy=no_proxy,
             timeout=timeout,
-            allow_server_web_search=allow_server_web_search,
         )
 
     async def chat_async(
@@ -1345,7 +1160,6 @@ class LLMClient:
         temperature: Optional[float] = None,
         no_proxy: bool = False,
         timeout: Optional[float] = None,
-        allow_server_web_search: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Async remote chat; no_proxy keeps forked macOS workers off OS proxy APIs."""
         messages = self._normalize_system_message_placement(messages)
@@ -1386,7 +1200,6 @@ class LLMClient:
                 kwargs = self._build_remote_kwargs(
                     target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
                     skip_capability_fetch=True,
-                    allow_server_web_search=allow_server_web_search,
                 )
                 prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
                     kwargs.get("messages"),
@@ -1411,7 +1224,6 @@ class LLMClient:
         client = self._get_async_remote_client(target)
         kwargs = self._build_remote_kwargs(
             target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
-            allow_server_web_search=allow_server_web_search,
         )
         if timeout and timeout > 0:
             # Cached clients are built without a timeout; honor the caller's
@@ -2047,7 +1859,6 @@ class LLMClient:
         temperature: Optional[float] = None,
         no_proxy: bool = False,
         timeout: Optional[float] = None,
-        allow_server_web_search: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         import requests
 
@@ -2450,7 +2261,6 @@ class LLMClient:
         temperature: Optional[float],
         tools: Optional[List[Dict[str, Any]]],
         skip_capability_fetch: bool = False,
-        allow_server_web_search: bool = False,
     ) -> Dict[str, Any]:
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
@@ -2565,25 +2375,13 @@ class LLMClient:
         }
         if temperature is not None:
             kwargs["temperature"] = temperature
-        server_web_tool = (
-            self._openrouter_main_web_search_tool()
-            if (tools and allow_server_web_search)
-            else None
-        )
-        if tools or server_web_tool:
+        if tools:
             prepared_tools = [
                 {k: v for k, v in tool.items() if k != "cache_control"}
                 for tool in self._sanitize_chat_completion_tools(tools)
             ]
-            if server_web_tool:
-                prepared_tools.append(server_web_tool)
             if prepared_tools and cache_model.startswith("anthropic/"):
-                for idx in range(len(prepared_tools) - 1, -1, -1):
-                    if isinstance(prepared_tools[idx].get("function"), dict):
-                        last_tool = {**prepared_tools[idx]}
-                        last_tool["cache_control"] = {"type": "ephemeral"}
-                        prepared_tools[idx] = last_tool
-                        break
+                prepared_tools[-1] = {**prepared_tools[-1], "cache_control": {"type": "ephemeral"}}
             kwargs["tools"] = prepared_tools
             kwargs["tool_choice"] = tool_choice
 
@@ -2636,27 +2434,7 @@ class LLMClient:
         for _sdk_field in ("refusal", "annotations", "audio", "function_call"):
             if msg.get(_sdk_field) is None:
                 msg.pop(_sdk_field, None)
-        annotations = msg.get("annotations") if isinstance(msg.get("annotations"), list) else []
-        web_sources: List[Dict[str, str]] = []
-        for annotation in annotations:
-            if not isinstance(annotation, dict):
-                continue
-            citation = annotation.get("url_citation") if isinstance(annotation.get("url_citation"), dict) else annotation
-            url = str(citation.get("url") or "").strip() if isinstance(citation, dict) else ""
-            if not url:
-                continue
-            web_sources.append({
-                "url": url[:500],
-                "title": str(citation.get("title") or "")[:300] if isinstance(citation, dict) else "",
-                "content": str(citation.get("content") or citation.get("snippet") or "")[:1000] if isinstance(citation, dict) else "",
-            })
-        if web_sources:
-            usage["web_search_sources"] = web_sources[:20]
-        # Provider response annotations are transport metadata, not valid chat
-        # input fields for the next round. Persist harvested citations in usage.
         msg.pop("annotations", None)
-        if isinstance(usage.get("server_tool_use"), dict):
-            usage["server_tool_use"] = dict(usage["server_tool_use"])
         # Provider-private reasoning text on the OpenAI-compatible direct lanes
         # (GLM / Z.AI / cloud.ru, legacy vLLM expose a top-level ``reasoning_content``).
         # Unlike ``reasoning``/``reasoning_details`` (kept for same-family continuity
@@ -2851,7 +2629,6 @@ class LLMClient:
         temperature: Optional[float] = None,
         no_proxy: bool = False,
         timeout: Optional[float] = None,
-        allow_server_web_search: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send remote chat; no_proxy uses a one-shot client and skips OS proxy lookup."""
         if target.get("provider") == "anthropic":
@@ -2873,7 +2650,6 @@ class LLMClient:
                 kwargs = self._build_remote_kwargs(
                     target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
                     skip_capability_fetch=True,
-                    allow_server_web_search=allow_server_web_search,
                 )
                 prompt_cache_ttl = self._prompt_cache_ttl_from_payload(
                     kwargs.get("messages"),
@@ -2900,7 +2676,6 @@ class LLMClient:
         client = self._get_remote_client(target)
         kwargs = self._build_remote_kwargs(
             target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
-            allow_server_web_search=allow_server_web_search,
         )
         if timeout and timeout > 0:
             # Cached clients are built without a timeout; honor the caller's

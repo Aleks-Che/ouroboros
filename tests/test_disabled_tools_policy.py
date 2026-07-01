@@ -150,7 +150,6 @@ def test_registry_hides_missing_credential_tools(tmp_path, monkeypatch):
     assert "CAPABILITY_UNAVAILABLE" in blocked
     assert "ANTHROPIC_API_KEY" in blocked
 
-    assert reg.get_schema_by_name("create_github_issue") is None
     assert reg.get_schema_by_name("submit_skill_to_hub") is None
     assert reg.get_schema_by_name("generate_evolution_stats") is None
     assert "CAPABILITY_UNAVAILABLE" in reg.execute("submit_skill_to_hub", {"skill": "x"})

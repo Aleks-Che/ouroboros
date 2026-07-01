@@ -1138,8 +1138,12 @@ def build_llm_messages(
     soft_cap_tokens: int = CONTEXT_SOFT_CAP_TOKENS,
     ctx: Any = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    from ouroboros.config import load_settings
+    settings = load_settings()
+    language = str(settings.get("OUROBOROS_LANGUAGE", "rus") or "rus").strip().lower()
+    system_prompt_file = "SYSTEM_rus.md" if language == "rus" else "SYSTEM.md"
     base_prompt = safe_read(
-        env.repo_path("prompts/SYSTEM.md"),
+        env.repo_path(f"prompts/{system_prompt_file}"),
         fallback="You are Ouroboros. Your base prompt could not be loaded."
     )
     bible_md = safe_read(env.repo_path("BIBLE.md"))

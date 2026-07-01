@@ -8,7 +8,7 @@ version = "6.53.4"
 description = "Self-creating AI agent with constitution, background consciousness, and persistent identity"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     {name = "Anton Razzhigaev"},
 ]
@@ -44,6 +44,7 @@ dependencies = [
     "mcp>=1.6,<2.0",
     "PyYAML>=6.0",
     "croniter",
+    "python-dotenv",
     # Upper-bounded: tree-sitter 0.25.x + language-pack 1.x changed the grammar/
     # node-type behavior so the WS3 polyglot symbol extraction returned nothing
     # (green locally on 0.23.2/0.9.1, red in CI which pulled the latest). Pin to
@@ -112,3 +113,9 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
 ignore = ["E501"]
+
+[tool.mypy]
+ignore_missing_imports = true
+warn_return_any = false
+warn_unused_configs = false
+exclude = ["tests/", "ouroboros-fork/"]

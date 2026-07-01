@@ -32,8 +32,17 @@ from ouroboros.skill_loader import (
 from ouroboros.skill_publish_eligibility import PUBLISHABLE_STATUSES
 from ouroboros.skill_review_status import normalize_skill_review_status
 from ouroboros.contracts.skill_payload_policy import SKILL_PAYLOAD_CONTROL_FILENAMES
-from ouroboros.tools.github import _gh_cmd, github_token_from_env_or_settings
 from ouroboros.tools.registry import ToolContext, ToolEntry
+
+
+def _gh_cmd(args: List[str], ctx: ToolContext, *, timeout: int = 30, input_data: str | None = None) -> str:
+    """GitHub CLI is disabled in closed network."""
+    return "⚠️ GitHub CLI is not available in closed network"
+
+
+def github_token_from_env_or_settings() -> str:
+    """GitHub is disabled in closed network."""
+    return ""
 from ouroboros.utils import contains_real_secret_value, read_json_dict, utc_now_iso
 
 _MAX_PAYLOAD_BYTES = 5 * 1024 * 1024

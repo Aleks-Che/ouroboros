@@ -36,7 +36,6 @@ async def api_state(request: Request) -> JSONResponse:
         from supervisor.workers import PENDING, RUNNING, WORKERS
         from supervisor.queue import get_evolution_status_snapshot
         from ouroboros.config import get_context_mode, get_runtime_mode, get_skills_repo_path
-        from ouroboros.tools.github import github_token_from_env_or_settings
 
         st = load_state()
         alive = 0
@@ -80,7 +79,7 @@ async def api_state(request: Request) -> JSONResponse:
             "runtime_mode": get_runtime_mode(),
             "context_mode": get_context_mode(),
             "skills_repo_configured": bool(get_skills_repo_path()),
-            "github_token_configured": bool(github_token_from_env_or_settings()),
+            "github_token_configured": False,
             "projects": _projects_summary_safe(request),
             "project_chat_ids": _project_chat_ids_safe(request),
             "task_bindings": _task_bindings_safe(request),

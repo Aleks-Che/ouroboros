@@ -6,6 +6,43 @@ This document is the current operational map of Ouroboros: structure, data flows
 
 ---
 
+## 0. Corporate Adaptation (Sberbank)
+
+This fork adapts Ouroboros for closed corporate network.
+
+### Disabled Features
+
+| Feature | Reason | Code |
+|---------|--------|------|
+| OpenRouter pricing fetch | External API | `llm.py:fetch_openrouter_pricing()` → `return {}` |
+| cloud.ru pricing fetch | External API | `llm.py:fetch_cloudru_pricing()` → `return {}` |
+| OpenRouter capabilities | External API | `llm.py:_fetch_openrouter_capabilities()` → no-op |
+| Web search tool injection | Not needed | `llm.py:_build_remote_kwargs()` — removed `server_web_tool` |
+| Web search sources parsing | Not needed | `llm.py:_normalize_remote_response()` — removed `annotations` |
+| GitHub tools | Closed network | `tools/github.py` — deleted |
+| `allow_server_web_search` param | Not needed | Removed from 6 functions |
+
+### Added Features
+
+| Feature | Config |
+|---------|--------|
+| Russian language prompt | `OUROBOROS_LANGUAGE=rus` → `prompts/SYSTEM_rus.md` |
+| Confluence/Jira config | `CONFLUENCE_BASE_URL`, `CONFLUENCE_TOKEN`, `JIRA_BASE_URL`, `JIRA_TOKEN` |
+| Network bind | `OUROBOROS_SERVER_HOST=0.0.0.0` |
+| Low context mode | `OUROBOROS_CONTEXT_MODE=low` |
+
+### Key Files Changed
+
+- `ouroboros/llm.py` — external API stubs, web search removal
+- `ouroboros/config.py` — corporate settings
+- `ouroboros/context.py` — language switcher
+- `ouroboros/safety.py` — `extract_video_frames` removed from SKIP
+- `ouroboros/tools/github.py` — deleted
+- `ouroboros/tools/registry.py` — GitHub tools removed
+- `prompts/SYSTEM_rus.md` — Russian prompt (648 lines)
+
+---
+
 ## 1. High-Level Architecture
 
 ```

@@ -2181,7 +2181,6 @@ def run_llm_loop(
                 max_retries, drive_logs, task_id, round_idx, event_queue, accumulated_usage, task_type,
                 use_local=active_use_local,
                 deadline_ts=_task_deadline_epoch(tools),
-                allow_server_web_search=_server_web_allowed_by_task(tools._ctx),
             )
             tools._ctx._current_llm_call_meta = dict(accumulated_usage.get("_last_llm_call_meta") or {})
 

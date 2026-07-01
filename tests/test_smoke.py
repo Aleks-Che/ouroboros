@@ -54,7 +54,6 @@ TOOL_MODULES = [
     "ouroboros.tools.plan_review",
     "ouroboros.tools.git_rollback",
     "ouroboros.tools.git_pr",
-    "ouroboros.tools.github",
     "ouroboros.tools.ci",
     "ouroboros.tools.verify",
 ]
@@ -116,9 +115,6 @@ EXPECTED_TOOLS = [
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
     "stage_adaptations", "stage_pr_merge", "vcs_rollback",
-    "list_github_prs", "get_github_pr", "comment_on_pr",
-    "list_github_issues", "get_github_issue", "comment_on_issue",
-    "close_github_issue", "create_github_issue",
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
     "journal_read", "journal_write", "workpad_read", "workpad_write",
     "promote_chat_to_task", "route_to_project", "list_projects", "steer_task",
@@ -187,17 +183,6 @@ def test_tool_schemas_have_no_empty_enum_values(registry):
         _walk(schema.get("function", {}).get("parameters", {}), schema.get("function", {}).get("name", "?"))
 
 
-def test_github_create_issue_schema_fields(registry):
-    schema = registry.get_schema_by_name("create_github_issue")["function"]
-    props = schema["parameters"]["properties"]
-    assert schema["parameters"]["required"] == ["title"]
-    assert props["title"]["type"] == "string"
-    assert props["body"]["type"] == "string"
-    assert props["body"]["default"] == ""
-    assert props["labels"]["type"] == "string"
-    assert props["labels"]["default"] == ""
-
-
 def test_tool_execute_basic(registry):
     """Actually execute a simple tool to verify execution works."""
     result = registry.execute("run_command", {"cmd": ["echo", "hello"]})
@@ -220,10 +205,6 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "plan_task",
         "vcs_rollback",
         "run_ci_tests",
-        # github.py is in _FROZEN_TOOL_MODULES — PR inspection tools must work in frozen builds
-        "list_github_prs",
-        "get_github_pr",
-        "comment_on_pr",
         "query_code",
     }
     missing = expected_subset - available

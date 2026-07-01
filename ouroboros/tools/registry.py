@@ -594,14 +594,6 @@ def _disabled_tools(ctx: Any) -> frozenset:
 
 
 _GITHUB_TOKEN_TOOLS = frozenset({
-    "list_github_prs",
-    "get_github_pr",
-    "comment_on_pr",
-    "list_github_issues",
-    "get_github_issue",
-    "comment_on_issue",
-    "close_github_issue",
-    "create_github_issue",
     "run_ci_tests",
     "submit_skill_to_hub",
     "generate_evolution_stats",
@@ -957,7 +949,7 @@ class ToolRegistry:
 
     _FROZEN_TOOL_MODULES = [
         "browser", "ci", "claude_advisory_review", "compact_context", "control",
-        "core", "evolution_stats", "git", "git_pr", "git_rollback", "github",
+        "core", "evolution_stats", "git", "git_pr", "git_rollback",
         "health", "join_ledger", "knowledge", "media", "memory_tools", "plan_review", "project_journal",
         "recent_tasks",
         "query_code", "review", "search", "services", "shell", "skill_exec", "skill_publish",

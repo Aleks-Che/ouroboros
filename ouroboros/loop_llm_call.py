@@ -640,7 +640,6 @@ def call_llm_with_retry(
     use_local: bool = False,
     deadline_ts: Optional[float] = None,
     attempt_cap: Optional[int] = None,
-    allow_server_web_search: bool = False,
 ) -> Tuple[Optional[Dict[str, Any]], float]:
     """Call LLM with retry logic, usage tracking, and event emission.
 
@@ -700,7 +699,6 @@ def call_llm_with_retry(
                 "reasoning_effort": effort,
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
                 "use_local": use_local,
-                "allow_server_web_search": bool(allow_server_web_search),
             }
             if tools:
                 kwargs["tools"] = tools
@@ -718,7 +716,6 @@ def call_llm_with_retry(
                         "reasoning_effort": effort,
                         "max_tokens": MAIN_LOOP_MAX_TOKENS,
                         "use_local": bool(use_local),
-                        "allow_server_web_search": bool(allow_server_web_search),
                     },
                     manifest={
                         "execution_id": execution_id,

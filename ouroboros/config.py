@@ -80,7 +80,8 @@ SETTINGS_DEFAULTS = {
     "ANTHROPIC_API_KEY": "",
 
     "OUROBOROS_NETWORK_PASSWORD": "",
-    "OUROBOROS_SERVER_HOST": "127.0.0.1",
+    "OUROBOROS_SERVER_HOST": "0.0.0.0",
+    "OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD": "true",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
     "OUROBOROS_MODEL": "google/gemini-3.5-flash",
     # Worker lanes. Empty means "use OUROBOROS_MODEL" (same shape as consciousness),
@@ -181,11 +182,6 @@ SETTINGS_DEFAULTS = {
     # web_search backend pin: auto (default OpenAI-first cascade) | ddgs (pure
     # retrieval, no second LLM — for fixed-model runs) | openai | openrouter | anthropic.
     "OUROBOROS_WEBSEARCH_BACKEND": "auto",
-    # Main-loop OpenRouter server web-search tool. Off by default: provider-
-    # specific capability, not a core provider-independence requirement.
-    "OUROBOROS_MAIN_WEB_SEARCH": "off",
-    "OUROBOROS_MAIN_WEB_SEARCH_ENGINE": "auto",
-    "OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS": 10,
     # OpenRouter provider routing: "" (off) | resilience (same-model failover, cache-warm)
     # | repro (pin, no failover — fixed-model runs) | a raw JSON `provider` object.
     "OUROBOROS_OR_PROVIDER": "",
@@ -196,7 +192,7 @@ SETTINGS_DEFAULTS = {
     # override so a self-change or non-owner save can never enable secret logging.
     # Generative context-window probe (Max gate): on (default) confirms a route's >=1M
     # window from a FREE over-window reject; *_CHARS sizes the oversized padding.
-    "OUROBOROS_GENERATIVE_PROBE": "1",
+    "OUROBOROS_GENERATIVE_PROBE": "0",
     "OUROBOROS_GENERATIVE_PROBE_CHARS": "5000000",
     # Pre-commit review: comma-separated provider-tagged model list
     "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.5,google/gemini-3.5-flash,anthropic/claude-opus-4.8",
@@ -221,7 +217,7 @@ SETTINGS_DEFAULTS = {
     # navigation map + deeper memory consolidation, sized for ~200k / local models.
     # Cognitive-horizon knob (BIBLE P1): the agent cannot lower it (owner-only),
     # and it never changes model / reasoning-effort / output-token budgets.
-    "OUROBOROS_CONTEXT_MODE": "max",
+    "OUROBOROS_CONTEXT_MODE": "low",
     # Optional extra user-managed skills checkout; Ouroboros never clones/pulls it.
     "OUROBOROS_SKILLS_REPO_PATH": "",
     "OUROBOROS_CLAWHUB_REGISTRY_URL": "https://clawhub.ai/api/v1",
@@ -276,6 +272,8 @@ SETTINGS_DEFAULTS = {
     "OUROBOROS_FALLBACK_COOLDOWN_ENABLED": True,
     "OUROBOROS_FALLBACK_COOLDOWN_SEC": 120,
     "OUROBOROS_FALLBACK_ATTEMPTS_PER_MODEL": 1,
+    # Language: en | rus. Selects SYSTEM.md or SYSTEM_rus.md prompt.
+    "OUROBOROS_LANGUAGE": "rus",
 }
 
 
@@ -1335,8 +1333,6 @@ def apply_settings_to_env(settings: dict) -> None:
         "OUROBOROS_IMAGE_INPUT_MODE",
         "OUROBOROS_BG_MAX_ROUNDS", "OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX",
         "OUROBOROS_WEBSEARCH_MODEL", "OUROBOROS_WEBSEARCH_BACKEND",
-        "OUROBOROS_MAIN_WEB_SEARCH", "OUROBOROS_MAIN_WEB_SEARCH_ENGINE",
-        "OUROBOROS_MAIN_WEB_SEARCH_MAX_TOTAL_RESULTS",
         "OUROBOROS_OR_PROVIDER",
         "OUROBOROS_SEARCH_CODE_WALL_SEC",
         "OUROBOROS_GENERATIVE_PROBE", "OUROBOROS_GENERATIVE_PROBE_CHARS",
@@ -1372,6 +1368,7 @@ def apply_settings_to_env(settings: dict) -> None:
         "LOCAL_MODEL_CHAT_FORMAT",
         "USE_LOCAL_MAIN", "USE_LOCAL_HEAVY", "USE_LOCAL_LIGHT", "USE_LOCAL_CONSCIOUSNESS", "USE_LOCAL_FALLBACK",
         "OUROBOROS_FILE_BROWSER_DEFAULT",
+        "OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD",
     ]
     for k in env_keys:
         val = settings.get(k)

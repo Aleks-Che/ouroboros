@@ -110,9 +110,7 @@ def _review_fields(
         submit_hub = {"visible": False, "disabled": True, "reason": ""}
     else:
         if github_token_configured is None:
-            from ouroboros.tools.github import github_token_from_env_or_settings
-
-            github_token_configured = bool(github_token_from_env_or_settings())
+            github_token_configured = False
         submit_hub = submit_hub_eligibility(
             source=source,
             review_status=loaded.review.status,
@@ -289,11 +287,10 @@ def _build_extensions_index(drive_root, repo_path):
         return datetime.fromtimestamp(min(stamps), tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
     from ouroboros.extension_health import read_extension_health
-    from ouroboros.tools.github import github_token_from_env_or_settings
 
     # Request-invariant: resolve the github-token state ONCE for the whole index, not
     # once per skill (FR1 — avoids N settings.json reads per GET /api/extensions).
-    _gh_token_configured = bool(github_token_from_env_or_settings())
+    _gh_token_configured = False
 
     for s in skills:
         payload_root = ""
