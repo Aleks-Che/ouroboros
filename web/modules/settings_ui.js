@@ -850,7 +850,7 @@ export function bindSecretInputs(root) {
             target.type = 'password';
             target.dataset.forceClear = '1';
             const toggle = root.querySelector(`.secret-toggle[data-target="${button.dataset.target}"]`);
-            if (toggle) toggle.textContent = 'Показать';
+            if (toggle) toggle.textContent = 'Show';
         });
     });
 }

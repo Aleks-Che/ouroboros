@@ -8,8 +8,8 @@ export function openConfirmDialog({
     body,
     input = false,
     initialValue = '',
-    confirmLabel = 'Продолжить',
-    cancelLabel = 'Отмена',
+    confirmLabel = 'Continue',
+    cancelLabel = 'Cancel',
     danger = false,
 } = {}) {
     if (activeClose) activeClose(false);

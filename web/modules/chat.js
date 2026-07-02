@@ -63,7 +63,7 @@ export function initChat(ctx) {
 export function createChatInstance({
     ws, state, updateUnreadBadge, openSettingsTab, openDashboardTab,
     chatId = 1, projectId = '', idPrefix = 'chat', mountEl = null,
-    asPanel = false, title = 'Чат',
+    asPanel = false, title = 'Chat',
 }) {
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId();
@@ -80,7 +80,7 @@ export function createChatInstance({
     // Evolve/Restart/Panic/budget chrome, which belongs to the one agent, not a
     // single project thread). The main chat keeps the full overlay header.
     const headerHtml = asPanel
-        ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Подключение...</span></div>`
+        ? `<div class="chat-panel-statusbar"><span id="chat-status" class="status-badge offline">Connecting...</span></div>`
         : renderPageHeader({
             title: title,
             icon: PAGE_ICONS.chat,
@@ -88,24 +88,24 @@ export function createChatInstance({
             className: 'chat-page-header',
             actionsHtml: `
                 <div class="chat-header-actions" id="chat-header-actions">
-                    <button class="chat-header-btn" type="button" data-chat-command="restart" title="Перезапустить агента">Перезапуск</button>
-                    <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Остановить все воркеры">Стоп</button>
+                    <button class="chat-header-btn" type="button" data-chat-command="restart" title="Restart agent">Restart</button>
+                    <button class="chat-header-btn danger" type="button" data-chat-command="panic" title="Stop all workers">Panic</button>
                     <details class="chat-header-more">
-                        <summary class="chat-header-btn" title="Дополнительные управления">Ещё</summary>
+                        <summary class="chat-header-btn" title="More agent controls">More</summary>
                         <div class="chat-header-menu">
-                            <button class="chat-header-menu-item" type="button" data-chat-command="bg" title="Переключить фоновое сознание">Сознание</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="evolve" title="Переключить режим эволюции">Эволюция</button>
-                            <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Запустить ревью сейчас">Ревью</button>
+                            <button class="chat-header-menu-item" type="button" data-chat-command="bg" title="Toggle background consciousness">Consciousness</button>
+                            <button class="chat-header-menu-item" type="button" data-chat-command="evolve" title="Toggle evolution mode">Evolve</button>
+                            <button class="chat-header-menu-item" type="button" data-chat-command="review" title="Run review now">Review</button>
                         </div>
                     </details>
                 </div>
-                <button class="chat-budget-pill" id="chat-budget-pill" type="button" title="Открыть управление бюджетом" aria-label="Открыть управление бюджетом">
+                <button class="chat-budget-pill" id="chat-budget-pill" type="button" title="Open budget controls" aria-label="Open budget controls">
                     <span class="chat-budget-text" id="chat-budget-text">$0 / $0</span>
                     <div class="chat-budget-bar">
                         <div class="chat-budget-bar-fill" id="chat-budget-bar-fill"></div>
                     </div>
                 </button>
-                <span id="chat-status" class="status-badge offline">Подключение...</span>
+                <span id="chat-status" class="status-badge offline">Connecting...</span>
             `,
         });
     page.innerHTML = `
@@ -116,21 +116,21 @@ export function createChatInstance({
             <div class="chat-input-wrap">
                 <div class="chat-toolbar-row">
                     <div class="chat-composer-pills" id="chat-composer-pills">
-                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Рой: запустить глубокий план + мультиподагентный fan-out для следующего сообщения. Автоматически отключается после отправки.">Рой</button>
-                        <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Размер контекста" title="Режим контекста (настройка владельца). Мин подходит для ~200K / локальных моделей; Макс — полный контекст. Применяется к следующей задаче.">
-                            <button class="chat-seg" type="button" data-mode="low">Мин</button>
-                            <button class="chat-seg" type="button" data-mode="max">Макс</button>
+                        <button class="chat-swarm" id="chat-swarm" type="button" data-armed="false" title="Swarm: arm a one-shot deep plan + multi-subagent fan-out (plan_task + web search, then delegate) for your next message. Auto-disarms after sending.">Swarm</button>
+                        <div class="chat-context-mode" id="chat-context-mode" data-context-mode="max" role="group" aria-label="Context size mode" title="Context mode (owner setting). Low fits ~200K / local models; Max is full. Applies on the next task.">
+                            <button class="chat-seg" type="button" data-mode="low">Low</button>
+                            <button class="chat-seg" type="button" data-mode="max">Max</button>
                         </div>
                     </div>
                 </div>
                 <div class="chat-text-row">
-                    <button class="chat-attach-btn" id="chat-attach" type="button" title="Прикрепить файл">
+                    <button class="chat-attach-btn" id="chat-attach" type="button" title="Attach file">
                         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                     </button>
                     <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*" multiple>
-                    <textarea id="chat-input" placeholder="Сообщение Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+                    <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
                     <div class="chat-send-group">
-                        <button class="chat-send-inline" id="chat-send" title="Отправить сообщение">Отправить</button>
+                        <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
                     </div>
                 </div>
             </div>
@@ -188,7 +188,7 @@ export function createChatInstance({
             <span class="attach-badge" data-attachment-id="${escapeHtmlAttr(item.id)}">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>
                 <span class="attach-name" title="${escapeHtmlAttr(item.display_name)}">${escapeHtml(item.display_name)}</span>
-                <button class="attach-remove" type="button" title="Удалить" aria-label="Удалить вложение ${escapeHtmlAttr(item.display_name)}" data-attachment-remove="${escapeHtmlAttr(item.id)}" ${attachmentsUploading ? 'disabled aria-disabled="true"' : ''}>×</button>
+                <button class="attach-remove" type="button" title="Remove" aria-label="Remove attachment ${escapeHtmlAttr(item.display_name)}" data-attachment-remove="${escapeHtmlAttr(item.id)}" ${attachmentsUploading ? 'disabled aria-disabled="true"' : ''}>×</button>
             </span>
         `).join('');
         requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: false }));
@@ -207,22 +207,22 @@ export function createChatInstance({
         const incoming = Array.from(files || []).filter(Boolean);
         if (!incoming.length) return;
         if (attachmentsUploading) {
-            showToast('Дождитесь завершения текущей загрузки перед изменением вложений.', 'error');
+            showToast('Wait for the current upload to finish before changing attachments.', 'error');
             return;
         }
         if (pendingAttachments.length + incoming.length > MAX_PENDING_ATTACHMENTS) {
-            showToast(`Прикрепляйте до ${MAX_PENDING_ATTACHMENTS} файлов за сообщение.`, 'error');
+            showToast(`Attach up to ${MAX_PENDING_ATTACHMENTS} files per message.`, 'error');
             return;
         }
         const oversized = incoming.find((file) => Number(file.size || 0) > MAX_ATTACHMENT_FILE_BYTES);
         if (oversized) {
-            showToast(`Каждое вложение должно быть не более ${Math.round(MAX_ATTACHMENT_FILE_BYTES / (1024 * 1024))} МБ.`, 'error');
+            showToast(`Each attachment must be ${Math.round(MAX_ATTACHMENT_FILE_BYTES / (1024 * 1024))} MB or smaller.`, 'error');
             return;
         }
         const incomingBytes = incoming.reduce((total, file) => total + Number(file.size || 0), 0);
         if (pendingAttachmentBytes() + incomingBytes > MAX_PENDING_ATTACHMENT_BYTES) {
             const limitMb = Math.round(MAX_PENDING_ATTACHMENT_BYTES / (1024 * 1024));
-            showToast(`Общий размер вложений не более ${limitMb} МБ на сообщение.`, 'error');
+            showToast(`Attachments are limited to ${limitMb} MB total per message.`, 'error');
             return;
         }
         pendingAttachments = pendingAttachments.concat(incoming.map((file) => ({
@@ -735,7 +735,7 @@ export function createChatInstance({
         const projectId = projectIdFromTask(taskId);
         record.root.dataset.projectCreating = '1';
         const actions = record.turnProjectBtn?.parentElement || record.root.querySelector('.chat-live-actions');
-        if (actions) actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Создание проекта...</button>';
+        if (actions) actions.innerHTML = '<button type="button" class="chat-live-project-btn" disabled>Creating project…</button>';
         try {
             // One-click convert (owner P1): no name prompt, no extra LLM call.
             // The SERVER derives the project name (gateway/projects.py
@@ -745,14 +745,14 @@ export function createChatInstance({
             // yet — is named from what the owner asked, not "New project".
             const payload = await apiClient.projectFromTask(taskId, projectId, '', record.objectiveHint || '');
             const project = payload.project || { id: projectId, name: projectId };
-            showToast(`Проект создан: ${project.name || project.id}`, 'ok');
+            showToast(`Project created: ${project.name || project.id}`, 'ok');
             window.dispatchEvent(new CustomEvent('ouro:project-created', { detail: { project } }));
             markCardConverted(record, project);
         } catch (exc) {
-            showToast(`Не удалось создать проект: ${exc.message || exc}`, 'error');
+            showToast(`Project creation failed: ${exc.message || exc}`, 'error');
             delete record.root.dataset.projectCreating;
             if (actions) {
-                actions.innerHTML = '<button type="button" class="chat-live-project-btn" data-turn-into-project>Превратить в проект</button>';
+                actions.innerHTML = '<button type="button" class="chat-live-project-btn" data-turn-into-project>Turn into project</button>';
                 record.turnProjectBtn = actions.querySelector('[data-turn-into-project]');
                 // Re-wire the click handler — innerHTML replaced the original node,
                 // so without this the restored button would be dead after a
@@ -786,7 +786,7 @@ export function createChatInstance({
         nameEl.textContent = name;  // textContent — no HTML injection from a project name
         const status = document.createElement('span');
         status.className = 'chat-live-project-status';
-        status.textContent = 'выполняется в фоне ↗';
+        status.textContent = 'running in background ↗';
         chip.append(icon, nameEl, status);
         chip.addEventListener('click', () => {
             window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: { project } }));
@@ -1016,12 +1016,12 @@ export function createChatInstance({
         record.items = [];
         record.lastHumanHeadline = '';
         record.expandedLineKeys.clear();
-        record.titleEl.textContent = 'Работаю...';
+        record.titleEl.textContent = 'Working...';
         record.phaseEl.dataset.phase = 'working';
-        record.phaseEl.textContent = 'Работаю';
+        record.phaseEl.textContent = 'Working';
         record.phaseEl.className = 'chat-live-phase working';
         record.countEl.hidden = true;
-        record.countEl.textContent = '0 заметок';
+        record.countEl.textContent = '0 notes';
         record.metaEl.innerHTML = '';
         record.timelineEl.innerHTML = '';
         record.root.dataset.finished = '0';
@@ -1402,9 +1402,9 @@ export function createChatInstance({
         } else {
             setLiveCardTypingVisible(record, true);
             if (drivesComposerStatus) {
-                setStatus('thinking', 'Работаю...');
+                setStatus('thinking', 'Working...');
             } else if (!hasActiveLiveCard() && statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-                setStatus('online', 'Онлайн');
+                setStatus('online', 'Online');
             }
         }
     }
@@ -2173,7 +2173,7 @@ export function createChatInstance({
         if (pendingAttachments.length) {
             // Upload immediately before send; offline queueing would orphan files.
             if (ws.ws?.readyState !== WebSocket.OPEN) {
-                showToast('Невозможно прикрепить файл в офлайне. Переподключитесь и попробуйте снова.', 'error');
+                showToast('Cannot attach file while offline. Reconnect and try again.', 'error');
                 return;
             }
             const staged = [...pendingAttachments];
@@ -2182,7 +2182,7 @@ export function createChatInstance({
             setSendBusy(true, staged.length > 1 ? 'Uploading files' : 'Uploading');
             try {
                 for (const stagedItem of staged) {
-                    if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Соединение закрылось во время загрузки. Переподключитесь и попробуйте снова.');
+                    if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed during upload. Reconnect and try again.');
                     const formData = new FormData();
                     formData.append('file', stagedItem.file);
                     const resp = await apiFetch('/api/chat/upload', { method: 'POST', body: formData });
@@ -2197,7 +2197,7 @@ export function createChatInstance({
                         mime: data.mime || stagedItem.file?.type || '',
                     });
                 }
-                if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Соединение закрылось после загрузки. Переподключитесь и попробуйте снова.');
+                if (ws.ws?.readyState !== WebSocket.OPEN) throw new Error('Connection closed after upload. Reconnect and try again.');
                 uploadedAttachments = uploaded;
                 const attachmentLines = uploaded
                     .map((item) => `[Attached file: ${item.display_name} saved to ${item.path}]`)
@@ -2213,7 +2213,7 @@ export function createChatInstance({
                 }));
             } catch (e) {
                 await cleanupUploadedAttachments(uploaded);
-                showToast('Ошибка загрузки: ' + e.message, 'error');
+                showToast('Upload error: ' + e.message, 'error');
                 return;  // pending attachments and preview remain so the user can retry
             } finally {
                 setAttachmentUploadState(false);
@@ -2233,7 +2233,7 @@ export function createChatInstance({
         }, hasAttachments ? { queue: false } : undefined);
         if (hasAttachments && result?.status !== 'sent') {
             await cleanupUploadedAttachments(uploadedAttachments);
-            showToast('Соединение потеряно перед отправкой. Переподключитесь и попробуйте снова.', 'error');
+            showToast('Connection lost before send. Reconnect and try again.', 'error');
             return;
         }
         // One-shot: disarm Swarm now that the message is sent.
@@ -2274,11 +2274,11 @@ export function createChatInstance({
         sendGroup.dataset.busy = busy ? '1' : '0';
         sendBtn.disabled = busy;
         if (busy) {
-            sendBtn.textContent = label || 'Отправка';
-            sendBtn.title = label || 'Отправка';
+            sendBtn.textContent = label || 'Sending';
+            sendBtn.title = label || 'Sending';
         } else {
-            sendBtn.textContent = 'Отправить';
-            sendBtn.title = 'Отправить сообщение';
+            sendBtn.textContent = 'Send';
+            sendBtn.title = 'Send message';
         }
     }
 
@@ -2328,7 +2328,7 @@ export function createChatInstance({
                         if (ackResp.ok) {
                             resp = await postMode(next);  // retry with the confirmation in place
                         } else {
-                            showToast('Не удалось сохранить подтверждение.', 'error');
+                            showToast('Could not save the confirmation.', 'error');
                         }
                     }
                 }
@@ -2336,12 +2336,12 @@ export function createChatInstance({
             if (resp.ok) {
                 contextModeBtn.dataset.contextMode = next;
             } else {
-                let message = 'Не удалось изменить режим контекста.';
+                let message = 'Could not change context mode.';
                 try { const p = await resp.json(); if (p?.error) message = p.error; } catch {}
                 showToast(message, 'error');
             }
         } catch (e) {
-            showToast(`Не удалось изменить режим контекста: ${e.message || e}`, 'error');
+            showToast(`Could not change context mode: ${e.message || e}`, 'error');
             /* leave the current value; /api/state refresh will resync */
         } finally {
             contextModeBtn.dataset.disabled = 'false';
@@ -2461,7 +2461,7 @@ export function createChatInstance({
             ws.send({ type: 'command', cmd: '/restart' });
             return;
         }
-        if (command === 'panic' && confirm('Немедленно остановить все воркеры?')) {
+        if (command === 'panic' && confirm('Kill all workers immediately?')) {
             ws.send({ type: 'command', cmd: '/panic' });
         }
     });
@@ -2492,7 +2492,7 @@ export function createChatInstance({
         // the live socket so a late-created panel never gets stuck on
         // "Connecting…" (the one-shot WS `open` already fired before it existed;
         // future reconnects still update it via the shared `open` handler).
-        if (ws.isConnected?.()) setStatus('online', 'Онлайн');
+        if (ws.isConnected?.()) setStatus('online', 'Online');
     } else {
         refreshHeaderControlState(true);
         setInterval(refreshHeaderControlState, 3000);
@@ -2516,7 +2516,7 @@ export function createChatInstance({
             typingEl.style.display = '';
             if (isNearBottom()) messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
-        setStatus('thinking', 'Думаю...');
+        setStatus('thinking', 'Thinking...');
     }
 
     function hideTypingIndicatorOnly() {
@@ -2526,7 +2526,7 @@ export function createChatInstance({
     function hideTyping() {
         hideTypingIndicatorOnly();
         if (statusBadge && ['Thinking...', 'Working...'].includes(statusBadge.textContent)) {
-            setStatus('online', 'Онлайн');
+            setStatus('online', 'Online');
         }
     }
 
@@ -2708,11 +2708,11 @@ export function createChatInstance({
     let wsHasConnectedOnce = false;
 
     ws.on('open', () => {
-        setStatus('online', 'Онлайн');
+        setStatus('online', 'Online');
         refreshHeaderControlState(true);
         const reconnectBanner =
             pendingReconnectBannerText
-            || (wsHasConnectedOnce ? '♻️ Переподключено' : '');
+            || (wsHasConnectedOnce ? '♻️ Reconnected' : '');
         const shouldClearReconnectParams = Boolean(pendingReconnectBannerText);
         pendingReconnectBannerText = '';
         const isReconnect = wsHasConnectedOnce;
@@ -2737,8 +2737,8 @@ export function createChatInstance({
 
     ws.on('close', () => {
         hideTyping();
-        setStatus('offline', 'Переподключение...');
-        syncHeaderControlState({ spent_usd: 0, budget_limit: 10, budget_text: 'Подключение...' });
+        setStatus('offline', 'Reconnecting...');
+        syncHeaderControlState({ spent_usd: 0, budget_limit: 10, budget_text: 'Connecting...' });
     });
 
     return {

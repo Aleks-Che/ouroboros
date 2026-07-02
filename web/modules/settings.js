@@ -73,7 +73,7 @@ function resetSecretClearFlags(root) {
         input.type = 'password';
     });
     root.querySelectorAll('.secret-toggle').forEach((button) => {
-        button.textContent = 'Показать';
+        button.textContent = 'Show';
     });
 }
 
@@ -90,7 +90,7 @@ function wireSecretRow(row) {
     const clear = row.querySelector('[data-row-secret-clear]');
     if (input) input.addEventListener('input', () => { if (input.value.trim()) delete input.dataset.forceClear; });
     if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? 'Show' : 'Hide'; });
-    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = 'Показать'; markSettingsDirty(); });
+    if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = 'Show'; markSettingsDirty(); });
 }
 
 function customSecretRow(key = '', value = '') {

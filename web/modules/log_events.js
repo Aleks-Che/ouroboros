@@ -1,12 +1,12 @@
 import { formatUsd4 } from './utils.js';
 
 export const LOG_CATEGORIES = {
-    tools: { label: 'Инструменты', color: 'var(--blue)' },
+    tools: { label: 'Tools', color: 'var(--blue)' },
     llm: { label: 'LLM', color: 'var(--accent)' },
-    errors: { label: 'Ошибки', color: 'var(--red)' },
-    tasks: { label: 'Задачи', color: 'var(--amber)' },
-    system: { label: 'Система', color: 'var(--text-muted)' },
-    consciousness: { label: 'Сознание', color: 'var(--accent)' },
+    errors: { label: 'Errors', color: 'var(--red)' },
+    tasks: { label: 'Tasks', color: 'var(--amber)' },
+    system: { label: 'System', color: 'var(--text-muted)' },
+    consciousness: { label: 'Consciousness', color: 'var(--accent)' },
 };
 
 export function categorizeLogEvent(evt) {

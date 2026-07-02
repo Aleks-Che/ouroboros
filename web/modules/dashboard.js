@@ -2,11 +2,11 @@ import { renderPageHeader, renderTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 
 const DASHBOARD_TABS = [
-    { value: 'logs', label: 'Логи' },
-    { value: 'evolution', label: 'Эволюция' },
-    { value: 'costs', label: 'Затраты' },
-    { value: 'updates', label: 'Обновления' },
-    { value: 'activity', label: 'Активность' },
+    { value: 'logs', label: 'Logs' },
+    { value: 'evolution', label: 'Evolution' },
+    { value: 'costs', label: 'Costs' },
+    { value: 'updates', label: 'Updates' },
+    { value: 'activity', label: 'Activity' },
 ];
 // Static guard markers: renderTabStrip emits data-dashboard-tab="logs",
 // data-dashboard-tab="evolution", data-dashboard-tab="costs",
@@ -19,14 +19,14 @@ export function initDashboard({ state }) {
     page.className = 'page app-page-glass';
     page.innerHTML = `
         ${renderPageHeader({
-            title: 'Панель управления',
+            title: 'Dashboard',
             icon: PAGE_ICONS.dashboard,
-            description: 'Следите за логами, эволюцией, затратами, активностью и обновлениями в одном месте.',
+            description: 'Monitor logs, evolution, costs, activity, and update state from one view.',
             tabsHtml: renderTabStrip({
                 items: DASHBOARD_TABS,
                 active: state.dashboardActiveSubtab || 'logs',
                 dataAttr: 'data-dashboard-tab',
-                ariaLabel: 'Виды панели',
+                ariaLabel: 'Dashboard views',
                 stripClass: 'dashboard-tabs',
                 tabClass: 'dashboard-tab',
             }),
