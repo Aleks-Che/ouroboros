@@ -186,10 +186,34 @@ def _apply_auto_grant_outcome(outcome: SkillReviewOutcome, skill: Any, auto_gran
 # Prompt assembly
 
 
+def _truncate_long_file_content(content: str, max_lines: int = 1000) -> str:
+    """Truncate long file content to first/last N lines to fit model context limits.
+    
+    When skill content exceeds model context limits, this function truncates files
+    to prevent 'Context size has been exceeded.' errors from the review provider.
+    """
+    lines = content.split('\n')
+    if len(lines) <= max_lines:
+        return content
+    
+    # Keep first 400 and last 400 lines for files > 1000 lines
+    keep_first = 400
+    keep_last = 400
+    truncated_lines = lines[:keep_first] + [
+        f"\n... [truncated {len(lines) - keep_first - keep_last} lines] ...\n",
+        *lines[-keep_last:]
+    ]
+    return '\n'.join(truncated_lines)
+
+
 def _read_skill_text(path: pathlib.Path, *, relpath: str = "") -> str:
     """Read a text skill file; refuse unreadable or binary payloads. The reviewable
     SIZE is bound ONCE at the pack level (see ``_build_skill_file_packs``), not by an
-    arbitrary per-file byte cap, so a large legitimate text/data file is reviewable."""
+    arbitrary per-file byte cap, so a large legitimate text/data file is reviewable.
+    
+    For files that exceed context limits of review models, truncate long content
+    to prevent 'Context size has been exceeded.' errors.
+    """
     try:
         data = path.read_bytes()
     except OSError as exc:
@@ -199,10 +223,13 @@ def _read_skill_text(path: pathlib.Path, *, relpath: str = "") -> str:
     if any(lowered.endswith(ext) for ext in _LOADABLE_BINARY_EXTENSIONS):
         raise _SkillBinaryPayload(relpath or path.name, len(data))
     try:
-        return data.decode("utf-8")
+        content = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         # Any non-UTF-8 runtime-reachable file blocks review.
         raise _SkillBinaryPayload(relpath or path.name, len(data)) from exc
+    
+    # Truncate long files to fit model context limits
+    return _truncate_long_file_content(content)
 
 
 def _build_skill_file_packs(
