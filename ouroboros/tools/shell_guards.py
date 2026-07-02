@@ -605,3 +605,256 @@ def light_shell_repo_mutation(
     if any(ind in cmd_lower for ind in (" > ", " >> ", " | tee ")):
         return repo_target_mentioned(argv, repo_dir=repo_dir, cwd=cwd)
     return False
+
+
+# ---------------------------------------------------------------------------
+# External URL detection in inline interpreter code
+# ---------------------------------------------------------------------------
+
+# URL patterns that indicate external network access
+_EXTERNAL_URL_RE = re.compile(
+    r"""(?i)(?:https?://|ftp://)"""
+    r"""(?!"""
+    r"""localhost[/:\s]"""
+    r"""|127\.0\.0\.1[/:\s]"""
+    r"""|\[::1\][/:\s]"""
+    r"""|0\.0\.0\.0[/:\s]"""
+    r""")"""
+    r"""[^\s'"]+"""
+)
+
+# Python functions/modules that make HTTP requests
+_PYTHON_NETWORK_CALLS = re.compile(
+    r"""(?i)(?:"""
+    r"""requests\.(?:get|post|put|delete|patch|head|options)"""
+    r"""|urllib\.request\.(?:urlopen|urlretrieve|Request)"""
+    r"""|urllib3\.request"""
+    r"""|httpx\.(?:get|post|put|delete|patch|head|options|AsyncClient|Client)"""
+    r"""|aiohttp\.(?:ClientSession|request|get|post)"""
+    r"""|urlopen"""
+    r""")"""
+)
+
+# Python functions that execute system commands
+_PYTHON_DANGEROUS_EXEC_CALLS = re.compile(
+    r"""(?i)(?:"""
+    r"""os\.system\s*\("""
+    r"""|os\.popen\s*\("""
+    r"""|subprocess\.(?:run|call|check_call|check_output|Popen)\s*\("""
+    r"""|subprocess\.getstatusoutput\s*\("""
+    r"""|subprocess\.getoutput\s*\("""
+    r"""|os\.exec[lvpe]+\s*\("""
+    r"""|os\.spawn[lvpe]+\s*\("""
+    r"""|os\.startfile\s*\("""
+    r""")"""
+)
+
+# Node.js functions that make HTTP requests
+_NODE_NETWORK_CALLS = re.compile(
+    r"""(?i)(?:"""
+    r"""fetch\s*\("""
+    r"""|axios\.(?:get|post|put|delete|patch|head|options|request)"""
+    r"""|http\.(?:get|request)"""
+    r"""|https\.(?:get|request)"""
+    r"""|got\.(?:get|post|put|delete|patch)"""
+    r"""|request\s*\("""
+    r"""|superagent\.(?:get|post|put|delete)"""
+    r""")"""
+)
+
+# Node.js functions that execute system commands
+_NODE_DANGEROUS_EXEC_CALLS = re.compile(
+    r"""(?i)(?:"""
+    r"""child_process\.(?:exec|execSync|execFile|spawn|spawnSync|fork)"""
+    r"""|exec\s*\("""
+    r"""|execSync\s*\("""
+    r"""|spawn\s*\("""
+    r""")"""
+)
+
+# Ruby functions that make HTTP requests
+_RUBY_NETWORK_CALLS = re.compile(
+    r"""(?i)(?:"""
+    r"""Net::HTTP\.(?:get|post|start|get_response)"""
+    r"""|open-uri"""
+    r"""|HTTParty\.(?:get|post)"""
+    r"""|Faraday\.(?:get|post)"""
+    r"""|RestClient\.(?:get|post)"""
+    r""")"""
+)
+
+# Ruby functions that execute system commands
+_RUBY_DANGEROUS_EXEC_CALLS = re.compile(
+    r"""(?i)(?:"""
+    r"""system\s*\("""
+    r"""|exec\s*\("""
+    r"""|%x[{\(]"""
+    r"""|`[^`]+`"""
+    r"""|IO\.popen\s*\("""
+    r""")"""
+)
+
+
+def _python_inline_has_external_url(inline_code: str) -> tuple[bool, str]:
+    """Check if Python inline code contains external URL references."""
+    try:
+        tree = ast.parse(inline_code)
+    except Exception:
+        # If we can't parse, check with regex as fallback
+        if _EXTERNAL_URL_RE.search(inline_code):
+            return True, "external URL detected in inline code"
+        return False, ""
+
+    for node in ast.walk(tree):
+        # Check string constants for URLs
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if _EXTERNAL_URL_RE.search(node.value):
+                return True, f"external URL in string: {node.value[:80]}"
+        # Check f-strings
+        if isinstance(node, ast.JoinedStr):
+            for value in node.values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    if _EXTERNAL_URL_RE.search(value.value):
+                        return True, f"external URL in f-string: {value.value[:80]}"
+    return False, ""
+
+
+def _python_inline_has_network_calls(inline_code: str) -> tuple[bool, str]:
+    """Check if Python inline code makes HTTP/network requests."""
+    match = _PYTHON_NETWORK_CALLS.search(inline_code)
+    if match:
+        return True, f"network call detected: {match.group()}"
+    return False, ""
+
+
+def _python_inline_has_dangerous_exec(inline_code: str) -> tuple[bool, str]:
+    """Check if Python inline code executes system commands."""
+    match = _PYTHON_DANGEROUS_EXEC_CALLS.search(inline_code)
+    if match:
+        return True, f"dangerous exec call detected: {match.group()}"
+    return False, ""
+
+
+def _node_inline_has_external_url(inline_code: str) -> tuple[bool, str]:
+    """Check if Node.js inline code contains external URL references."""
+    if _EXTERNAL_URL_RE.search(inline_code):
+        return True, "external URL detected in Node.js inline code"
+    return False, ""
+
+
+def _node_inline_has_network_calls(inline_code: str) -> tuple[bool, str]:
+    """Check if Node.js inline code makes HTTP/network requests."""
+    match = _NODE_NETWORK_CALLS.search(inline_code)
+    if match:
+        return True, f"network call detected: {match.group()}"
+    return False, ""
+
+
+def _node_inline_has_dangerous_exec(inline_code: str) -> tuple[bool, str]:
+    """Check if Node.js inline code executes system commands."""
+    match = _NODE_DANGEROUS_EXEC_CALLS.search(inline_code)
+    if match:
+        return True, f"dangerous exec call detected: {match.group()}"
+    return False, ""
+
+
+def _ruby_inline_has_external_url(inline_code: str) -> tuple[bool, str]:
+    """Check if Ruby inline code contains external URL references."""
+    if _EXTERNAL_URL_RE.search(inline_code):
+        return True, "external URL detected in Ruby inline code"
+    return False, ""
+
+
+def _ruby_inline_has_network_calls(inline_code: str) -> tuple[bool, str]:
+    """Check if Ruby inline code makes HTTP/network requests."""
+    match = _RUBY_NETWORK_CALLS.search(inline_code)
+    if match:
+        return True, f"network call detected: {match.group()}"
+    return False, ""
+
+
+def _ruby_inline_has_dangerous_exec(inline_code: str) -> tuple[bool, str]:
+    """Check if Ruby inline code executes system commands."""
+    match = _RUBY_DANGEROUS_EXEC_CALLS.search(inline_code)
+    if match:
+        return True, f"dangerous exec call detected: {match.group()}"
+    return False, ""
+
+
+def interpreter_inline_security_check(raw_cmd: Any) -> str:
+    """Check inline interpreter code for external URLs and dangerous exec calls.
+    
+    Returns an error message if blocked, or empty string if safe.
+    """
+    argv = shell_argv(raw_cmd)
+    if not argv:
+        return ""
+
+    executable = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe")
+
+    # Get inline code from -c flag or script argument
+    inline_code = ""
+    if "-c" in argv:
+        try:
+            inline_code = str(argv[argv.index("-c") + 1])
+        except (IndexError, ValueError):
+            pass
+    elif len(argv) > 1 and not str(argv[1]).startswith("-"):
+        inline_code = str(argv[1])
+
+    if not inline_code:
+        return ""
+
+    # Unwrap shell if needed
+    if executable in {"bash", "sh", "zsh"}:
+        inner = shell_command_string(argv)
+        if inner:
+            return interpreter_inline_security_check(inner)
+        return ""
+
+    # Python interpreters
+    if executable in {"python", "python3"} or executable.startswith("python"):
+        # Check for external URLs
+        has_url, url_reason = _python_inline_has_external_url(inline_code)
+        if has_url:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {url_reason}. External URLs are not allowed in closed network."
+
+        # Check for network calls
+        has_net, net_reason = _python_inline_has_network_calls(inline_code)
+        if has_net:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {net_reason}. HTTP/network requests are not allowed in closed network."
+
+        # Check for dangerous exec calls
+        has_exec, exec_reason = _python_inline_has_dangerous_exec(inline_code)
+        if has_exec:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {exec_reason}. System command execution is not allowed in inline code."
+
+    # Node.js interpreters
+    elif executable in {"node", "deno"}:
+        has_url, url_reason = _node_inline_has_external_url(inline_code)
+        if has_url:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {url_reason}. External URLs are not allowed in closed network."
+
+        has_net, net_reason = _node_inline_has_network_calls(inline_code)
+        if has_net:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {net_reason}. HTTP/network requests are not allowed in closed network."
+
+        has_exec, exec_reason = _node_inline_has_dangerous_exec(inline_code)
+        if has_exec:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {exec_reason}. System command execution is not allowed in inline code."
+
+    # Ruby interpreters
+    elif executable in {"ruby", "perl", "php"}:
+        has_url, url_reason = _ruby_inline_has_external_url(inline_code)
+        if has_url:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {url_reason}. External URLs are not allowed in closed network."
+
+        has_net, net_reason = _ruby_inline_has_network_calls(inline_code)
+        if has_net:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {net_reason}. HTTP/network requests are not allowed in closed network."
+
+        has_exec, exec_reason = _ruby_inline_has_dangerous_exec(inline_code)
+        if has_exec:
+            return f"⚠️ INLINE_SECURITY_BLOCKED: {exec_reason}. System command execution is not allowed in inline code."
+
+    return ""

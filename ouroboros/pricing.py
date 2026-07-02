@@ -129,6 +129,9 @@ def _fetch_live_rows() -> Tuple[Dict[str, Tuple[float, ...]], bool]:
     whole TTL). Returning ONLY live rows lets the caller layer them OVER the existing
     cache, so a partial or total failure keeps the prior good rows for the source that
     did not refresh (never overwriting live pricing with the static-only floor)."""
+    from ouroboros.config import OUROBOROS_CLOSED_NETWORK
+    if OUROBOROS_CLOSED_NETWORK:
+        return {}, True
     import logging as _log
     live: Dict[str, Tuple[float, ...]] = {}
     openrouter_ok = False

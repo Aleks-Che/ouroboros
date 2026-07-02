@@ -31,6 +31,7 @@ from ouroboros.runtime_mode_policy import (
 from ouroboros.tools.commit_gate import _invalidate_advisory
 from ouroboros.shell_parse import embedded_absolute_path_tokens, is_absolute_path_text, recover_stringified_argv, shell_argv_with_inline
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
+from ouroboros.tools.shell_guards import interpreter_inline_security_check
 from ouroboros.tool_access import (
     active_tool_profile,
     decide_tool_access,
@@ -1207,6 +1208,12 @@ def _run_shell(
             return f"⚠️ SCRATCH_BLOCKED: {_scratch_reason}."
 
     timeout_sec = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx, override_sec=_timeout_override)
+
+    # Security check: block external URLs and dangerous exec calls in inline interpreter code
+    inline_security_block = interpreter_inline_security_check(cmd)
+    if inline_security_block:
+        return inline_security_block
+
     bootstrap_process_path()
     try:
         if _executor_can_run_cwd(ctx, pathlib.Path(work_dir)):
@@ -1734,6 +1741,12 @@ def _run_script(
     body = str(script or "")
     if not body.strip():
         return "⚠️ TOOL_ARG_ERROR (run_script): script is required."
+
+    # Security check: block external URLs and dangerous exec calls in script body
+    inline_security_block = interpreter_inline_security_check([interp, "-c", body])
+    if inline_security_block:
+        return inline_security_block
+
     # Resolve the early body-audit scratch against the SAME effective cwd the script will execute in
     # (light + empty cwd -> task_drive; else the declared cwd; else the active workspace) — NOT the raw
     # `cwd` (often empty) — so a relatively-declared scratch path matches a user_files write in the body
